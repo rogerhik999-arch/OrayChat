@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">OrayChat</string>
+    <string name="title_activity_main">OrayChat</string>
+    <string name="package_name">app.oraychat.mobile</string>
+    <string name="custom_url_scheme">app.oraychat.mobile</string>
+</resources>

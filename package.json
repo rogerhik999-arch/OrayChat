@@ -1,0 +1,108 @@
+{
+  "name": "oraychat",
+  "version": "1.0.0",
+  "description": "Private P2P encrypted chat desktop app",
+  "main": "electron/main.js",
+  "scripts": {
+    "test": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/relay.test.mjs && node test/e2e.mjs",
+    "build": "esbuild renderer/src/app.mjs --bundle --outfile=renderer/dist/app.bundle.js --format=iife --platform=browser --target=chrome130",
+    "start": "npm run build && electron .",
+    "check:services": "node tools/check-services.mjs",
+    "test:relay": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/relay.test.mjs && node test/e2e.mjs --relay",
+    "test:lobby": "npm run build && node test/history.test.mjs && node test/e2e-lobby.mjs",
+    "test:pass": "npm run build && node test/crypto.test.mjs && node test/e2e-pass.mjs",
+    "test:remember": "npm run build && node test/crypto.test.mjs && node test/e2e-remember.mjs",
+    "build:www": "node scripts/build-www.mjs",
+    "sync:version": "node scripts/sync-version.mjs"
+  },
+  "keywords": [],
+  "author": "rogerhik999-arch",
+  "license": "ISC",
+  "type": "commonjs",
+  "private": "true",
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/ios": "^8.5.2",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "@trystero-p2p/mqtt": "^0.25.4",
+    "trystero": "^0.25.4"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2"
+  },
+  "build": {
+    "appId": "app.oraychat.desktop",
+    "productName": "OrayChat",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**",
+      "renderer/**",
+      "package.json",
+      "!**/*.md"
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.social-networking",
+      "identity": null,
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage"
+        },
+        {
+          "target": "deb"
+        }
+      ],
+      "category": "Network;InstantMessaging",
+      "icon": "build/icon.png",
+      "maintainer": "rogerhik999-arch"
+    }
+  },
+  "homepage": "https://github.com/rogerhik999-arch/OrayChat"
+}

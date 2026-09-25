@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src wss: https:; worker-src 'self' blob:; img-src 'self' data:;" />
+  <title>OrayChat — 私有 P2P 加密聊天</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 登录视图 -->
+  <section id="loginView" class="login-wrap hidden">
+    <div class="login-card">
+      <div class="brand">
+        <div class="logo">◈</div>
+        <h1>OrayChat</h1>
+        <p class="sub">私有 P2P 加密聊天 · 直连不经服务器</p>
+      </div>
+      <label>昵称
+        <input id="nameInput" type="text" maxlength="32" placeholder="给自己起个名字（即登录账号）" autocomplete="off" />
+      </label>
+      <label>房间（同一房间的登录用户自动互相连接）
+        <input id="roomInput" type="text" maxlength="64" placeholder="oraychat-hall" autocomplete="off" />
+      </label>
+      <label>房间口令（可选 · 群体门禁：加密信令，口令不符者无法进入）
+        <input id="passInput" type="password" maxlength="128" placeholder="留空 = 无口令；同一房间的成员需一致" autocomplete="off" />
+      </label>
+      <label class="chk remember-chk" title="口令将以明文保存在本机应用数据中，仅建议磁盘加密的设备勾选">
+        <input id="rememberChk" type="checkbox" /> 在本机记住口令（明文存储，默认关闭）
+      </label>
+      <div id="existingId" class="existing-id hidden"></div>
+      <button id="loginBtn" class="primary">登录并连接</button>
+      <div class="login-note">
+        首次登录会为该昵称生成本地身份密钥（Ed25519 + X25519），保存在本机。
+        通信经公共信令初始化、P2P 直连，消息端到端加密 —— 信令与中继服务器均无法看到内容。
+      </div>
+      <div id="loginErr" class="err hidden"></div>
+      <div class="ver" id="verLine"></div>
+    </div>
+  </section>
+
+  <!-- 主视图 -->
+  <main id="mainView" class="hidden">
+    <aside class="sidebar">
+      <div class="self-card">
+        <div class="self-name" id="selfName">—</div>
+        <div class="self-fp mono" id="selfFp" title="你的身份指纹，可印给朋友核对">—</div>
+        <div class="self-room">房间 <span id="selfRoom" class="mono">—</span></div>
+      </div>
+      <div class="peers-head">在线成员 <span id="peerCount" class="count">0</span></div>
+      <ul id="peerList" class="peer-list"></ul>
+      <div class="side-foot">
+        <div class="retention-note">📜 记录全体保存 · 保留 30 天 · 删除对所有人生效</div>
+        <button id="logoutBtn" class="ghost">退出登录</button>
+      </div>
+    </aside>
+
+    <section class="chat">
+      <header class="chat-head" id="chatHead">
+        <div>
+          <div class="chat-title" id="chatTitle">选择左侧成员开始聊天</div>
+          <div class="chat-sub" id="chatSub">登录后，房间内所有人会自动互相建立加密直连</div>
+        </div>
+        <div class="badges" id="chatBadges"></div>
+      </header>
+      <div class="msgs" id="msgs">
+        <div class="placeholder" id="placeholder">
+          <div class="ph-icon">🔐</div>
+          <p>消息经端到端加密后通过 WebRTC 数据通道直发对方，<br/>
+             只有你们二人能解密；信令/中继服务器只帮你们"认识"，看不到内容。</p>
+        </div>
+      </div>
+      <footer class="composer">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+        <button id="sendBtn" class="primary" disabled>发送</button>
+      </footer>
+    </section>
+  </main>
+
+  <!-- Web/Capacitor 兼容层：Electron 下 preload 先定义 window.oray，此文件自动让位 -->
+  <script src="web-shim.js"></script>
+  <script src="dist/app.bundle.js"></script>
+</body>
+</html>

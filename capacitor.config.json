@@ -1,0 +1,12 @@
+{
+  "appId": "app.oraychat.mobile",
+  "appName": "OrayChat",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

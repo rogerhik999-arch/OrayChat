@@ -1,0 +1,17 @@
+node_modules/
+release/
+www/
+renderer/dist/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+android/capture/
+ios/App/Pods/
+ios/App/build/
+ios/App/Podfile.lock
+ios/DerivedData/
+*.log
+.DS_Store
+/capture
