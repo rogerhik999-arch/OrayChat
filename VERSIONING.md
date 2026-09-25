@@ -35,9 +35,15 @@
 
 ## 签名现状（如实说明）
 
-- macOS：`identity: null` —— 未做 Developer ID 签名/公证，用户首次打开需绕过 Gatekeeper
+- **Android**：`android/keystore.properties`（**不入库**，已 gitignore）指向
+  `android/oraychat-release.keystore`（自签 30 年有效期）。本地/CI 构建时
+  `assembleRelease` 自动产出**已签名** `app-release.apk`，可直接安装。
+  配套 GitHub Secrets：`ANDROID_KEYSTORE_BASE64` / `ANDROID_STORE_PASSWORD` /
+  `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`（已配置）→ CI 同样出签名包。
+  ⚠️ 密钥库丢失 = 无法向老用户发布覆盖更新，务必备份 `android/oraychat-release.keystore`
+  与 `android/keystore.properties`。
+- macOS：`identity: null` —— 未做 Developer ID 签名/公证，用户首次打开需右键→打开
 - Windows：未做 Authenticode 签名，SmartScreen 会提示
 - iOS：需要 Apple 开发者账号 + 证书才能出可安装到真机的 ipa；CI 产物为模拟器包
-- Android：debug 签名 APK 可直接安装；正式发布需生成 release keystore
 
 这些是"无付费开发者账号"前提下的产物形态；配置好证书后，在 CI 中补充对应签名环境变量即可，无需改代码。
