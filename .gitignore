@@ -8,6 +8,10 @@ android/build/
 android/local.properties
 android/.idea/
 android/capture/
+android/oraychat-release.keystore
+android/keystore.properties
+*.keystore
+keystore.properties
 ios/App/Pods/
 ios/App/build/
 ios/App/Podfile.lock

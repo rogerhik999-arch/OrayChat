@@ -71,6 +71,20 @@ jobs:
       - run: node scripts/build-www.mjs
       - run: npx cap sync android
       - run: node scripts/sync-version.mjs
+      # 从仓库 Secrets 解码发布密钥库（未配置时产出 unsigned 包）
+      - name: Prepare keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/oraychat-release.keystore
+            printf 'storeFile=oraychat-release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$STORE_PASS" "$KEY_ALIAS" "$KEY_PASS" > android/keystore.properties
+          else
+            echo "未配置签名 Secrets，release 包将不含签名"
+          fi
       - run: cd android && chmod +x gradlew && ./gradlew assembleDebug assembleRelease
       - uses: actions/upload-artifact@v4
         with:
