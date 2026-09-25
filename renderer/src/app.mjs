@@ -65,6 +65,69 @@ function rememberPass(room, pass) {
   return window.oray.kvSet(passKey(room), pass || null).catch(() => {})
 }
 
+// ---------- 登录历史（按昵称记住房间+口令，可删除） ----------
+
+const LOGIN_KEY = 'oc-login-history'
+async function getLoginHistory() {
+  return (await window.oray.kvGet(LOGIN_KEY)) || {}
+}
+// remember=false 时保留旧口令不清除（勾选状态由界面控制保存与否）
+async function upsertLogin(name, room, pass, remember) {
+  const h = await getLoginHistory()
+  const prev = h[name] || {}
+  h[name] = { room, pass: remember ? (pass || prev.pass || '') : prev.pass || '' }
+  await window.oray.kvSet(LOGIN_KEY, h)
+  renderSavedAccounts()
+}
+async function forgetLogin(name) {
+  const h = await getLoginHistory()
+  const entry = h[name]
+  delete h[name]
+  await window.oray.kvSet(LOGIN_KEY, h)
+  // 该账号若记住了口令，一并清除
+  if (entry?.pass) await window.oray.kvSet(passKey(entry.room), null)
+  renderSavedAccounts()
+}
+async function autofillByLogin(name) {
+  if (!name) return
+  const h = await getLoginHistory()
+  const e = h[name]
+  if (e?.room) {
+    $('roomInput').value = e.room
+    $('passInput').value = e.pass || ''
+    $('rememberChk').checked = !!e.pass
+  }
+}
+async function renderSavedAccounts() {
+  const box = $('savedAccounts')
+  if (!box) return
+  const h = await getLoginHistory()
+  const names = Object.keys(h)
+  if (!names.length) { box.classList.add('hidden'); box.innerHTML = ''; return }
+  box.classList.remove('hidden')
+  box.innerHTML = '<div class="sa-head">本机保存的登录（点击填入，可删除）</div>'
+  for (const n of names) {
+    const row = document.createElement('div')
+    row.className = 'sa-row'
+    const info = document.createElement('span')
+    info.className = 'sa-info'
+    info.textContent = `${n} → ${h[n].room}${h[n].pass ? ' 🔑' : ''}`
+    info.onclick = () => {
+      $('nameInput').value = n
+      $('roomInput').value = h[n].room
+      $('passInput').value = h[n].pass || ''
+      $('rememberChk').checked = !!h[n].pass
+    }
+    const del = document.createElement('a')
+    del.className = 'sa-del'
+    del.textContent = '删除'
+    del.onclick = () => forgetLogin(n)
+    row.appendChild(info)
+    row.appendChild(del)
+    box.appendChild(row)
+  }
+}
+
 // ---------- 会话视图辅助 ----------
 
 function viewKey(v = state.view) {
@@ -99,13 +162,17 @@ function renderPeers() {
     const li = document.createElement('li')
     li.className = 'peer-item' + (state.view.conv === 'dm' && state.view.peerId === peerId ? ' active' : '')
     const name = p.name || `${peerId.slice(0, 8)}…`
-    const stateText = {
+    let stateText = {
       connecting: '建立 P2P 连接…',
       handshaking: '协商端到端加密…',
       ready: p.via === 'mqtt' ? '已加密 · 公共MQTT中继'
         : p.path === 'relay' ? '已加密 · TURN中继' : '已加密 · P2P直连',
       failed: `握手失败：${p.lastError || '未知'}`,
     }[p.state] || p.state
+    if (p.state === 'ready' && p.lastSeen) {
+      const ago = Math.max(0, Math.round((Date.now() - p.lastSeen) / 1000))
+      stateText += ago <= 20 ? ` · ${ago}s 前在线报告` : ` · ⚠ ${ago}s 未报告`
+    }
     const dotCls = p.state === 'ready' ? (p.via === 'mqtt' || p.path === 'relay' ? 'warn' : 'ok')
       : p.state === 'failed' ? 'err' : 'off'
     li.innerHTML = `
@@ -124,6 +191,8 @@ function renderPeers() {
 function renderChatHead() {
   const isLobby = state.view.conv === 'lobby'
   const readyCount = state.net ? [...state.net.peers.values()].filter((p) => p.state === 'ready').length : 0
+  const activePeer = !isLobby ? state.net?.peers.get(state.view.peerId) : null
+  const reconnectable = !isLobby && activePeer && (activePeer.state === 'failed' || activePeer.via === 'mqtt' || activePeer.path === 'unknown')
   if (isLobby) {
     $('chatTitle').textContent = `大厅 · ${state.room}`
     $('chatSub').textContent = '房间内所有人可见；记录全体保存、任何人可删除、上线自动同步、保留 30 天'
@@ -133,6 +202,7 @@ function renderChatHead() {
       `<span class="badge">保留 30 天</span>`,
     ]
     if (state.roomPass) badges.splice(1, 0, `<span class="badge warn">🔒 口令保护（信令加密 + 门禁）</span>`)
+    if (reconnectable) badges.push(`<button id="reconnectBtn" class="ghost warn2">重新连接</button>`)
     $('chatBadges').innerHTML = badges.join('') +
       `<button id="clearBtn" class="ghost danger">清空全体记录</button>`
   } else {
@@ -159,6 +229,13 @@ function renderChatHead() {
   }
   const btn = $('clearBtn')
   if (btn) btn.onclick = confirmThenClear
+  const rbtn = $('reconnectBtn')
+  if (rbtn) rbtn.onclick = async () => {
+    rbtn.disabled = true
+    try { await state.net.reconnect(state.view.peerId) } catch (e) { appendSys(`重连失败：${e.message}`) }
+    setTimeout(() => { if (rbtn.isConnected) rbtn.disabled = false }, 3000)
+  }
+  renderReconnectBar()
 }
 
 // 渲染整个消息区（共享日志驱动；mid 幂等，删除/清空/同步都会触发重绘）
@@ -189,31 +266,67 @@ function renderMessages() {
       frag.appendChild(sep)
     }
     const mine = m.author === state.myIdPubHex
-    const div = document.createElement('div')
-    div.className = 'msg ' + (mine ? 'me' : '')
-    div.innerHTML = `
-      <div class="bubble">
-        ${!mine && state.view.conv === 'lobby' ? `<span class="author">${esc(authorName(m.author))}</span>` : ''}
-        ${esc(m.text)}
-        <span class="meta">${mine ? '我' : esc(authorName(m.author))} · ${fmtTime(m.t)}
-          <a class="del" data-mid="${esc(m.mid)}" title="删除（对所有人生效）">删除</a></span>
-      </div>`
-    frag.appendChild(div)
+    const row = document.createElement('div')
+    row.className = 'msg' + (mine ? ' me' : '')
+    const bubble = document.createElement('div')
+    bubble.className = 'bubble'
+    if (!mine && state.view.conv === 'lobby') {
+      const author = document.createElement('span')
+      author.className = 'author'
+      author.textContent = authorName(m.author)
+      bubble.appendChild(author)
+    }
+    const text = document.createElement('span')
+    text.className = 'btext'
+    text.textContent = m.text
+    bubble.appendChild(text)
+    const meta = document.createElement('span')
+    meta.className = 'meta'
+    meta.append(`${mine ? '我' : authorName(m.author)} · ${fmtTime(m.t)} `)
+    const del = document.createElement('a')
+    del.className = 'del'
+    del.textContent = '删除'
+    del.title = '删除（对所有人生效）'
+    meta.appendChild(del)
+    bubble.appendChild(meta)
+    row.appendChild(bubble)
+    frag.appendChild(row)
   }
   box.appendChild(frag)
-  for (const a of box.querySelectorAll('a.del')) {
-    a.onclick = (e) => {
-      const el = e.currentTarget
-      if (el.dataset.confirm) { deleteMessage(el.dataset.mid); return }
-      el.dataset.confirm = '1'
-      el.textContent = '确认删除'
-      setTimeout(() => { el.textContent = '删除'; delete el.dataset.confirm }, 2500)
-    }
-  }
   box.scrollTop = box.scrollHeight
 }
 
-function renderConv() { renderChatHead(); renderMessages() }
+function renderReconnectBar() {
+  let bar = $('reconnectBar')
+  if (!bar) {
+    bar = document.createElement('div')
+    bar.id = 'reconnectBar'
+    bar.className = 'reconnect-bar'
+    $('chatHead').after(bar)
+  }
+  if (state.view.conv === 'dm') {
+    const p = state.net?.peers.get(state.view.peerId)
+    const dropped = p && (p.state === 'failed' || (p.lastConnectionLost && Date.now() - p.lastConnectionLost < 60000))
+    if (dropped) {
+      bar.innerHTML = ''
+      const msg = document.createElement('span')
+      msg.textContent = `⚠ ${p.name || '对方'}：${p.lastError || '网络拓扑变化，连接中断'}`
+      const btn = document.createElement('button')
+      btn.textContent = '重新连接'
+      btn.onclick = async () => {
+        btn.disabled = true
+        try { await state.net.reconnect(state.view.peerId) } catch (e) { btn.textContent = `重连失败：${e.message}` }
+      }
+      bar.appendChild(msg)
+      bar.appendChild(btn)
+      bar.classList.remove('hidden')
+      return
+    }
+  }
+  bar.classList.add('hidden')
+}
+
+function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages() }
 
 function selectView(v) {
   state.view = v
@@ -277,6 +390,8 @@ async function doLogin(name, room, roomPass) {
   await loadNames()
   saveName(state.myIdPubHex, name)
   state.logData = await window.oray.kvGet(`oc-log2:${room}`)
+  // 登录历史：按昵称记住房间；勾选“记住口令”时同时保存口令
+  await upsertLogin(name, room, effectivePass, !!state.args['remember-pass'] || $('rememberChk')?.checked)
 
   const cfg = state.cfg
   state.net = new ChatNet(state.ident, state.name, state.room, {
@@ -346,6 +461,22 @@ function netHooks() {
     },
     onWireSend: (peerId, envelope) => {
       if (state.args.bot) window.oray.botLog(`[BOT] WIRE ${JSON.stringify(envelope)}`)
+    },
+    onConnectionLost: (peerId, p, msg) => {
+      p.lastConnectionLost = Date.now()
+      appendSys(msg)
+      if (state.args.bot) window.oray.botLog(`[BOT] CONN-LOST peer=${p.name} msg=${JSON.stringify(msg)}`)
+      renderConv()
+      renderPeers()
+    },
+    onConnectionRestored: (peerId, p) => {
+      appendSys(`与 ${p.name || '对方'} 的连接已恢复`)
+      renderConv()
+      renderPeers()
+    },
+    onPresence: (peerId, p) => {
+      if (state.args.bot) window.oray.botLog(`[BOT] PRESENCE from=${p.name}`)
+      renderPeers()
     },
     onControl: (peerId, p, ctl) => {
       if (state.args.bot && ctl.wireConv === 'lobby') {
@@ -438,14 +569,13 @@ function bindUi() {
     if (!name) { $('loginErr').textContent = '请输入昵称'; $('loginErr').classList.remove('hidden'); return }
     const room = ($('roomInput').value.trim() || state.cfg.defaultRoom || DEFAULT_CONFIG.defaultRoom)
     const pass = $('passInput').value
-    // 勾选“记住口令”：本机保存（明文）；未勾选：清除该房间已记住的口令
-    rememberPass(room, $('rememberChk').checked ? pass : '')
     try { await doLogin(name, room, pass) } catch (e) {
       $('loginErr').textContent = `登录失败：${e.message}`
       $('loginErr').classList.remove('hidden')
     }
   }
-  // 输入房间名时，若本机记住过该房间的口令则自动回填并勾选
+  // 输入昵称/房间名时按本机登录历史自动回填（昵称优先）
+  $('nameInput').addEventListener('input', () => autofillByLogin($('nameInput').value.trim()))
   $('roomInput').addEventListener('input', () => {
     savedPassFor($('roomInput').value.trim()).then((saved) => {
       if (saved) { $('passInput').value = saved; $('rememberChk').checked = true }
@@ -522,21 +652,26 @@ async function main() {
   if (state.args.bot) {
     // 自动化模式：直接登录
     await doLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom), String(state.args['room-pass'] || ''))
-    if (state.args['remember-pass'] && state.args['room-pass']) await rememberPass(state.args.room, state.args['room-pass'])
+    if (state.args['remember-pass'] && state.args['room-pass']) await upsertLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom), String(state.args['room-pass']), true)
     if (state.args['exit-after-ms']) {
       setTimeout(() => window.oray.botExit(0), Number(state.args['exit-after-ms']))
     }
   } else {
-    // 人类模式：显示登录界面，预填房间，聚焦昵称，显示版本
+    // 人类模式：显示登录界面，预填房间，聚焦昵称，显示版本与本机保存的登录
     $('loginView').classList.remove('hidden')
     $('roomInput').placeholder = state.cfg.defaultRoom
     $('nameInput').focus()
+    renderSavedAccounts()
     try {
       const info = await (window.oray.appInfo ? window.oray.appInfo() : Promise.resolve({ version: '1.0.0' }))
       $('verLine').textContent = `v${info.version}`
     } catch { $('verLine').textContent = '' }
   }
 }
+
+setInterval(() => {
+  if (state.net && !$('mainView').classList.contains('hidden')) renderPeers()
+}, 5000)
 
 main().catch((e) => {
   console.error('启动失败', e)

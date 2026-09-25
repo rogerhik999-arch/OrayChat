@@ -130,8 +130,9 @@ button.ghost:hover { color: var(--tx); border-color: var(--tx2); }
 .bubble {
   max-width: 68%; padding: 9px 13px; border-radius: 14px;
   background: var(--peer-bubble); border: 1px solid var(--line);
-  white-space: pre-wrap; word-break: break-word;
+  word-break: break-word;
 }
+.bubble .btext { display: block; white-space: pre-wrap; }
 .msg.me .bubble { background: var(--me-bubble); border-color: #33538f; }
 .bubble .meta { display: block; margin-top: 4px; font-size: 10.5px; color: rgba(255,255,255,.45); }
 .bubble .author {
@@ -147,11 +148,11 @@ button.ghost:hover { color: var(--tx); border-color: var(--tx2); }
 button.ghost.danger { color: var(--err); border-color: #5c3535; font-size: 11.5px; }
 button.ghost.danger[data-confirm] { background: #3a2323; color: var(--warn); }
 .retention-note { font-size: 11px; color: var(--tx2); line-height: 1.6; }
-.remember-chk {
-  display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--tx2);
-  cursor: pointer; margin-top: 10px;
+.login-card label.remember-chk {
+  display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--tx2);
+  cursor: pointer; margin-top: 12px;
 }
-.remember-chk input { margin: 0; }
+.remember-chk input { margin: 0; width: auto; }
 .bubble.system {
   background: transparent; border: 1px dashed var(--line); color: var(--tx2);
   font-size: 12px; align-self: center; max-width: 90%;
@@ -173,3 +174,32 @@ button.ghost.danger[data-confirm] { background: #3a2323; color: var(--warn); }
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: #2b3644; border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 本机保存的登录列表（登录页） */
+.saved-accounts {
+  margin-top: 16px; padding: 8px 10px; border-radius: 9px;
+  border: 1px dashed var(--line); background: var(--bg3);
+}
+.saved-accounts .sa-head { font-size: 11px; color: var(--tx2); margin-bottom: 6px; }
+.saved-accounts .sa-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 2px; font-size: 12.5px; cursor: pointer; border-radius: 6px;
+}
+.saved-accounts .sa-row:hover { background: var(--bg); }
+.saved-accounts .sa-info { flex: 1; color: var(--tx); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.saved-accounts .sa-del { color: var(--tx2); font-size: 11px; }
+.saved-accounts .sa-del:hover { color: var(--err); }
+
+/* 断线重连提示条 */
+.reconnect-bar {
+  margin: 10px 22px 0; padding: 8px 14px; border-radius: 9px;
+  background: #3a2d1c; border: 1px solid #6b5626; color: var(--warn);
+  font-size: 12.5px; display: flex; align-items: center; gap: 12px;
+}
+.reconnect-bar button {
+  margin-left: auto; padding: 4px 12px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--warn); background: transparent; color: var(--warn); font-size: 12px;
+}
+.reconnect-bar button:hover { background: var(--warn); color: #101418; }
+button.ghost.warn2 { color: var(--warn); border-color: #6b5626; }
+button.ghost.warn2:hover { background: #3a2d1c; }

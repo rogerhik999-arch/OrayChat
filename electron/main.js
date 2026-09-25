@@ -11,7 +11,8 @@ const fs = require('node:fs')
 
 const argv = {}
 for (const a of process.argv.slice(2)) {
-  const m = a.match(/^--([^=]+)(?:=(.*))?$/)
+  // [\s\S] 支持参数值含换行（如多行消息）
+  const m = a.match(/^--([^=]+)(?:=([\s\S]*))?$/)
   if (m) argv[m[1]] = m[2] === undefined ? true : m[2]
 }
 

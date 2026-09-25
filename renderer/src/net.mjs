@@ -19,6 +19,7 @@ import { LogStore, dmConvKey } from './store.mjs'
 const APP_ID = 'oraychat-p2p-v1'
 const HANDSHAKE_TIMEOUT_MS = 15000
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000
+const PRESENCE_HEARTBEAT_MS = 15000
 
 // 免费公共基础设施默认清单（可在 userData/oraychat-config.json 覆盖）
 export const DEFAULT_CONFIG = {
@@ -86,6 +87,8 @@ export class ChatNet {
     })
     this.store.onChange((convKey) => this.hooks.onStoreChanged?.(convKey))
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
+    // 在线状态心跳：定期向所有就绪对端报告（对端据此显示在线状态与断线）
+    this.heartbeatTimer = setInterval(() => this.sendPresenceHeartbeat(), PRESENCE_HEARTBEAT_MS)
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -163,6 +166,7 @@ export class ChatNet {
       if (existing.via === 'mqtt') {
         existing.via = 'p2p'
         existing.pc = this.room.getPeers()[peerId] || null
+        this.attachConnectionWatch(peerId)
         if (existing.state === 'ready') {
           this.hooks.onLog?.(`与 ${existing.name || peerId.slice(0, 8)}… 的会话已从中继升级为 P2P 直连`)
           this.hooks.onPathDetected?.(peerId, existing)
@@ -175,6 +179,7 @@ export class ChatNet {
     }
     const peer = this.ensurePeer(peerId, 'p2p')
     peer.pc = this.room.getPeers()[peerId] || null
+    this.attachConnectionWatch(peerId)
     this.startHandshake(peerId)
   }
 
@@ -342,6 +347,7 @@ export class ChatNet {
     if (!peer || !peer.ctx) return
     peer.state = 'ready'
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
+    peer.lastSeen = Date.now()
     peer.safety = oc.safetyNumber(this.ident.edPub, peer.ctx.peerIdPub)
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
@@ -407,6 +413,7 @@ export class ChatNet {
     }
     try {
       const { text, t, mid, conv } = oc.open(peer.ctx, envelope)
+      peer.lastSeen = Date.now()
       if (mid) {
         this.store.addMsg(this.storeKey(conv, peerId), {
           mid, author: peer.idPubHex || oc.hex(peer.ctx.peerIdPub), text, t,
@@ -481,6 +488,16 @@ export class ChatNet {
   onControlFrame(peerId, frame, via) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.via !== via || peer.state !== 'ready') return
+    if (frame?.op === 'presence') { // 在线报告
+      peer.lastSeen = Date.now()
+      this.hooks.onPresence?.(peerId, peer)
+      return
+    }
+    if (frame?.op === 'rehandshake') { // 对端请求重新握手（其为本房间握手发起方）
+      this.hooks.onLog?.(`对端请求重新握手 (${peerId.slice(0, 8)}…)`)
+      this.restartHandshake(peerId, via)
+      return
+    }
     const wireConv = frame?.conv === 'lobby' ? 'lobby' : 'dm'
     const key = this.storeKey(wireConv, peerId)
     let applied = false
@@ -510,6 +527,72 @@ export class ChatNet {
     this.hooks.onSyncApplied?.(peerId, peer, { wireConv, changed, state: frame.state })
   }
 
+  // ---------- 连接监测 / 在线心跳 / 重连 ----------
+
+  // 监听 WebRTC 连接状态：网络拓扑变化（断网、切换 Wi-Fi、NAT 重映射）时触发
+  attachConnectionWatch(peerId) {
+    const peer = this.peers.get(peerId)
+    if (!peer?.pc || peer.pc.__orayWatch) return
+    peer.pc.__orayWatch = true
+    peer.pc.addEventListener?.('connectionstatechange', () => {
+      const cur = this.peers.get(peerId)
+      if (!cur || cur !== peer) return
+      const st = peer.pc.connectionState
+      if (st === 'connected') {
+        if (cur.state === 'ready') this.hooks.onConnectionRestored?.(peerId, cur)
+      } else if (st === 'disconnected' || st === 'failed' || st === 'closed') {
+        if (cur.state === 'ready') this.handleConnectionDrop(peerId, st)
+      }
+    })
+  }
+
+  // 直连掉线：优先自动降级到 MQTT 中继继续聊天，同时通知 UI 提示重连
+  handleConnectionDrop(peerId, st) {
+    const peer = this.peers.get(peerId)
+    if (!peer) return
+    if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.client?.connected) {
+      this.hooks.onLog?.(`直连 ${st}，自动切换中继 (${peerId.slice(0, 8)}…)`, 'warn')
+      this.restartHandshake(peerId, 'mqtt')
+      this.hooks.onConnectionLost?.(peerId, peer, '直连已断开（网络变化？），正在经中继自动重连…')
+      return
+    }
+    peer.state = 'failed'
+    peer.lastError = `连接断开（${st}）`
+    this.hooks.onConnectionLost?.(peerId, peer, '连接已断开，请点击“重新连接”')
+    this.hooks.onPeerFailed?.(peerId, peer)
+  }
+
+  // 手动重连：发起方直接重新握手；响应方发 rehandshake 指令请对方发起
+  async reconnect(peerId) {
+    const peer = this.peers.get(peerId)
+    if (!peer) return
+    if (peer.state === 'ready' && peer.via === 'p2p') {
+      peer.pc?.restartIce?.() // 已就绪：只做 ICE 重启尝试升级/修复路径
+      this.detectPath(peerId)
+      return
+    }
+    this.reconnectBanner = true
+    if (this.iAmInitiator(peerId)) {
+      this.restartHandshake(peerId, peer.via)
+    } else {
+      await this.sendCtl(peerId, { op: 'rehandshake' })
+    }
+  }
+
+  // 定期在线报告
+  sendPresenceHeartbeat() {
+    if (this.destroyed) return
+    const now = Date.now()
+    for (const [peerId, peer] of this.peers) {
+      if (peer.state !== 'ready') continue
+      try {
+        if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', { conv: 'dm', op: 'presence', t: now })
+        else this.ctlAction?.send({ op: 'presence', t: now }, { target: peerId }).catch(() => {})
+      } catch { /* 心跳失败静默，下轮再报 */ }
+    }
+    this.hooks.onPresenceSent?.([...this.peers.values()].filter((p) => p.state === 'ready').length)
+  }
+
   readyPeerIds() {
     return [...this.peers.entries()].filter(([, p]) => p.state === 'ready').map(([id]) => id)
   }
@@ -517,6 +600,7 @@ export class ChatNet {
   destroy() {
     this.destroyed = true
     clearInterval(this.sweepTimer)
+    clearInterval(this.heartbeatTimer)
     try { this.room?.leave() } catch { /* 忽略 */ }
     this.relay?.destroy()
   }
