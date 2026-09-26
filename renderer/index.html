@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src wss: https:; worker-src 'self' blob:; img-src 'self' data:;" />
   <title>OrayChat — 私有 P2P 加密聊天</title>
@@ -36,7 +37,8 @@
 
   <!-- 主视图 -->
   <main id="mainView" class="hidden">
-    <aside class="sidebar">
+    <div id="backdrop" class="backdrop"></div>
+    <aside class="sidebar" id="sidebar">
       <div class="self-card">
         <div class="self-name" id="selfName">—</div>
         <div class="self-fp mono" id="selfFp" title="你的身份指纹，可印给朋友核对">—</div>
@@ -52,6 +54,7 @@
 
     <section class="chat">
       <header class="chat-head" id="chatHead">
+        <button id="menuBtn" class="ghost menu-btn" title="成员与状态栏">☰</button>
         <div>
           <div class="chat-title" id="chatTitle">选择左侧成员开始聊天</div>
           <div class="chat-sub" id="chatSub">登录后，房间内所有人会自动互相建立加密直连</div>

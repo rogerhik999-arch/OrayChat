@@ -203,3 +203,44 @@ button.ghost.danger[data-confirm] { background: #3a2323; color: var(--warn); }
 .reconnect-bar button:hover { background: var(--warn); color: #101418; }
 button.ghost.warn2 { color: var(--warn); border-color: #6b5626; }
 button.ghost.warn2:hover { background: #3a2d1c; }
+
+/* ---------- 移动端适配：侧栏抽屉 ---------- */
+.menu-btn { display: none; font-size: 18px; line-height: 1; padding: 6px 12px; flex: none; }
+.backdrop { display: none; }
+
+@media (max-width: 760px) {
+  /* 抽屉式侧栏：默认隐藏，☰/遮罩控制 */
+  .menu-btn { display: inline-block; }
+  .sidebar {
+    position: fixed; top: 0; bottom: 0; left: 0;
+    width: min(300px, 84vw); z-index: 30;
+    transform: translateX(-100%); transition: transform .22s ease;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+    padding-top: env(safe-area-inset-top);
+  }
+  body.sidebar-open .sidebar { transform: none; }
+  .backdrop {
+    display: block; position: fixed; inset: 0; z-index: 20;
+    background: rgba(0,0,0,.45); opacity: 0; pointer-events: none;
+    transition: opacity .2s ease;
+  }
+  body.sidebar-open .backdrop { opacity: 1; pointer-events: auto; }
+
+  /* 聊天区在小屏的排版 */
+  .chat-head { padding: 10px 12px; gap: 8px; }
+  .chat-head > div:first-of-type { flex: 1; min-width: 0; }
+  .chat-title { font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-sub { display: none; }
+  .msgs { padding: 12px; }
+  .bubble { max-width: 82%; }
+  .badges { max-width: 60%; }
+
+  /* 触屏：输入字号 ≥16px 防 iOS 聚焦缩放；安全区 */
+  .composer { padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); }
+  .composer textarea { font-size: 16px; }
+  .composer button { width: 74px; }
+
+  /* 登录卡自适应 */
+  .login-card { width: min(400px, calc(100vw - 24px)); padding: 26px 22px 20px; }
+  .login-card input { font-size: 16px; }
+}

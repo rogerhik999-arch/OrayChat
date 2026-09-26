@@ -310,6 +310,7 @@ function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages()
 
 function selectView(v) {
   state.view = v
+  document.body.classList.remove('sidebar-open') // 手机上选中即收起侧栏
   renderConv()
   renderPeers()
   const canSend = v.conv === 'lobby' || state.net?.peers.get(v.peerId)?.state === 'ready'
@@ -562,6 +563,13 @@ function bindUi() {
     el.style.height = `${Math.min(el.scrollHeight, 130)}px`
   })
   $('logoutBtn').onclick = () => { state.net?.destroy(); window.oray.quit() }
+
+  // 移动端抽屉：☰ 开、遮罩/Esc 关
+  const closeDrawer = () => document.body.classList.remove('sidebar-open')
+  $('menuBtn').onclick = () => document.body.classList.toggle('sidebar-open')
+  $('backdrop').onclick = closeDrawer
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer() })
+  window.addEventListener('resize', () => { if (window.innerWidth > 760) closeDrawer() })
 }
 
 async function sendCurrent() {
@@ -620,12 +628,17 @@ async function main() {
   if (state.args.bot) {
     // 自动化模式：直接登录
     await doLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom))
+    if (state.args['open-sidebar']) document.body.classList.add('sidebar-open')
     if (state.args['exit-after-ms']) {
       setTimeout(() => window.oray.botExit(0), Number(state.args['exit-after-ms']))
+    }
+    if (state.args['close-after-ms']) {
+      setTimeout(() => window.oray.closeWindow(), Number(state.args['close-after-ms']))
     }
   } else {
     // 人类模式：显示登录界面，预填房间，聚焦昵称，显示版本与本机保存的登录
     $('loginView').classList.remove('hidden')
+    if (window.innerWidth <= 760) $('input').placeholder = '输入消息…'
     $('roomInput').placeholder = state.cfg.defaultRoom
     $('nameInput').focus()
     renderSavedAccounts()

@@ -5,7 +5,7 @@
 // - bot 模式：--bot 时无窗口自动化登录，日志经 IPC 转发到 stdout，供 e2e 测试驱动
 // - 应用层配置：<userData>/oraychat-config.json 可覆盖 STUN/TURN/默认房间
 
-const { app, BrowserWindow, ipcMain } = require('electron')
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -18,6 +18,9 @@ for (const a of process.argv.slice(2)) {
 
 const PROFILE = String(argv.profile || 'default')
 const IS_BOT = !!argv.bot
+
+let tray = null
+let isQuiting = false // 区分“关窗隐藏到托盘”与“真正退出”
 
 app.setName('OrayChat')
 app.setPath('userData', path.join(app.getPath('appData'), 'OrayChat', PROFILE))
@@ -107,17 +110,19 @@ function registerIpc() {
     const img = await win.webContents.capturePage()
     return img.toPNG()
   })
-  ipcMain.handle('app:quit', () => app.exit(0))
+  ipcMain.handle('app:quit', () => { isQuiting = true; app.quit() })
+  ipcMain.on('win:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
 }
 
 function createWindow() {
   // --render-icon=<输出.png>：以 1024×1024 透明窗口渲染产品图标（构建管线用）
   const isIconRenderer = !!argv['render-icon']
+  const [usrW, usrH] = String(argv['window-size'] || '').split('x').map(Number)
   const win = new BrowserWindow({
-    width: isIconRenderer ? 1024 : 1120,
-    height: isIconRenderer ? 1024 : 760,
-    minWidth: isIconRenderer ? undefined : 860,
-    minHeight: isIconRenderer ? undefined : 560,
+    width: isIconRenderer ? 1024 : (usrW || 1120),
+    height: isIconRenderer ? 1024 : (usrH || 760),
+    minWidth: isIconRenderer || usrW ? undefined : 860,
+    minHeight: isIconRenderer || usrH ? undefined : 560,
     show: isIconRenderer ? false : !IS_BOT,
     transparent: isIconRenderer,
     frame: !isIconRenderer,
@@ -133,6 +138,21 @@ function createWindow() {
   win.loadFile(isIconRenderer
     ? path.join(__dirname, '..', 'tools', `icon-${argv['icon-page'] || 'app'}.svg.html`)
     : path.join(__dirname, '..', 'renderer', 'index.html'))
+
+  // 关闭窗口 = 隐藏窗口、应用驻留系统托盘后台继续运行；退出必须经托盘菜单
+  win.on('close', (e) => {
+    process.stdout.write(`[tray] close 事件触发 isQuiting=${isQuiting} IS_BOT=${IS_BOT}\n`)
+    if (!isQuiting && !IS_BOT) {
+      process.stdout.write('[tray] 隐藏窗口，驻留后台\n')
+      e.preventDefault()
+      win.hide()
+      if (process.platform === 'win32' && tray) tray.displayBalloon?.({
+        icon: nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png')),
+        title: 'OrayChat 仍在运行',
+        content: '已最小化到系统托盘，消息会继续接收；右键托盘图标可退出。',
+      })
+    }
+  })
   if (IS_BOT) win.webContents.on('console-message', (_e, level, message) => {
     process.stdout.write(`[renderer:${level}] ${message}\n`)
   })
@@ -156,12 +176,34 @@ function createWindow() {
   return win
 }
 
+function showMainWindow() {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (win) {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  } else createWindow()
+}
+
+function createTray() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'))
+    .resize({ width: process.platform === 'darwin' ? 22 : 32, height: process.platform === 'darwin' ? 22 : 32 })
+  tray = new Tray(icon)
+  tray.setToolTip('OrayChat — 私有 P2P 加密聊天（运行中）')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主窗口', click: showMainWindow },
+    { type: 'separator' },
+    { label: '退出 OrayChat', click: () => { isQuiting = true; app.quit() } },
+  ]))
+  tray.on('click', showMainWindow) // macOS 左键直接弹窗
+}
+
 app.whenReady().then(() => {
   registerIpc()
   createWindow()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
+  if (!IS_BOT) createTray()
+  app.on('activate', () => showMainWindow()) // macOS 点 Dock 图标恢复
 })
 
-app.on('window-all-closed', () => {
-  app.exit(0)
-})
+// 关窗即隐藏，通常不会走到这里；bot 模式靠 botExit 退出
+app.on('window-all-closed', () => { if (IS_BOT) app.exit(0) })

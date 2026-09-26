@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('oray', {
   botLog: (line) => ipcRenderer.send('bot:log', line),
   botExit: (code) => ipcRenderer.send('bot:exit', code),
   captureWindow: () => ipcRenderer.invoke('win:capture'),
+  closeWindow: () => ipcRenderer.send('win:close'),
   quit: () => ipcRenderer.invoke('app:quit'),
 
   versions: {
