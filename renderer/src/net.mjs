@@ -93,6 +93,8 @@ export class ChatNet {
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
     // 在线状态心跳：定期向所有就绪对端报告（对端据此显示在线状态与断线）
     this.heartbeatTimer = setInterval(() => this.sendPresenceHeartbeat(), PRESENCE_HEARTBEAT_MS)
+    // 直连升级探测：中继会话每 45s 静默检查一次 Trystero 侧是否已打通/可重试
+    this.directProbeTimer = setInterval(() => this.probeDirectUpgrades(), 45000)
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -625,6 +627,73 @@ export class ChatNet {
     this.hooks.onPresenceSent?.([...this.peers.values()].filter((p) => p.state === 'ready').length)
   }
 
+  // ---------- 直连升级（自动 + 手动） ----------
+
+  // 中继就绪会话的直连升级探测：
+  //   - Trystero 侧已打通 → 立即升级为直连
+  //   - Trystero 侧存在但未连上 → restartIce 重试（限频，每对端 ≥3 分钟一次）
+  probeDirectUpgrades() {
+    if (this.destroyed || !this.room) return
+    const now = Date.now()
+    for (const [peerId, peer] of this.peers) {
+      if (peer.state !== 'ready' || peer.via !== 'mqtt') continue
+      const tPeer = this.room.getPeers?.()[peerId]
+      const pc = tPeer?.pc || tPeer
+      if (!pc) continue
+      if (pc.connectionState === 'connected') {
+        this.onPeerJoin(peerId) // 触发升级分支（幂等）
+      } else if (now - (peer.lastDirectProbe || 0) > 180000) {
+        peer.lastDirectProbe = now
+        pc.restartIce?.()
+        this.hooks.onLog?.(`直连升级探测：ICE 重启 (${peerId.slice(0, 8)}…)`)
+      }
+    }
+  }
+
+  // 手动触发直连升级，返回 {ok, detail}；成功后会话原密钥无缝切到直连
+  async tryDirect(peerId) {
+    const peer = this.peers.get(peerId)
+    if (!peer || peer.state !== 'ready') throw new Error('对端尚未建立加密会话')
+    if (this.opts.forceRelay) throw new Error('当前为纯中继模式（--relay-only），无法直连')
+
+    if (peer.via === 'p2p') {
+      peer.pc?.restartIce?.()
+      await this.waitForIceResult(peerId, 10000)
+      this.detectPath(peerId)
+      const ok = peer.path === 'direct'
+      return { ok, detail: ok ? '已重新协商为直连' : `ICE 重启完成，当前路径：${peer.path === 'relay' ? '中继' : peer.path}` }
+    }
+
+    const tPeer = this.room?.getPeers?.()[peerId]
+    const pc = tPeer?.pc || tPeer
+    if (!pc) {
+      throw new Error('信令尚未互见（双方会继续自动重试）；若跨网络且无法打洞，只能走中继')
+    }
+    pc.restartIce?.()
+    const connected = await this.waitForIceResult(peerId, 15000, pc)
+    if (!connected) {
+      const detail = 'ICE 重启后仍未打通（可能为对称 NAT 且无可用 TURN）'
+      this.hooks.onLog?.(detail, 'warn')
+      return { ok: false, detail }
+    }
+    // 打通了：走与自动升级相同的分支
+    this.onPeerJoin(peerId)
+    await this.waitForIceResult(peerId, 5000)
+    this.detectPath(peerId)
+    return { ok: true, detail: '已升级为 P2P 直连' }
+  }
+
+  // 等待指定 peer 的通路达到 connected，最多 timeoutMs；pcOverride 指定监测对象
+  async waitForIceResult(peerId, timeoutMs, pcOverride) {
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      const pc = pcOverride || this.peers.get(peerId)?.pc
+      if (pc?.connectionState === 'connected') return true
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    return false
+  }
+
   readyPeerIds() {
     return [...this.peers.entries()].filter(([, p]) => p.state === 'ready').map(([id]) => id)
   }
@@ -633,6 +702,7 @@ export class ChatNet {
     this.destroyed = true
     clearInterval(this.sweepTimer)
     clearInterval(this.heartbeatTimer)
+    clearInterval(this.directProbeTimer)
     try { this.room?.leave() } catch { /* 忽略 */ }
     this.relay?.destroy()
   }

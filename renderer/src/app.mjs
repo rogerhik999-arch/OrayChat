@@ -211,6 +211,7 @@ function renderChatHead() {
       badges.push(`<span class="badge">连接协商中…</span>`)
     }
     badges.push(`<span class="badge">保留 30 天</span>`)
+    if (p?.state === 'ready' && p.via === 'mqtt') badges.push(`<button id="tryDirectBtn" class="ghost warn2">尝试直连</button>`)
     $('chatBadges').innerHTML = badges.join('') +
       `<button id="clearBtn" class="ghost danger">清空全体记录</button>`
     $('chatSub').textContent = p?.state === 'ready'
@@ -224,6 +225,19 @@ function renderChatHead() {
     rbtn.disabled = true
     try { await state.net.reconnect(state.view.peerId) } catch (e) { appendSys(`重连失败：${e.message}`) }
     setTimeout(() => { if (rbtn.isConnected) rbtn.disabled = false }, 3000)
+  }
+  const tbtn = $('tryDirectBtn')
+  if (tbtn) tbtn.onclick = async () => {
+    tbtn.disabled = true
+    tbtn.textContent = '尝试中…'
+    try {
+      const r = await state.net.tryDirect(state.view.peerId)
+      appendSys(`尝试直连：${r.ok ? '✅ ' : '❌ '}${r.detail}`)
+      renderPeers()
+    } catch (e) {
+      appendSys(`尝试直连失败：${e.message}`)
+    }
+    if (tbtn.isConnected) { tbtn.disabled = false; tbtn.textContent = '尝试直连' }
   }
   renderReconnectBar()
 }
@@ -648,6 +662,16 @@ async function main() {
     }
     if (state.args['close-after-ms']) {
       setTimeout(() => window.oray.closeWindow(), Number(state.args['close-after-ms']))
+    }
+    if (state.args['try-direct-after-ms']) {
+      setTimeout(async () => {
+        const ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+        if (!ready) { window.oray.botLog('[BOT] TRY-DIRECT no-ready-peer'); return }
+        try {
+          const r = await state.net.tryDirect(ready[0])
+          window.oray.botLog(`[BOT] TRY-DIRECT ok=${r.ok} detail=${JSON.stringify(r.detail)} path=${ready[1].path}`)
+        } catch (e) { window.oray.botLog(`[BOT] TRY-DIRECT error=${e.message}`) }
+      }, Number(state.args['try-direct-after-ms']))
     }
   } else {
     // 人类模式：显示登录界面，预填房间，聚焦昵称，显示版本与本机保存的登录
