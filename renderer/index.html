@@ -22,12 +22,6 @@
       <label>房间（同一房间的登录用户自动互相连接）
         <input id="roomInput" type="text" maxlength="64" placeholder="oraychat-hall" autocomplete="off" />
       </label>
-      <label>房间口令（可选 · 群体门禁：加密信令，口令不符者无法进入）
-        <input id="passInput" type="password" maxlength="128" placeholder="留空 = 无口令；同一房间的成员需一致" autocomplete="off" />
-      </label>
-      <label class="chk remember-chk" title="口令将以明文保存在本机应用数据中，仅建议磁盘加密的设备勾选">
-        <input id="rememberChk" type="checkbox" /> 在本机记住口令（明文存储，默认关闭）
-      </label>
       <div id="savedAccounts" class="saved-accounts hidden"></div>
       <div id="existingId" class="existing-id hidden"></div>
       <button id="loginBtn" class="primary">登录并连接</button>

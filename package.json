@@ -10,8 +10,6 @@
     "check:services": "node tools/check-services.mjs",
     "test:relay": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/relay.test.mjs && node test/e2e.mjs --relay",
     "test:lobby": "npm run build && node test/history.test.mjs && node test/e2e-lobby.mjs",
-    "test:pass": "npm run build && node test/crypto.test.mjs && node test/e2e-pass.mjs",
-    "test:remember": "npm run build && node test/crypto.test.mjs && node test/e2e-remember.mjs",
     "build:www": "node scripts/build-www.mjs",
     "sync:version": "node scripts/sync-version.mjs"
   },

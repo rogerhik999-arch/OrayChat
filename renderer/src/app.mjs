@@ -17,7 +17,6 @@ const state = {
   // 当前视图：{conv:'lobby'} 或 {conv:'dm', peerId}
   view: { conv: 'lobby' },
   names: new Map(), // idPubHex -> 显示名（含自己），本地文件持久化
-  roomPass: '', // 房间口令（仅存内存，不落盘）
   logData: null, // 登录时从主进程文件 KV 读入的共享日志
 }
 
@@ -57,14 +56,6 @@ function authorName(idPubHex) {
 
 // ---------- 口令记忆（可选，默认关闭；明文存本机文件，仅建议磁盘加密设备使用） ----------
 
-const passKey = (room) => `oc-pass:${room}`
-function savedPassFor(room) {
-  return window.oray.kvGet(passKey(room)).then((v) => v || '')
-}
-function rememberPass(room, pass) {
-  return window.oray.kvSet(passKey(room), pass || null).catch(() => {})
-}
-
 // ---------- 登录历史（按昵称记住房间+口令，可删除） ----------
 
 const LOGIN_KEY = 'oc-login-history'
@@ -72,31 +63,23 @@ async function getLoginHistory() {
   return (await window.oray.kvGet(LOGIN_KEY)) || {}
 }
 // remember=false 时保留旧口令不清除（勾选状态由界面控制保存与否）
-async function upsertLogin(name, room, pass, remember) {
+async function upsertLogin(name, room) {
   const h = await getLoginHistory()
-  const prev = h[name] || {}
-  h[name] = { room, pass: remember ? (pass || prev.pass || '') : prev.pass || '' }
+  h[name] = { room }
   await window.oray.kvSet(LOGIN_KEY, h)
   renderSavedAccounts()
 }
 async function forgetLogin(name) {
   const h = await getLoginHistory()
-  const entry = h[name]
   delete h[name]
   await window.oray.kvSet(LOGIN_KEY, h)
-  // 该账号若记住了口令，一并清除
-  if (entry?.pass) await window.oray.kvSet(passKey(entry.room), null)
   renderSavedAccounts()
 }
 async function autofillByLogin(name) {
   if (!name) return
   const h = await getLoginHistory()
   const e = h[name]
-  if (e?.room) {
-    $('roomInput').value = e.room
-    $('passInput').value = e.pass || ''
-    $('rememberChk').checked = !!e.pass
-  }
+  if (e?.room) $('roomInput').value = e.room
 }
 async function renderSavedAccounts() {
   const box = $('savedAccounts')
@@ -111,12 +94,10 @@ async function renderSavedAccounts() {
     row.className = 'sa-row'
     const info = document.createElement('span')
     info.className = 'sa-info'
-    info.textContent = `${n} → ${h[n].room}${h[n].pass ? ' 🔑' : ''}`
+    info.textContent = `${n} → ${h[n].room}`
     info.onclick = () => {
       $('nameInput').value = n
       $('roomInput').value = h[n].room
-      $('passInput').value = h[n].pass || ''
-      $('rememberChk').checked = !!h[n].pass
     }
     const del = document.createElement('a')
     del.className = 'sa-del'
@@ -201,7 +182,6 @@ function renderChatHead() {
       `<span class="badge">已同步成员 ${readyCount}</span>`,
       `<span class="badge">保留 30 天</span>`,
     ]
-    if (state.roomPass) badges.splice(1, 0, `<span class="badge warn">🔒 口令保护（信令加密 + 门禁）</span>`)
     if (reconnectable) badges.push(`<button id="reconnectBtn" class="ghost warn2">重新连接</button>`)
     $('chatBadges').innerHTML = badges.join('') +
       `<button id="clearBtn" class="ghost danger">清空全体记录</button>`
@@ -370,10 +350,8 @@ function appendSys(text) {
 
 // ---------- 登录 ----------
 
-async function doLogin(name, room, roomPass) {
+async function doLogin(name, room) {
   $('loginErr').classList.add('hidden')
-  // 口令优先级：显式输入 > 本机记住的（该房间） > 无
-  const effectivePass = roomPass || (await savedPassFor(room)) || ''
   const stored = await window.oray.loadIdentity(name)
   if (stored?.edSeed) {
     state.ident = oc.identityFromJson(stored)
@@ -386,21 +364,17 @@ async function doLogin(name, room, roomPass) {
   state.name = name
   state.myIdPubHex = oc.hex(state.ident.edPub)
   state.room = room
-  state.roomPass = effectivePass
   await loadNames()
   saveName(state.myIdPubHex, name)
   state.logData = await window.oray.kvGet(`oc-log2:${room}`)
-  // 登录历史：按昵称记住房间；勾选“记住口令”时同时保存口令
-  await upsertLogin(name, room, effectivePass, !!state.args['remember-pass'] || $('rememberChk')?.checked)
+  // 登录历史：按昵称记住房间
+  await upsertLogin(name, room)
 
   const cfg = state.cfg
   state.net = new ChatNet(state.ident, state.name, state.room, {
     ...cfg,
     rtcConfig: buildRtcConfig(cfg),
-  }, netHooks(), {
-    forceRelay: !!state.args['relay-only'],
-    roomPassword: state.roomPass || undefined,
-  })
+  }, netHooks(), { forceRelay: !!state.args['relay-only'] })
 
   $('selfName').textContent = name
   $('selfFp').textContent = oc.identityFingerprint(state.ident.edPub)
@@ -501,7 +475,7 @@ function botInit(args) {
   bot.sendTo = args['send-to'] || null
   bot.count = Number(args.count || 3)
   bot.textPrefix = args.text || 'hello'
-  window.oray.botLog(`[BOT] START profile-mode bot name=${args.name} room=${args.room} sendTo=${bot.sendTo} autoReply=${!!args['auto-reply']} lobbyText=${args['lobby-text'] || ''} delLobby=${args['del-lobby'] || ''} pass=${args['room-pass'] ? 'set' : 'none'}`)
+  window.oray.botLog(`[BOT] START profile-mode bot name=${args.name} room=${args.room} sendTo=${bot.sendTo} autoReply=${!!args['auto-reply']} lobbyText=${args['lobby-text'] || ''} delLobby=${args['del-lobby'] || ''}`)
   // 大厅独立发送（--lobby-alone：不等对端上线，仅落自己的共享日志，等待同步扩散）
   if (args['lobby-text'] && args['lobby-alone']) {
     setTimeout(botSendLobby, Number(args['lobby-delay-ms'] || 1200))
@@ -568,19 +542,13 @@ function bindUi() {
     const name = $('nameInput').value.trim()
     if (!name) { $('loginErr').textContent = '请输入昵称'; $('loginErr').classList.remove('hidden'); return }
     const room = ($('roomInput').value.trim() || state.cfg.defaultRoom || DEFAULT_CONFIG.defaultRoom)
-    const pass = $('passInput').value
-    try { await doLogin(name, room, pass) } catch (e) {
+    try { await doLogin(name, room) } catch (e) {
       $('loginErr').textContent = `登录失败：${e.message}`
       $('loginErr').classList.remove('hidden')
     }
   }
-  // 输入昵称/房间名时按本机登录历史自动回填（昵称优先）
+  // 输入昵称时按本机登录历史自动回填房间
   $('nameInput').addEventListener('input', () => autofillByLogin($('nameInput').value.trim()))
-  $('roomInput').addEventListener('input', () => {
-    savedPassFor($('roomInput').value.trim()).then((saved) => {
-      if (saved) { $('passInput').value = saved; $('rememberChk').checked = true }
-    })
-  })
   $('nameInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click() })
   $('roomInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click() })
 
@@ -651,8 +619,7 @@ async function main() {
 
   if (state.args.bot) {
     // 自动化模式：直接登录
-    await doLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom), String(state.args['room-pass'] || ''))
-    if (state.args['remember-pass'] && state.args['room-pass']) await upsertLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom), String(state.args['room-pass']), true)
+    await doLogin(String(state.args.name || 'bot'), String(state.args.room || state.cfg.defaultRoom))
     if (state.args['exit-after-ms']) {
       setTimeout(() => window.oray.botExit(0), Number(state.args['exit-after-ms']))
     }
