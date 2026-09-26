@@ -76,6 +76,10 @@ export class ChatNet {
     this.peers = new Map()
     this.destroyed = false
     this.myIdPubHex = oc.hex(ident.edPub)
+    // 公钥 → 显示昵称。来源：直接握手（受身份签名保护）+ 对端同步帧传播
+    // （仅显示用途；身份以公钥/安全码为准）。随同步帧 gossip，让未直接
+    // 握手的成员（离线作者的历史消息）也能解析出名字。
+    this.peerNames = new Map([[this.myIdPubHex, myName]])
 
     // 房间口令：Trystero 信令加密 + 门禁；并派生房间密钥加密中继回退层帧
     this.roomKey = oc.deriveRoomKey(opts.roomPassword, APP_ID, roomId)
@@ -268,6 +272,8 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer) return
     this.clearRetransmit(peer)
+    peer.lastHs1Key = null
+    peer.cachedHs2 = null
     peer.via = via
     peer.ctx = null
     peer.pending = null
@@ -310,13 +316,22 @@ export class ChatNet {
     try {
       if (msg.t === 'OC-HS1-v1') {
         if (this.iAmInitiator(peerId)) return // 双方角色规则一致，不应收到 hs1；忽略竞态帧
+        // 重传幂等：同一 hs1（同签名）到达多次时，重发缓存的 hs2 ——
+        // 否则每次都换新临时密钥，会与发起方已接受的 hs2 错位导致 HMAC 不匹配
+        const hs1Key = `${msg.eph}|${msg.sig}`
+        if (peer.lastHs1Key === hs1Key && peer.cachedHs2) {
+          this.sendHs(peerId, peer.cachedHs2)
+          return
+        }
         const { msg: hs2, ctx } = oc.acceptHs1(this.ident, this.myName, this.roomId, msg)
+        peer.lastHs1Key = hs1Key
+        peer.cachedHs2 = hs2
         peer.ctx = ctx
         peer.name = ctx.peerName
         this.sendHs(peerId, hs2)
         this.hooks.onLog?.(`收到 hs1，已回 hs2（对端=${ctx.peerName}，${via}）`)
       } else if (msg.t === 'OC-HS2-v1') {
-        if (peer.role !== 'initiator' || !peer.pending) throw new Error('未发起过握手')
+        if (peer.role !== 'initiator' || !peer.pending) return // 迟到/重复的 hs2：静默忽略
         this.clearRetransmit(peer) // hs2 已到，停止重传 hs1
         const { msg: hs3, ctx } = oc.acceptHs2(this.ident, peer.pending, msg)
         peer.pending = null
@@ -345,9 +360,11 @@ export class ChatNet {
   markReady(peerId) {
     const peer = this.peers.get(peerId)
     if (!peer || !peer.ctx) return
+    if (peer.state === 'ready') return // 重复 hs3/hs3ack 幂等
     peer.state = 'ready'
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
+    if (peer.ctx.peerName) this.peerNames.set(peer.idPubHex, peer.ctx.peerName)
     peer.safety = oc.safetyNumber(this.ident.edPub, peer.ctx.peerIdPub)
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
@@ -511,7 +528,14 @@ export class ChatNet {
   async pushSync(peerId, wireConv) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') return
-    const frame = { conv: wireConv, state: this.store.exportConv(this.storeKey(wireConv, peerId)) }
+    const state = this.store.exportConv(this.storeKey(wireConv, peerId))
+    // 附带作者昵称映射：接收端无需与作者直接握手即可解析历史消息的显示名
+    const names = {}
+    for (const e of state.entries) {
+      const n = this.peerNames.get(e.author)
+      if (n) names[e.author] = n
+    }
+    const frame = { conv: wireConv, state, names }
     try {
       if (peer.via === 'mqtt') this.relay.send(peerId, 'sync', frame)
       else await this.syncAction?.send(frame, { target: peerId })
@@ -524,6 +548,14 @@ export class ChatNet {
     const wireConv = frame?.conv === 'lobby' ? 'lobby' : 'dm'
     const key = this.storeKey(wireConv, peerId)
     const changed = this.store.applyState(key, frame.state)
+    // 合并对端传播的昵称映射（gossip；仅显示用途）
+    if (frame.names && typeof frame.names === 'object') {
+      for (const [id, n] of Object.entries(frame.names)) {
+        if (typeof n !== 'string' || !n) continue
+        if (this.peerNames.get(id) !== n) this.peerNames.set(id, n)
+        this.hooks.onPeerName?.(peerId, peer, id, n)
+      }
+    }
     this.hooks.onSyncApplied?.(peerId, peer, { wireConv, changed, state: frame.state })
   }
 

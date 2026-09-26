@@ -45,9 +45,10 @@ function loadNames() {
   })
 }
 function saveName(idPubHex, name) {
-  if (!idPubHex || !name || state.names.get(idPubHex) === name) return
+  if (!idPubHex || !name || state.names.get(idPubHex) === name) return false
   state.names.set(idPubHex, name)
   window.oray.kvSet(`oc-names:${state.room}`, Object.fromEntries(state.names)).catch(() => {})
+  return true
 }
 function authorName(idPubHex) {
   if (idPubHex === state.myIdPubHex) return state.name
@@ -461,6 +462,10 @@ function netHooks() {
     onPresence: (peerId, p) => {
       if (state.args.bot) window.oray.botLog(`[BOT] PRESENCE from=${p.name}`)
       renderPeers()
+    },
+    onPeerName: (peerId, p, idPubHex, name) => {
+      if (saveName(idPubHex, name)) renderConv()
+      if (state.args.bot) window.oray.botLog(`[BOT] NAME name=${JSON.stringify(name)} id=${idPubHex.slice(0, 8)}…`)
     },
     onControl: (peerId, p, ctl) => {
       if (state.args.bot && ctl.wireConv === 'lobby') {

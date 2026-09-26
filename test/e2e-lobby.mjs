@@ -11,39 +11,44 @@ import { fileURLToPath } from 'node:url'
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const ELECTRON = path.join(ROOT, 'node_modules', '.bin', 'electron')
 const ROOM = `oc-lobby-${Date.now().toString(36)}`
-const STAGE_TIMEOUT = 90000
+const STAGE_TIMEOUT = 150000
 
-const lines = { loa: [], lob: [] }
+const lines = { loa: [], lob: [], loc: [] }
 const procs = new Map() // key -> proc
 
 function launch(key, args) {
-  const p = spawn(ELECTRON, ['.', `--profile=${key}`, '--bot', `--name=${key === 'loa' ? 'alice' : 'bob'}`, `--room=${ROOM}`, ...args], { cwd: ROOT })
+  const p = spawn(ELECTRON, ['.', `--profile=${key}`, '--bot', `--name=${key === 'loa' ? 'alice' : key === 'loc' ? 'carol' : 'bob'}`, `--room=${ROOM}`, ...args], { cwd: ROOT })
+  p.__key = key
   procs.set(key, p)
   p.stdout.on('data', (d) => {
     for (const line of d.toString().split('\n')) {
-      if (line.trim()) { lines[key].push(line); console.log(`  [${key}] ${line}`) }
+      if (line.trim()) { (lines[key] ||= []).push(line); console.log(`  [${key}] ${line}`) }
     }
   })
   p.stderr.on('data', (d) => {
     for (const line of d.toString().split('\n')) {
-      if (line.trim() && !/webrtc|stun_port|socket_tcp|sandbox_ext/.test(line)) lines[key].push(line)
+      if (line.trim() && !/webrtc|stun_port|socket_tcp|sandbox_ext/.test(line)) (lines[key] ||= []).push(line)
     }
   })
   return p
 }
 
+function kill(key) {
+  try { execSync(`pkill -9 -f "profile=${key}"`) } catch { /* 忽略 */ }
+  procs.delete(key)
+}
 function killAll() {
-  for (const [, p] of procs) { try { p.kill('SIGKILL') } catch { /* 忽略 */ } }
+  try { execSync('pkill -9 -f "OrayChatGroup/node_modules/electron/dist" 2>/dev/null') } catch { /* 忽略 */ }
   procs.clear()
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 等待条件出现（轮询日志），返回匹配文本或超时抛错
-async function waitLog(keys, pattern, label) {
+async function waitLog(keys, pattern, label, timeoutMs = STAGE_TIMEOUT) {
   const start = Date.now()
   const re = new RegExp(pattern)
-  while (Date.now() - start < STAGE_TIMEOUT) {
+  while (Date.now() - start < timeoutMs) {
     for (const k of keys) {
       const hit = lines[k].find((l) => re.test(l))
       if (hit) return { key: k, line: hit }
@@ -93,6 +98,14 @@ async function run() {
   await waitLog(['lob'], 'SYNC conv=lobby changed=true n=1 last="offline-msg-2"', '阶段4')
   results.push(['阶段4：bob 上线后自动全局同步，大厅日志恢复出离线期间的消息', true])
   console.log('  ✅ 阶段 4 通过')
+
+  // ---- 阶段 5：离线作者的名字经同步传播（carol 未与 alice 直接握手也能解析） ----
+  console.log('\n--- 阶段 5：离线作者昵称随同步帧传播 ---')
+  kill('loa'); await sleep(1500)   // alice 下线（其消息仍在 bob 的共享日志里）
+  launch('loc', 'carol', ['--no-exit'])
+  await waitLog(['loc'], 'NAME name="alice"', '阶段5', 240000)
+  results.push(['阶段5：carol 未与 alice 握手，仍通过同步帧解析出她的昵称', true])
+  console.log('  ✅ 阶段 5 通过')
 
   console.log('\n== 大厅 e2e 断言汇总 ==')
   let pass = true

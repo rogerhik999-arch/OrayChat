@@ -25,9 +25,14 @@ const t2 = new RelayTransport({
   onLog: (m) => console.log(`[B] ${m}`),
 })
 
-// 等待双方 presence 互通
-await new Promise((r) => setTimeout(r, 10000))
-console.log(`\nA.peers=${[...t1.peers.keys()].map((k) => k.slice(0, 10))} B.peers=${[...t2.peers.keys()].map((k) => k.slice(0, 10))}`)
+// 等待双方 presence 互通（轮询至 60s，公共 broker 有延迟抖动）
+{
+  const start = Date.now()
+  while (Date.now() - start < 60000 && !(t1.peers.has(idB) && t2.peers.has(idA))) {
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+  console.log(`\nA.peers=${[...t1.peers.keys()].map((k) => k.slice(0, 10))} B.peers=${[...t2.peers.keys()].map((k) => k.slice(0, 10))} (等待 ${Math.round((Date.now() - start) / 1000)}s)`)
+}
 assert.ok(t1.peers.has(idB), 'A 应通过 presence 发现 B')
 assert.ok(t2.peers.has(idA), 'B 应通过 presence 发现 A')
 

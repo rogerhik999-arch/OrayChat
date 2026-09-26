@@ -2,7 +2,7 @@
 // 模式一（默认）：登录 → 公共 MQTT 信令 → WebRTC P2P 直连 → E2EE 握手 → 加密往返
 // 模式二（--relay）：强制 --relay-only，验证公共 MQTT 中继回退路径也能完成加密往返
 // 运行：node test/e2e.mjs [--relay]
-import { spawn } from 'node:child_process'
+import { spawn, execSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -38,7 +38,7 @@ function launch(profile, args, key) {
 }
 
 function cleanup(code) {
-  for (const p of procs) { try { p.kill('SIGKILL') } catch { /* 忽略 */ } }
+  try { execSync('pkill -9 -f "OrayChatGroup/node_modules/electron/dist" 2>/dev/null') } catch { /* 忽略 */ }
   process.exit(code)
 }
 
