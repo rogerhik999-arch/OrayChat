@@ -673,6 +673,9 @@ async function main() {
     if (state.args['close-after-ms']) {
       setTimeout(() => window.oray.closeWindow(), Number(state.args['close-after-ms']))
     }
+    if (state.args['hb-log']) {
+      setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
+    }
     if (state.args['try-direct-after-ms']) {
       setTimeout(async () => {
         const ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')

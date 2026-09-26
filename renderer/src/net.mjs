@@ -466,9 +466,8 @@ export class ChatNet {
     return { mid, count: targets.length }
   }
 
-  // 兼容旧接口：send = 私聊；broadcast = 大厅群发
+  // 兼容旧接口：send = 私聊（1:1）
   async send(peerId, text) { return this.sendMessage(peerId, text, 'dm') }
-  async broadcast(text) { return this.sendMessage('all', text, 'lobby') }
 
   // ---------- 群体删除 / 清空（任何成员可发起，全体生效） ----------
 
