@@ -330,7 +330,14 @@ function renderReconnectBar() {
   bar.classList.add('hidden')
 }
 
-function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages() }
+function updateComposerPlaceholder() {
+  const el = $('input')
+  if (!el) return
+  if (state.view.conv === 'lobby') el.placeholder = '📢 群发给房间内所有人（大厅）…'
+  else el.placeholder = `🔒 私密发给 ${currentPeerName() || '对方'}（仅对方可见）…`
+}
+
+function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages(); updateComposerPlaceholder() }
 
 function selectView(v) {
   state.view = v
@@ -406,7 +413,10 @@ async function doLogin(name, room) {
   $('selfRoom').textContent = room
   $('loginView').classList.add('hidden')
   $('mainView').classList.remove('hidden')
-  selectView({ conv: 'lobby' })
+  // 默认进入第一个在线成员的私聊（避免误以为输入框是私聊却群发）；无人在线才落大厅
+  const firstReady = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+  if (firstReady) selectView({ conv: 'dm', peerId: firstReady[0] })
+  else selectView({ conv: 'lobby' })
 }
 
 function showExistingId(text, createdAt) {
@@ -478,7 +488,7 @@ function netHooks() {
       renderPeers()
     },
     onPeerName: (peerId, p, idPubHex, name) => {
-      if (saveName(idPubHex, name)) renderConv()
+      if (saveName(idPubHex, name)) { renderConv(); renderPeers() }
       if (state.args.bot) window.oray.botLog(`[BOT] NAME name=${JSON.stringify(name)} id=${idPubHex.slice(0, 8)}…`)
     },
     onControl: (peerId, p, ctl) => {
