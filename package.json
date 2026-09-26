@@ -1,10 +1,10 @@
 {
   "name": "oraychat",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Private P2P encrypted chat desktop app",
   "main": "electron/main.js",
   "scripts": {
-    "test": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/relay.test.mjs && node test/e2e.mjs",
+    "test": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/web-shim.test.mjs && node test/relay.test.mjs && node test/e2e.mjs",
     "build": "esbuild renderer/src/app.mjs --bundle --outfile=renderer/dist/app.bundle.js --format=iife --platform=browser --target=chrome130",
     "start": "npm run build && electron .",
     "check:services": "node tools/check-services.mjs",

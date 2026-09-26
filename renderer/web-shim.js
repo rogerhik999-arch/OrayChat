@@ -45,9 +45,18 @@
     saveIdentity: async (username, json) => { ls.set(kv(`identity:${username}`), JSON.stringify(json)); return true },
     listIdentities: async () => Object.keys(localStorage).filter((k) => k.startsWith('oray-kv:identity:')).map((k) => k.split('identity:')[1]),
 
-    // 本地 KV（与桌面端 local-state.json 对应）
-    kvGet: async (key) => ls.get(kv(key)),
-    kvSet: async (key, val) => { ls.set(kv(key), val); return true },
+    // 本地 KV（与桌面端 local-state.json 对应）：
+    // localStorage 只能存字符串，对象值必须 JSON 序列化，否则读取端
+    // Object.keys(字符串) 会把字符下标当键（手机端登录历史损坏的根因）
+    kvGet: async (key) => {
+      const raw = ls.get(kv(key))
+      if (raw === null) return null
+      try { return JSON.parse(raw) } catch { return raw } // 兼容历史裸字符串
+    },
+    kvSet: async (key, val) => {
+      ls.set(kv(key), val === null || val === undefined ? null : JSON.stringify(val))
+      return true
+    },
 
     botLog: (line) => console.log(line),
     botExit: (code) => console.log(`[botExit] ${code}`),

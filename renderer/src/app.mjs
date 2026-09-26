@@ -60,13 +60,22 @@ function authorName(idPubHex) {
 
 const LOGIN_KEY = 'oc-login-history'
 async function getLoginHistory() {
-  return (await window.oray.kvGet(LOGIN_KEY)) || {}
+  // 自愈：历史数据可能是损坏的（字符串/数组/含非法条目），统一规整为
+  // { 昵称: { room: string } } 形状；无法规整则重置为空
+  const raw = await window.oray.kvGet(LOGIN_KEY)
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out = {}
+  for (const [name, e] of Object.entries(raw)) {
+    if (!name.trim() || !e || typeof e !== 'object' || typeof e.room !== 'string' || !e.room.trim()) continue
+    out[name.trim()] = { room: e.room.trim() }
+  }
+  return out
 }
 // remember=false 时保留旧口令不清除（勾选状态由界面控制保存与否）
 async function upsertLogin(name, room) {
   const h = await getLoginHistory()
   h[name] = { room }
-  await window.oray.kvSet(LOGIN_KEY, h)
+  await window.oray.kvSet(LOGIN_KEY, h) // getLoginHistory 已规整，写回即清洗旧垃圾
   renderSavedAccounts()
 }
 async function forgetLogin(name) {
