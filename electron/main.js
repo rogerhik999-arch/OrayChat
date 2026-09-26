@@ -115,12 +115,14 @@ function registerIpc() {
 }
 
 function createWindow() {
-  // --render-icon=<输出.png>：以 1024×1024 透明窗口渲染产品图标（构建管线用）
+  // --render-icon=<输出.png>：渲染产品图标（构建管线用；托盘图为 44×44，其余 1024×1024）
   const isIconRenderer = !!argv['render-icon']
   const [usrW, usrH] = String(argv['window-size'] || '').split('x').map(Number)
+  const isTrayRender = isIconRenderer && String(argv['icon-page'] || '').startsWith('tray')
+  const rSize = isIconRenderer ? (isTrayRender ? 44 : 1024) : (usrW || 1120)
   const win = new BrowserWindow({
-    width: isIconRenderer ? 1024 : (usrW || 1120),
-    height: isIconRenderer ? 1024 : (usrH || 760),
+    width: rSize,
+    height: isIconRenderer ? rSize : (usrH || 760),
     minWidth: isIconRenderer || usrW ? undefined : 860,
     minHeight: isIconRenderer || usrH ? undefined : 560,
     show: isIconRenderer ? false : !IS_BOT,

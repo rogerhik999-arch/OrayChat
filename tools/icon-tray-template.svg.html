@@ -1,20 +1,22 @@
 <!doctype html>
-<!-- OrayChat 托盘模板图（macOS：黑色+alpha，44×44 含 4px 安全边距） -->
+<!-- OrayChat 托盘模板图（macOS：黑色+alpha，44×44；keyhole 用 evenodd 挖孔，不用 mask） -->
 <html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}</style></head>
 <body>
 <svg width="44" height="44" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <defs><mask id="m">
-    <rect width="1024" height="1024" fill="white"/>
-    <circle cx="544" cy="592" r="30" fill="black"/>
-    <rect x="530" y="600" width="28" height="64" rx="14" fill="black"/>
-  </mask></defs>
   <g transform="translate(512 512) scale(0.72) translate(-512 -512)">
+    <!-- 对端小气泡（描边） -->
     <path d="M 610 176 h 210 a 96 96 0 0 1 96 96 v 88 a 96 96 0 0 1 -96 96 h -150 l -84 78 l 6 -78 h 18 a 96 96 0 0 1 -96 -96 v -88 a 96 96 0 0 1 96 -96 z"
           fill="none" stroke="black" stroke-width="26"/>
+    <!-- 主气泡 -->
     <path d="M 372 330 h 376 a 132 132 0 0 1 132 132 v 216 a 132 132 0 0 1 -132 132 h -406 l -152 132 l 34 -132 h -14 a 132 132 0 0 1 -132 -132 v -216 a 132 132 0 0 1 132 -132 z"
-          fill="black" mask="url(#m)"/>
+          fill="black"/>
+    <!-- 锁环 -->
     <path d="M 448 520 v -56 a 96 96 0 0 1 192 0 v 56" fill="none" stroke="black" stroke-width="38" stroke-linecap="round"/>
-    <rect x="396" y="508" width="296" height="212" rx="44" fill="black"/>
+    <!-- 锁体 + 锁孔（evenodd 挖孔） -->
+    <path fill-rule="evenodd" fill="black"
+          d="M 440 508 h 208 a 44 44 0 0 1 44 44 v 124 a 44 44 0 0 1 -44 44 h -208 a 44 44 0 0 1 -44 -44 v -124 a 44 44 0 0 1 44 -44 z
+             M 544 562 a 30 30 0 1 0 0.01 0 z
+             M 530 592 h 28 v 72 h -28 z"/>
   </g>
 </svg>
 </body></html>
