@@ -186,8 +186,18 @@ function showMainWindow() {
 }
 
 function createTray() {
-  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'))
-    .resize({ width: process.platform === 'darwin' ? 22 : 32, height: process.platform === 'darwin' ? 22 : 32 })
+  // 模板图（macOS，自动适配深浅色菜单栏）/ 彩色图（Windows/Linux）
+  const p = process.platform === 'darwin'
+    ? path.join(__dirname, 'assets', 'trayTemplate.png')
+    : path.join(__dirname, 'assets', 'tray-color.png')
+  let icon = nativeImage.createFromPath(p)
+  if (icon.isEmpty()) {
+    process.stdout.write(`[tray] 警告：托盘图标资源缺失 ${p}\n`)
+    icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'))
+  }
+  if (process.platform === 'darwin') icon.setTemplateImage(true)
+  icon = icon.resize({ width: process.platform === 'darwin' ? 22 : 32, height: process.platform === 'darwin' ? 22 : 32 })
+  process.stdout.write(`[tray] 图标加载 ${icon.isEmpty() ? '失败(空图像)' : '成功'} source=${p}\n`)
   tray = new Tray(icon)
   tray.setToolTip('OrayChat — 私有 P2P 加密聊天（运行中）')
   tray.setContextMenu(Menu.buildFromTemplate([
