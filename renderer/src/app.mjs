@@ -489,6 +489,11 @@ function netHooks() {
       renderConv()
       renderPeers()
     },
+    onGoOnline: (reason) => {
+      appendSys(`📶 主动上线：${reason}`)
+      if (state.args.bot) window.oray.botLog(`[BOT] GO-ONLINE reason=${JSON.stringify(reason)}`)
+      renderPeers()
+    },
     onPresence: (peerId, p) => {
       if (state.args.bot) window.oray.botLog(`[BOT] PRESENCE from=${p.name}`)
       renderPeers()
@@ -682,6 +687,19 @@ async function main() {
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
     }
+    if (state.args['go-online-after-ms']) {
+      setTimeout(() => {
+        // --kill-pc：模拟待机冻结（WebRTC 连接被系统切断）后再主动上线
+        if (state.args['kill-pc']) {
+          for (const [, p] of state.net.peers) {
+            try { p.pc.close() } catch { /* 忽略 */ }
+            p.pc = null
+          }
+          window.oray.botLog('[BOT] KILL-PC 已模拟待机（pc 全部关闭）')
+        }
+        state.net.goOnline('bot 注入测试')
+      }, Number(state.args['go-online-after-ms']))
+    }
     if (state.args['switch-seq']) {
       // 视图切换序列：name1:text1,name2:text2,... 模拟用户在两个会话间来回切换发消息
       const steps = String(state.args['switch-seq']).split(',').map((x) => x.split(':'))
@@ -739,9 +757,22 @@ async function main() {
   }
 }
 
+// 待机/恢复检测：每次 tick 记录时间；若相邻 tick 间隔剧增（>30s）说明系统冻结过
+let lastTick = Date.now()
+setInterval(() => {
+  const now = Date.now()
+  if (now - lastTick > 30000 && state.net) {
+    state.net.goOnline(`检测到待机约 ${Math.round((now - lastTick) / 1000)}s 后恢复`)
+  }
+  lastTick = now
+}, 5000)
 setInterval(() => {
   if (state.net && !$('mainView').classList.contains('hidden')) renderPeers()
 }, 5000)
+// 回到前台：主动检查上线状态
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.net) state.net.onVisible()
+})
 
 main().catch((e) => {
   console.error('启动失败', e)

@@ -169,7 +169,7 @@ export class ChatNet {
     const existing = this.peers.get(peerId)
     if (existing) {
       // 中继会话对端现在可以直连了 → 升级
-      if (existing.via === 'mqtt') {
+      if (existing.via === 'mqtt' && existing.lockVia !== 'mqtt') {
         existing.via = 'p2p'
         existing.pc = this.room.getPeers()[peerId] || null
         this.attachConnectionWatch(peerId)
@@ -207,6 +207,8 @@ export class ChatNet {
   dropPeer(peerId, peer) {
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
+    if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
+    if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
     this.peers.delete(peerId)
     this.hooks.onPeerRemoved?.(peerId, peer)
   }
@@ -248,13 +250,17 @@ export class ChatNet {
       peer.pending = pend
       peer.role = 'initiator'
       this.sendHs(peerId, msg)
-      // QoS0 传输可能丢帧：周期性重发 hs1 直到进入下一阶段（hs2 到达即清除）
-      if (peer.via === 'mqtt') {
-        this.clearRetransmit(peer)
-        peer.hsRetransmit = setInterval(() => {
-          if (peer.state === 'handshaking' && peer.pending) this.sendHs(peerId, msg)
-        }, 3000)
-      }
+      // QoS0 传输可能丢帧：周期性重发 hs1 直到进入下一阶段（hs2 到达即清除）。
+      // p2p 也启用（首轮 hs3 丢失的场景证明 WebRTC 数据通道同样会丢首帧）
+      this.clearRetransmit(peer)
+      let hsRetries = 0
+      peer.hsRetransmit = setInterval(() => {
+        if (peer.state !== 'handshaking' || !peer.pending) { this.clearRetransmit(peer); return }
+        if (peer.via === 'mqtt' || hsRetries < 5) {
+          hsRetries++
+          this.sendHs(peerId, msg)
+        } else this.clearRetransmit(peer)
+      }, peer.via === 'mqtt' ? 3000 : 4000)
       this.hooks.onLog?.(`→ 向 ${peerId.slice(0, 8)}…（${peer.via}）发起 E2EE 握手 (hs1)`)
     } else {
       peer.role = 'responder'
@@ -314,7 +320,9 @@ export class ChatNet {
 
   onHandshakeFrame(peerId, msg, via) {
     const peer = this.peers.get(peerId)
-    if (!peer || peer.via !== via) return
+    if (!peer) return
+    if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
+    if (peer.via !== via) return
     try {
       if (msg.t === 'OC-HS1-v1') {
         if (this.iAmInitiator(peerId)) return // 双方角色规则一致，不应收到 hs1；忽略竞态帧
@@ -340,11 +348,25 @@ export class ChatNet {
         peer.ctx = ctx
         peer.name = ctx.peerName
         this.sendHs(peerId, hs3)
+        // hs3 丢了响应方不会就绪并重发 hs1：发起方在就绪前重发 hs3
+        if (!peer.hs3Retry) {
+          peer.hs3Retry = setInterval(() => {
+            if (this.peers.get(peerId)?.state === 'ready') { clearInterval(peer.hs3Retry); peer.hs3Retry = null; return }
+            this.sendHs(peerId, hs3)
+          }, 2500)
+        }
         this.hooks.onLog?.(`收到 hs2，已回 hs3（对端=${ctx.peerName}，${via}）`)
       } else if (msg.t === 'OC-HS3-v1') {
         const { msg: hs3ack } = oc.acceptHs3(peer.ctx, msg)
         this.sendHs(peerId, hs3ack)
         this.markReady(peerId) // 响应方在回完 hs3ack 后同样进入就绪
+        // hs3ack 丢了发起方不会就绪并重发 hs3：响应方在就绪前短暂重发 hs3ack
+        if (peer.via === 'mqtt' && !peer.hs3ackRetry) {
+          peer.hs3ackRetry = setInterval(() => {
+            if (this.peers.get(peerId)?.state === 'ready') { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null; return }
+            this.sendHs(peerId, hs3ack)
+          }, 2500)
+        }
       } else if (msg.t === 'OC-HS3ACK-v1') {
         oc.acceptHs3ack(peer.ctx, msg)
         this.markReady(peerId)
@@ -370,6 +392,9 @@ export class ChatNet {
     peer.safety = oc.safetyNumber(this.ident.edPub, peer.ctx.peerIdPub)
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
+    if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
+    if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
+    peer.lockVia = null
     if (peer.via === 'p2p') {
       peer.candidates = this.candidateSummary(peer)
       this.detectPath(peerId)
@@ -691,6 +716,53 @@ export class ChatNet {
       await new Promise((r) => setTimeout(r, 500))
     }
     return false
+  }
+
+  // ---------- 主动上线（移动端待机恢复 / 网络切换） ----------
+
+  // 统一上线入口：强制重建中继连接 + 全部会话按中继重新握手 + 重同步。
+  // 直连（p2p）会话若 WebRTC 仍存活则只补同步；否则切中继（直连后续自动升级回来）。
+  goOnline(reason = 'manual') {
+    this.hooks.onGoOnline?.(reason)
+    this.hooks.onLog?.(`主动上线（${reason}）：重建中继连接并重新握手`, 'warn')
+    const wasRelayConnected = this.relay?.connected
+    this.relay.forceReconnect()
+    // 中继重建瞬间连接不稳定：等连上后再发起重握手（否则新 hs1 首帧易丢）
+    const kickoff = () => {
+      for (const [peerId, peer] of [...this.peers.entries()]) {
+        const pcAlive = peer.pc && peer.pc.connectionState === 'connected'
+        if (pcAlive) {
+          // 直连仍存活：会话密钥有效，只补同步错过的消息
+          this.pushSync(peerId, 'lobby')
+          this.pushSync(peerId, 'dm')
+          continue
+        }
+        this.restartHandshake(peerId, 'mqtt') // 先走中继恢复会话，直连恢复后自动升级
+      }
+    }
+    if (wasRelayConnected && this.relay?.connected) {
+      this.hooks.onLog?.(`goOnline kickoff：${this.peers.size} 个会话待恢复`)
+      for (const peerId of this.peers.keys()) this.peers.get(peerId).lockVia = 'mqtt'
+      kickoff()
+    } else {
+      // 等中继真正连上（forceReconnect 已重置连接），最多 30s
+      const start = Date.now()
+      const t = setInterval(() => {
+        if (this.relay?.connected || Date.now() - start > 30000) {
+          clearInterval(t)
+          this.hooks.onLog?.(`goOnline kickoff（等待分支，${Math.round((Date.now() - start) / 1000)}s）：${this.peers.size} 个会话待恢复`)
+          for (const peerId of this.peers.keys()) this.peers.get(peerId).lockVia = 'mqtt'
+          kickoff()
+        }
+      }, 500)
+    }
+  }
+
+  // 回到前台：中继掉线即主动上线
+  onVisible() {
+    if (this.destroyed) return
+    if (!this.relay?.connected && !this.opts.forceRelay) this.goOnline('回到前台且中继离线')
+    else if (!this.relay?.connected) this.goOnline('回到前台且中继离线')
   }
 
   readyPeerIds() {

@@ -87,12 +87,11 @@ export class RelayTransport {
     })
     client.on('error', () => { /* 换下一个 broker */ })
     client.on('close', () => {
+      if (this.client !== client || this.closed) return // 已被 forceReconnect 替换的旧连接：忽略
       clearInterval(this.presenceTimer)
       clearInterval(this.pruneTimer)
-      if (this.client === client && !this.closed) {
-        this.onLog('MQTT 中继断开，尝试下一个 broker', 'warn')
-        this.connect(idx + 1)
-      }
+      this.onLog('MQTT 中继断开，尝试下一个 broker', 'warn')
+      this.connect(idx + 1)
     })
   }
 
@@ -110,6 +109,21 @@ export class RelayTransport {
       }
     }
   }
+
+  // 主动重连（App 从待机恢复、网络切换时调用）：
+  // 断开当前连接并从头尝试 broker 列表。置空 this.client 再 end，
+  // 使 close 事件的自动重连分支跳过，避免双重连接。
+  forceReconnect() {
+    if (this.closed) return
+    clearInterval(this.presenceTimer)
+    clearInterval(this.pruneTimer)
+    const old = this.client
+    this.client = null
+    try { old?.end(true) } catch { /* 忽略 */ }
+    this.connect(0)
+  }
+
+  get connected() { return !!this.client?.connected }
 
   send(peerId, kind, data) {
     if (!this.client?.connected) throw new Error('MQTT 中继未连接')
