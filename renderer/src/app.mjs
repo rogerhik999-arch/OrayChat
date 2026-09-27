@@ -613,6 +613,13 @@ function bindUi() {
   })
   $('logoutBtn').onclick = () => { state.net?.destroy(); window.oray.quit() }
 
+  // 设置窗口（修改网络/托盘等配置需重启应用生效）
+  if (window.oray.openSettings) {
+    $('settingsBtn').onclick = () => window.oray.openSettings()
+  } else {
+    $('settingsBtn').style.display = 'none' // web 版无设置窗口
+  }
+
   // 移动端抽屉：☰ 开、遮罩/Esc 关
   const closeDrawer = () => document.body.classList.remove('sidebar-open')
   $('menuBtn').onclick = () => document.body.classList.toggle('sidebar-open')

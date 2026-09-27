@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('oray', {
   getConfig: () => ipcRenderer.invoke('config:get'),
   getLaunchArgs: () => ipcRenderer.invoke('launch-args:get'),
   appInfo: () => ipcRenderer.invoke('app:info'),
+  openSettings: () => ipcRenderer.invoke('settings:open'),
 
   // 身份密钥持久化
   loadIdentity: (username) => ipcRenderer.invoke('identity:load', username),

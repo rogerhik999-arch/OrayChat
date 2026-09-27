@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>OrayChat 设置</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body { overflow-y: auto; padding: 20px 26px; }
+    .set-card { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+    .set-card h2 { font-size: 14px; color: var(--accent); margin-bottom: 10px; }
+    .set-card label { display: block; font-size: 12px; color: var(--tx2); margin: 8px 0 3px; }
+    .set-card textarea, .set-card input[type=text] {
+      width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+      background: var(--bg3); color: var(--tx); font: 12px/1.6 "SF Mono", Menlo, monospace; outline: none;
+    }
+    .set-card textarea { min-height: 54px; resize: vertical; }
+    .set-card .hint { font-size: 11px; color: var(--tx2); margin-top: 4px; }
+    .row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+    .row select, .row input[type=text] { font-size: 13px; }
+    button.primary { width: auto; padding: 8px 22px; margin-top: 8px; }
+    button.ghost { padding: 6px 14px; }
+    .danger-zone button { border-color: #5c3535; color: var(--err); }
+    .danger-zone button:hover { background: #3a2323; }
+    #about table { width: 100%; font-size: 12.5px; border-collapse: collapse; }
+    #about td { padding: 5px 4px; border-bottom: 1px solid var(--line); }
+    #about td:first-child { color: var(--tx2); width: 110px; }
+    #toast {
+      position: fixed; right: 20px; bottom: 20px; padding: 9px 18px; border-radius: 9px;
+      background: var(--ok); color: #08281c; font-weight: 700; font-size: 13px;
+      opacity: 0; transition: opacity .25s; pointer-events: none;
+    }
+    #toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <h1 style="font-size:18px; margin-bottom:14px">⚙️ 设置</h1>
+
+  <div class="set-card">
+    <h2>通用</h2>
+    <label>默认房间名（登录页留空时使用）</label>
+    <input type="text" id="defaultRoom" placeholder="oraychat-hall" />
+    <div class="row">
+      <input type="checkbox" id="trayEnabled" style="width:auto" />
+      <label for="trayEnabled" style="margin:0; color:var(--tx); font-size:13px; cursor:pointer">
+        关闭窗口后驻留系统托盘后台运行（关掉后：关窗即退出）
+      </label>
+    </div>
+    <button class="primary" id="saveGeneral">保存通用设置</button>
+    <div class="hint">通用设置保存后需重新登录/重启应用生效。</div>
+  </div>
+
+  <div class="set-card">
+    <h2>网络（私有化部署：STUN / TURN / MQTT broker）</h2>
+    <label>STUN 服务器（每行一条，如 stun:host:port）</label>
+    <textarea id="stunUrls" spellcheck="false"></textarea>
+    <label>TURN 服务器（JSON 数组，含 username/credential）</label>
+    <textarea id="turnServers" spellcheck="false" style="min-height:80px"></textarea>
+    <label>MQTT broker（每行一条 wss:// 地址；信令与中继回退共用）</label>
+    <textarea id="relayBrokers" spellcheck="false"></textarea>
+    <button class="primary" id="saveNetwork">保存网络设置</button>
+    <div class="hint">保存后重启应用生效。留空 = 恢复默认公共配置。</div>
+  </div>
+
+  <div class="set-card danger-zone">
+    <h2>清空本地数据（不影响其他设备）</h2>
+    <div class="row">
+      <span style="flex:1; font-size:12.5px; color:var(--tx2)">登录历史（本机保存的昵称/房间列表）</span>
+      <button class="ghost" id="clearLogin">清空</button>
+    </div>
+    <div class="row">
+      <select id="roomSelect" style="flex:1; padding:7px; border-radius:8px; border:1px solid var(--line); background:var(--bg3); color:var(--tx)"></select>
+      <button class="ghost" id="clearRoom">清空该房间聊天记录</button>
+    </div>
+  </div>
+
+  <div class="set-card" id="about">
+    <h2>关于</h2>
+    <table>
+      <tr><td>版本</td><td id="aboutVersion">—</td></tr>
+      <tr><td>Profile</td><td id="aboutProfile">—</td></tr>
+      <tr><td>本机身份</td><td id="aboutIdentities">—</td></tr>
+    </table>
+    <div class="hint">安全码（双方身份联合指纹）显示于每个聊天会话的顶部徽章，请与对方线下核对。</div>
+  </div>
+
+  <div style="text-align:center; margin: 8px 0 20px">
+    <button class="ghost" id="openMain">返回主窗口</button>
+  </div>
+
+  <div id="toast"></div>
+  <script src="settings.js"></script>
+</body>
+</html>

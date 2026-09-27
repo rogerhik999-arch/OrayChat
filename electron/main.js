@@ -111,6 +111,58 @@ function registerIpc() {
     return img.toPNG()
   })
   ipcMain.handle('app:quit', () => { isQuiting = true; app.quit() })
+
+  // ---------- 设置窗口 ----------
+  // config 存 local-state.json 的 'oc-config' 键（用户覆盖项），与内置 DEFAULT_CONFIG 合并
+  ipcMain.handle('settings:get', () => {
+    const s = loadLocalState()
+    return {
+      userConfig: s['oc-config'] || {},
+      trayEnabled: s['oc-tray-enabled'] !== false, // 默认开
+      version: app.getVersion(),
+      profile: PROFILE,
+      identities: (() => {
+        try {
+          return fs.readdirSync(identitiesDir()).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, ''))
+        } catch { return [] }
+      })(),
+    }
+  })
+  ipcMain.handle('settings:set-user-config', (_e, userConfig) => {
+    const s2 = loadLocalState()
+    s2['oc-config'] = userConfig || {}
+    fs.writeFileSync(statePath(), JSON.stringify(s2), { mode: 0o600 })
+    return true
+  })
+  ipcMain.handle('settings:set-tray-enabled', (_e, enabled) => {
+    const s3 = loadLocalState()
+    s3['oc-tray-enabled'] = !!enabled
+    fs.writeFileSync(statePath(), JSON.stringify(s3), { mode: 0o600 })
+    return true
+  })
+  ipcMain.handle('settings:clear-data', (_e, kind, room) => {
+    const s4 = loadLocalState()
+    let cleared = 0
+    if (kind === 'login-history') {
+      cleared = Object.keys(s4['oc-login-history'] || {}).length
+      delete s4['oc-login-history']
+    } else if (kind === 'room-log' && room) {
+      const key = `oc-log2:${room}`
+      cleared = 1
+      delete s4[key]
+      const nameKey = `oc-names:${room}`
+      delete s4[nameKey]
+    }
+    fs.writeFileSync(statePath(), JSON.stringify(s4), { mode: 0o600 })
+    return cleared
+  })
+  ipcMain.handle('settings:list-rooms', () => {
+    const s5 = loadLocalState()
+    return Object.keys(s5).filter((k) => k.startsWith('oc-log2:')).map((k) => k.replace('oc-log2:', ''))
+  })
+  ipcMain.handle('settings:open-main', () => { showMainWindow() })
+  ipcMain.handle('settings:open', () => { createSettingsWindow() })
+  ipcMain.on('win:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
   ipcMain.on('win:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
 }
 
@@ -143,9 +195,13 @@ function createWindow() {
 
   // 关闭窗口 = 隐藏窗口、应用驻留系统托盘后台继续运行；退出必须经托盘菜单
   win.on('close', (e) => {
-    process.stdout.write(`[tray] close 事件触发 isQuiting=${isQuiting} IS_BOT=${IS_BOT}\n`)
     if (!isQuiting && !IS_BOT) {
-      process.stdout.write('[tray] 隐藏窗口，驻留后台\n')
+      // 托盘驻留被停用时：关窗即退出
+      let trayEnabled = true
+      try {
+        trayEnabled = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'local-state.json'), 'utf8'))['oc-tray-enabled'] !== false
+      } catch { /* 默认开 */ }
+      if (!trayEnabled) { isQuiting = true; app.quit(); return }
       e.preventDefault()
       win.hide()
       if (process.platform === 'win32' && tray) tray.displayBalloon?.({
@@ -178,6 +234,27 @@ function createWindow() {
   return win
 }
 
+let settingsWin = null
+function createSettingsWindow() {
+  if (settingsWin && !settingsWin.isDestroyed()) { settingsWin.show(); settingsWin.focus(); return }
+  settingsWin = new BrowserWindow({
+    width: 720,
+    height: 640,
+    minWidth: 560,
+    minHeight: 480,
+    title: 'OrayChat 设置',
+    backgroundColor: '#101418',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'settingsPreload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  })
+  settingsWin.loadFile(path.join(__dirname, '..', 'renderer', 'settings.html'))
+  settingsWin.on('closed', () => { settingsWin = null })
+}
+
 function showMainWindow() {
   const win = BrowserWindow.getAllWindows()[0]
   if (win) {
@@ -204,6 +281,7 @@ function createTray() {
   tray.setToolTip('OrayChat — 私有 P2P 加密聊天（运行中）')
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示主窗口', click: showMainWindow },
+    { label: '设置…', click: () => createSettingsWindow() },
     { type: 'separator' },
     { label: '退出 OrayChat', click: () => { isQuiting = true; app.quit() } },
   ]))
@@ -222,7 +300,13 @@ if (!gotTheLock) {
 app.whenReady().then(() => {
   registerIpc()
   createWindow()
-  if (!IS_BOT) createTray()
+  // 托盘驻留开关（设置页可改；默认开）。读取 local-state（尚未迁移前的轻量读取）
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'local-state.json'), 'utf8'))
+    if (st['oc-tray-enabled'] === false) {
+      process.stdout.write('[tray] 已在设置中停用系统托盘驻留\n')
+    } else if (!IS_BOT) createTray()
+  } catch { if (!IS_BOT) createTray() }
   app.on('activate', () => showMainWindow()) // macOS 点 Dock 图标恢复
 })
 
