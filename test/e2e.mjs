@@ -2,12 +2,16 @@
 // 模式一（默认）：登录 → 公共 MQTT 信令 → WebRTC P2P 直连 → E2EE 握手 → 加密往返
 // 模式二（--relay）：强制 --relay-only，验证公共 MQTT 中继回退路径也能完成加密往返
 // 运行：node test/e2e.mjs [--relay]
-import { spawn, execSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { killTrees } from './proc-kill.mjs'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const ELECTRON = path.join(ROOT, 'node_modules', '.bin', 'electron')
+const require_ = createRequire(import.meta.url)
+// electron 包入口直接导出各平台可执行文件的绝对路径（.bin/electron 是 sh 脚本，Windows spawn 不了）
+const ELECTRON = require_('electron')
 const RELAY_MODE = process.argv.includes('--relay')
 const ROOM = `oc-test-${Date.now().toString(36)}${RELAY_MODE ? '-relay' : ''}`
 const COUNT = 3
@@ -38,7 +42,7 @@ function launch(profile, args, key) {
 }
 
 function cleanup(code) {
-  try { execSync('pkill -9 -f "OrayChatGroup/node_modules/electron/dist" 2>/dev/null') } catch { /* 忽略 */ }
+  killTrees(procs)
   process.exit(code)
 }
 

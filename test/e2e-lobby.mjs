@@ -4,12 +4,15 @@
 //   阶段3 离线落库: bob 离线，alice 在大厅发消息 → 仍保存于 alice 的共享日志（全体保存）
 //   阶段4 上线同步: bob 重新上线 → 握手完成后自动同步，bob 的大厅日志出现离线期间的消息
 // 运行：node test/e2e-lobby.mjs
-import { spawn, execSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { killTree, killTrees } from './proc-kill.mjs'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const ELECTRON = path.join(ROOT, 'node_modules', '.bin', 'electron')
+const require_ = createRequire(import.meta.url)
+const ELECTRON = require_('electron') // .bin/electron 是 sh 脚本，Windows spawn 不了
 const ROOM = `oc-lobby-${Date.now().toString(36)}`
 const STAGE_TIMEOUT = 150000
 
@@ -34,11 +37,12 @@ function launch(key, args) {
 }
 
 function kill(key) {
-  try { execSync(`pkill -9 -f "profile=${key}"`) } catch { /* 忽略 */ }
+  const p = procs.get(key)
+  if (p) killTree(p)
   procs.delete(key)
 }
 function killAll() {
-  try { execSync('pkill -9 -f "OrayChatGroup/node_modules/electron/dist" 2>/dev/null') } catch { /* 忽略 */ }
+  killTrees(procs.values())
   procs.clear()
 }
 

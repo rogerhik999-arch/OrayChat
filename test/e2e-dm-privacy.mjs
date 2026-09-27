@@ -3,12 +3,15 @@
 //   隐私断言：bob 私聊发给 alice 的消息 → alice 收到并回显；carol 绝不能收到
 //   时序健壮：全部断言基于同步帧（公共 broker 延迟抖动不影响结果）
 // 运行：node test/e2e-dm-privacy.mjs
-import { spawn, execSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { killTree, killTrees } from './proc-kill.mjs'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const ELECTRON = path.join(ROOT, 'node_modules', '.bin', 'electron')
+const require_ = createRequire(import.meta.url)
+const ELECTRON = require_('electron') // .bin/electron 是 sh 脚本，Windows spawn 不了
 const ROOM = `oc-priv-${Date.now().toString(36)}`
 const LOBBY_TEXT = `lobby-broadcast-${Date.now().toString(36)}`
 const DM_TEXT = `dm-private-${Date.now().toString(36)}`
@@ -32,8 +35,8 @@ function launch(key, name, args) {
   })
   return p
 }
-const kill = (key) => { try { execSync(`pkill -9 -f "profile=${key}"`) } catch { /* 忽略 */ } procs.delete(key) }
-const killAll = () => { try { execSync('pkill -9 -f "OrayChatGroup/node_modules/electron/dist"') } catch { /* 忽略 */ } procs.clear() }
+const kill = (key) => { const p = procs.get(key); if (p) killTree(p); procs.delete(key) }
+const killAll = () => { killTrees(procs.values()); procs.clear() }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function waitLog(keys, pattern, label, timeoutMs = 300000) {
