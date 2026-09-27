@@ -210,6 +210,15 @@ function createTray() {
   tray.on('click', showMainWindow) // macOS 左键直接弹窗
 }
 
+// 单实例锁（按 profile 隔离）：同一 profile 二次启动时，唤起已有窗口而非开新进程 ——
+// 避免双开导致同一身份在房间里出现两次、消息分叉与本地记录互相覆盖
+const gotTheLock = app.requestSingleInstanceLock()
+if (!gotTheLock) {
+  app.exit(0)
+} else {
+  app.on('second-instance', () => showMainWindow())
+}
+
 app.whenReady().then(() => {
   registerIpc()
   createWindow()

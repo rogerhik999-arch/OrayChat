@@ -55,6 +55,12 @@ function authorName(idPubHex) {
   return state.names.get(idPubHex) || `${idPubHex.slice(0, 8)}…`
 }
 
+// 当前私聊对端的显示名（lobby 视图返回 null）
+function currentPeerName() {
+  if (state.view.conv !== 'dm') return null
+  return state.net?.peers.get(state.view.peerId)?.name || null
+}
+
 // ---------- 口令记忆（可选，默认关闭；明文存本机文件，仅建议磁盘加密设备使用） ----------
 
 // ---------- 登录历史（按昵称记住房间+口令，可删除） ----------
@@ -675,6 +681,39 @@ async function main() {
     }
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
+    }
+    if (state.args['switch-seq']) {
+      // 视图切换序列：name1:text1,name2:text2,... 模拟用户在两个会话间来回切换发消息
+      const steps = String(state.args['switch-seq']).split(',').map((x) => x.split(':'))
+      ;(async () => {
+        for (let i = 0; i < steps.length; i++) {
+          const [peerName, text] = steps[i]
+          // 等待目标对端就绪（公共信令延迟大，最长 120s）
+          const start = Date.now()
+          let entry = null
+          while (Date.now() - start < 120000) {
+            entry = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && p.name === peerName)
+            if (entry) break
+            await new Promise((r) => setTimeout(r, 1000))
+          }
+          if (!entry) { window.oray.botLog(`[BOT] SWITCH skip=${peerName} 120s 未就绪`); continue }
+          selectView({ conv: 'dm', peerId: entry[0] })
+          await new Promise((r) => setTimeout(r, 300))
+          const title = document.querySelector('.chat-title')?.textContent
+          const last = [...document.querySelectorAll('.msgs .bubble .btext')].pop()?.textContent
+          await state.net.sendMessage(entry[0], text, 'dm')
+          window.oray.botLog(`[BOT] SWITCH step=${i} view=${peerName} title=${JSON.stringify(title)} lastVisible=${JSON.stringify(last || '')} sent=${JSON.stringify(text)}`)
+          await new Promise((r) => setTimeout(r, 800))
+        }
+        if (state.args['dump-store']) {
+          for (const [key, c] of Object.entries(state.net.store.exportAll())) {
+            const texts = (c.entries || []).map((e) => `${(e.author || '').slice(0, 6)}:${e.text}`).join(' | ')
+            window.oray.botLog(`[BOT] STORE conv=${key} n=${(c.entries || []).length} [${texts}]`)
+          }
+          window.oray.botLog('[BOT] STORE-DONE')
+          if (state.args['exit-after-dump']) window.oray.botExit(0)
+        }
+      })().catch((e) => window.oray.botLog(`[BOT] SWITCH-ERR ${e?.message || e}`))
     }
     if (state.args['try-direct-after-ms']) {
       setTimeout(async () => {
