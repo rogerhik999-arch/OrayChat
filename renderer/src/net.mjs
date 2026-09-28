@@ -95,6 +95,8 @@ export class ChatNet {
     this.heartbeatTimer = setInterval(() => this.sendPresenceHeartbeat(), PRESENCE_HEARTBEAT_MS)
     // 直连升级探测：中继会话每 45s 静默检查一次 Trystero 侧是否已打通/可重试
     this.directProbeTimer = setInterval(() => this.probeDirectUpgrades(), 45000)
+    // 失败会话周期性重试（60s）：修复"一侧显示失败、另一侧看不到"的单向可见
+    this.retryFailedTimer = setInterval(() => this.retryFailedSessions(), 60000)
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -220,7 +222,16 @@ export class ChatNet {
   onRelayAnnounce(peerId, info) {
     if (this.destroyed) return
     const existing = this.peers.get(peerId)
-    if (existing) return // 已有会话（P2P 优先）
+    if (existing) {
+      // 对端仍在线但其会话曾失败（单向可见的根因之一）：借 presence 时机重新握手
+      if (existing.state === 'failed' && existing.via !== 'p2p') {
+        existing.retried = false
+        existing.lastError = null
+        this.hooks.onLog?.(`对端 ${info.name || peerId.slice(0, 8)}… 仍在线，重试握手`)
+        this.restartHandshake(peerId, 'mqtt')
+      }
+      return // 其余已有会话不动（P2P 优先）
+    }
     const peer = this.ensurePeer(peerId, 'mqtt')
     peer.name = info.name
     this.startHandshake(peerId)
@@ -653,6 +664,21 @@ export class ChatNet {
     this.hooks.onPresenceSent?.([...this.peers.values()].filter((p) => p.state === 'ready').length)
   }
 
+  // 失败会话重试：仍在对端 presence 认知里的才值得重试（TTL 30s 内见过）
+  retryFailedSessions() {
+    if (this.destroyed) return
+    for (const [peerId, peer] of this.peers) {
+      if (peer.state !== 'failed') continue
+      const stillAround = this.relay?.peers?.has(peerId)
+        || this.room?.getPeers?.()?.[peerId]
+      if (!stillAround) continue
+      peer.retried = false
+      peer.lastError = null
+      this.hooks.onLog?.(`周期重试失败会话 (${peer.name || peerId.slice(0, 8)}…)`)
+      this.restartHandshake(peerId, peer.via === 'p2p' && this.room?.getPeers?.()?.[peerId] ? 'p2p' : 'mqtt')
+    }
+  }
+
   // ---------- 直连升级（自动 + 手动） ----------
 
   // 中继就绪会话的直连升级探测：
@@ -775,6 +801,7 @@ export class ChatNet {
     this.destroyed = true
     clearInterval(this.sweepTimer)
     clearInterval(this.heartbeatTimer)
+    clearInterval(this.retryFailedTimer)
     clearInterval(this.directProbeTimer)
     try { this.room?.leave() } catch { /* 忽略 */ }
     this.relay?.destroy()
