@@ -1,6 +1,6 @@
 {
   "name": "oraychat",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "Private P2P encrypted chat desktop app",
   "main": "electron/main.js",
   "scripts": {
