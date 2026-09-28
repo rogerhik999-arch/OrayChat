@@ -65,7 +65,10 @@
       ],
       "category": "public.app-category.social-networking",
       "identity": null,
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "extendInfo": {
+        "NSAppSleepDisabled": true
+      }
     },
     "win": {
       "target": [
