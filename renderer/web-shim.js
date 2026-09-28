@@ -64,3 +64,35 @@
     quit: () => { /* Web 版无退出概念 */ },
   }
 })()
+
+// Capacitor/移动端：无独立设置窗口（BrowserWindow），以页面导航方式打开 settings.html
+if (typeof window !== 'undefined' && window.oray && !window.oray.openSettings && window.oray.platform === 'web') {
+  window.oray.openSettings = () => { location.href = 'settings.html' }
+}
+
+// 设置页的 Web 等价实现（settings.html 在 WebView 中直接导航打开时）
+if (typeof window !== 'undefined' && !window.settings) {
+  window.settings = {
+    get: async () => {
+      const userConfig = JSON.parse(localStorage.getItem('oray-config') || '{}')
+      const identities = Object.keys(localStorage).filter((k) => k.startsWith('oray-kv:identity:')).map((k) => k.split('identity:')[1])
+      return { userConfig, trayEnabled: true, version: '1.7.0', profile: 'mobile', identities }
+    },
+    setUserConfig: async (cfg) => { localStorage.setItem('oray-config', JSON.stringify(cfg)); return true },
+    setTrayEnabled: async () => true, // 移动端无托盘
+    clearData: async (kind, room) => {
+      if (kind === 'login-history') {
+        localStorage.removeItem('oray-kv:oc-login-history')
+        return 1
+      }
+      if (kind === 'room-log' && room) {
+        localStorage.removeItem(`oray-kv:oc-log2:${room}`)
+        localStorage.removeItem(`oray-kv:oc-names:${room}`)
+        return 1
+      }
+      return 0
+    },
+    listRooms: async () => Object.keys(localStorage).filter((k) => k.startsWith('oray-kv:oc-log2:')).map((k) => k.split('oc-log2:')[1]),
+    openMainWindow: async () => { location.href = 'index.html' },
+  }
+}

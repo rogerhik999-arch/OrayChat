@@ -691,11 +691,14 @@ function bindUi() {
   $('logoutBtn').onclick = () => { state.net?.destroy(); window.oray.quit() }
 
   // 设置窗口（修改网络/托盘等配置需重启应用生效）；web 版隐藏入口
-  if (window.oray.openSettings) {
-    $('settingsBtn').onclick = () => window.oray.openSettings()
-  } else {
-    $('settingsBtn').classList.add('hidden')
+  const openSettingsIfAvailable = () => {
+    if (window.oray.openSettings) window.oray.openSettings()
+    else appendSys('当前平台暂无设置界面（Web 版）')
   }
+  if (window.oray.openSettings) $('settingsBtn').onclick = openSettingsIfAvailable
+  else $('settingsBtn').classList.add('hidden')
+  const sideBtn = $('sideSettingsBtn')
+  if (sideBtn) sideBtn.onclick = openSettingsIfAvailable
 
   // 移动端抽屉：☰ 开、遮罩/Esc 关
   const closeDrawer = () => document.body.classList.remove('sidebar-open')

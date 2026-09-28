@@ -9,7 +9,7 @@ const WWW = path.join(ROOT, 'www')
 
 fs.rmSync(WWW, { recursive: true, force: true })
 fs.mkdirSync(path.join(WWW, 'dist'), { recursive: true })
-for (const f of ['index.html', 'style.css', 'web-shim.js']) {
+for (const f of ['index.html', 'style.css', 'web-shim.js', 'settings.html', 'settings.js']) {
   fs.copyFileSync(path.join(ROOT, 'renderer', f), path.join(WWW, f))
 }
 fs.copyFileSync(path.join(ROOT, 'renderer', 'dist', 'app.bundle.js'), path.join(WWW, 'dist', 'app.bundle.js'))
