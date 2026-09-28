@@ -143,7 +143,9 @@ export class ChatNet {
   storeKey(wireConv, peerId) {
     if (wireConv === 'lobby') return 'lobby'
     const peer = this.peers.get(peerId)
-    const peerHex = peer?.idPubHex || (peer?.ctx?.peerIdPub ? oc.hex(peer.ctx.peerIdPub) : peerId)
+    // 键必须派生自对端「身份公钥」（稳定）；peerId 是本次连接的临时 ID，绝不能进键
+    const peerHex = peer?.idPubHex || (peer?.ctx?.peerIdPub ? oc.hex(peer.ctx.peerIdPub) : null)
+    if (!peerHex) return `dm-unknown:${peerId}` // 理论不可达：消息只发给/来自 ready 会话
     return dmConvKey(this.myIdPubHex, peerHex)
   }
 

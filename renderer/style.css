@@ -206,6 +206,7 @@ button.ghost.warn2:hover { background: #3a2d1c; }
 
 /* ---------- 移动端适配：侧栏抽屉 ---------- */
 .menu-btn { display: none; font-size: 18px; line-height: 1; padding: 6px 12px; flex: none; }
+.gear-btn { font-size: 17px; line-height: 1; padding: 6px 12px; flex: none; }
 .backdrop { display: none; }
 
 @media (max-width: 760px) {
@@ -244,3 +245,10 @@ button.ghost.warn2:hover { background: #3a2d1c; }
   .login-card { width: min(400px, calc(100vw - 24px)); padding: 26px 22px 20px; }
   .login-card input { font-size: 16px; }
 }
+
+/* 名录分组标题 / 离线联系人 */
+.roster-head {
+  padding: 10px 10px 4px; font-size: 11px; color: var(--tx2);
+  letter-spacing: .8px; text-transform: none; list-style: none;
+}
+.peer-item.offline { opacity: .82; }

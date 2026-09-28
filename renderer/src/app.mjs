@@ -129,11 +129,58 @@ async function renderSavedAccounts() {
 
 function viewKey(v = state.view) {
   if (v.conv === 'lobby') return 'lobby'
+  if (v.conv === 'dm-offline') return dmConvKey(state.myIdPubHex, v.idPubHex)
   const peer = state.net?.peers.get(v.peerId)
   const peerHex = peer?.idPubHex || v.peerId
   return dmConvKey(state.myIdPubHex, peerHex)
 }
 function viewWireConv(v = state.view) { return v.conv === 'lobby' ? 'lobby' : 'dm' }
+
+// ---------- 名录（roster）：房间出现过的所有人 ----------
+// 来源：oc-names 映射（握手 + 同步帧学习）∪ 共享日志里的作者公钥。
+// 在线状态：有就绪会话 = 在线；否则离线（仍可点开查看历史）。
+
+// 身份公钥 → 就绪会话的 peerId（在线判定）
+function onlinePeerIdByPub(idPubHex) {
+  for (const [peerId, p] of state.net?.peers || []) {
+    if (p.state === 'ready' && p.idPubHex === idPubHex) return peerId
+  }
+  return null
+}
+
+function buildRoster() {
+  const seen = new Map() // idPubHex -> {name}
+  // a) 名字映射（含自己）
+  for (const [id, n] of state.names) {
+    if (id === state.myIdPubHex) continue
+    seen.set(id, { name: n })
+  }
+  // b) 大厅 + 所有 DM 日志里出现过的作者
+  for (const c of state.net?.store?.convs?.values() || []) {
+    for (const e of c.entries.values()) {
+      if (e.author && e.author !== state.myIdPubHex && !seen.has(e.author)) {
+        seen.set(e.author, { name: authorName(e.author) })
+      }
+    }
+  }
+  // 附加在线状态与显示名兜底
+  for (const [id, info] of seen) {
+    const pid = onlinePeerIdByPub(id)
+    info.online = !!pid
+    info.peerId = pid || null
+    if (!info.name) info.name = `${id.slice(0, 8)}…`
+  }
+  // 视图正在查看一个不在名录的在线成员（无历史无名字的极端情况）也纳入
+  if (state.view.conv === 'dm') {
+    const p = state.net?.peers.get(state.view.peerId)
+    if (p?.state === 'ready' && p.idPubHex && !seen.has(p.idPubHex)) {
+      seen.set(p.idPubHex, { name: p.name || `${p.idPubHex.slice(0, 8)}…`, online: true, peerId: state.view.peerId })
+    }
+  }
+  return [...seen.entries()]
+    .map(([id, info]) => ({ id, ...info }))
+    .sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name))
+}
 
 // ---------- 渲染 ----------
 
@@ -181,12 +228,39 @@ function renderPeers() {
     li.onclick = () => selectView({ conv: 'dm', peerId })
     list.appendChild(li)
   }
+
+  // 历史联系人（房间出现过的所有人，离线可点开看聊天记录）
+  const roster = buildRoster().filter((r) => !r.online)
+  if (roster.length) {
+    const head = document.createElement('li')
+    head.className = 'roster-head'
+    head.textContent = `历史联系人 ${roster.length}`
+    list.appendChild(head)
+    for (const r of roster) {
+      const li = document.createElement('li')
+      li.className = 'peer-item offline' + (state.view.conv === 'dm' && state.view.peerId === r.peerId ? ' active' : '')
+      li.innerHTML = `
+        <div class="avatar" style="background:${avatarColor(r.id)}; opacity:.55">${esc(r.name.slice(0, 1).toUpperCase())}</div>
+        <div class="p-info">
+          <div class="p-name">${esc(r.name)}</div>
+          <div class="p-state"><span class="dot off"></span>离线 · 点开查看聊天记录</div>
+        </div>`
+      li.onclick = () => selectView({ conv: 'dm-offline', idPubHex: r.id, name: r.name })
+      list.appendChild(li)
+    }
+  }
   $('peerCount').textContent = String(readyCount)
   renderChatHead()
 }
 
 function renderChatHead() {
   const isLobby = state.view.conv === 'lobby'
+  if (state.view.conv === 'dm-offline') {
+    $('chatTitle').textContent = state.view.name || '历史联系人'
+    $('chatSub').textContent = '该成员当前离线 · 以下为本机保存的聊天记录（30 天内）；对方上线互连后可继续聊天'
+    $('chatBadges').innerHTML = `<span class="badge">📴 离线</span><span class="badge">保留 30 天</span>`
+    return
+  }
   const readyCount = state.net ? [...state.net.peers.values()].filter((p) => p.state === 'ready').length : 0
   const activePeer = !isLobby ? state.net?.peers.get(state.view.peerId) : null
   const reconnectable = !isLobby && activePeer && (activePeer.state === 'failed' || activePeer.via === 'mqtt' || activePeer.path === 'unknown')
@@ -280,7 +354,7 @@ function renderMessages() {
     row.className = 'msg' + (mine ? ' me' : '')
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
-    if (!mine && state.view.conv === 'lobby') {
+    if (!mine && (state.view.conv === 'lobby' || state.view.conv === 'dm-offline')) {
       const author = document.createElement('span')
       author.className = 'author'
       author.textContent = authorName(m.author)
@@ -340,6 +414,7 @@ function updateComposerPlaceholder() {
   const el = $('input')
   if (!el) return
   if (state.view.conv === 'lobby') el.placeholder = '📢 群发给房间内所有人（大厅）…'
+  else if (state.view.conv === 'dm-offline') el.placeholder = '📴 对方离线，仅可查看历史记录…'
   else el.placeholder = `🔒 私密发给 ${currentPeerName() || '对方'}（仅对方可见）…`
 }
 
@@ -350,7 +425,7 @@ function selectView(v) {
   document.body.classList.remove('sidebar-open') // 手机上选中即收起侧栏
   renderConv()
   renderPeers()
-  const canSend = v.conv === 'lobby' || state.net?.peers.get(v.peerId)?.state === 'ready'
+  const canSend = v.conv !== 'dm-offline' && (v.conv === 'lobby' || state.net?.peers.get(v.peerId)?.state === 'ready')
   $('input').disabled = !canSend
   $('sendBtn').disabled = !canSend
 }
@@ -358,6 +433,7 @@ function selectView(v) {
 // ---------- 删除操作 ----------
 
 async function deleteMessage(mid) {
+  if (state.view.conv === 'dm-offline') { appendSys('对方离线，暂无法同步删除（上线后会看到本机已删）'); return }
   try {
     await state.net.deleteMessage(viewWireConv(), mid, state.view.peerId)
   } catch (e) { appendSys(`删除失败：${e.message}`) }
@@ -368,6 +444,7 @@ async function confirmThenClear() {
   if (btn.dataset.confirm) {
     delete btn.dataset.confirm
     btn.textContent = '清空全体记录'
+    if (state.view.conv === 'dm-offline') { appendSys('对方离线，本机记录将在下次同步时按删除标记收敛'); await state.net.store.applyClear(viewKey(), Date.now()); renderMessages(); return }
     try { await state.net.clearConv(viewWireConv(), state.view.peerId) }
     catch (e) { appendSys(`清空失败：${e.message}`) }
   } else {
@@ -613,11 +690,11 @@ function bindUi() {
   })
   $('logoutBtn').onclick = () => { state.net?.destroy(); window.oray.quit() }
 
-  // 设置窗口（修改网络/托盘等配置需重启应用生效）
+  // 设置窗口（修改网络/托盘等配置需重启应用生效）；web 版隐藏入口
   if (window.oray.openSettings) {
     $('settingsBtn').onclick = () => window.oray.openSettings()
   } else {
-    $('settingsBtn').style.display = 'none' // web 版无设置窗口
+    $('settingsBtn').classList.add('hidden')
   }
 
   // 移动端抽屉：☰ 开、遮罩/Esc 关
