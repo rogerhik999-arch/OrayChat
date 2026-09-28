@@ -774,6 +774,16 @@ async function main() {
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
     }
+    if (state.args['topology-change-after-ms']) {
+      // 模拟网络拓扑变化：中继与 WebRTC 同时被切断（等价 Wi-Fi 切换）
+      setTimeout(() => {
+        window.oray.botLog('[BOT] TOPO-CHANGE 注入：杀 relay + 全部 pc')
+        try { state.net.relay.forceReconnect(); state.net.relay.client?.end(true) } catch { /* 忽略 */ }
+        for (const [, pp] of state.net.peers) { try { pp.pc?.close() } catch { /* 忽略 */ } }
+        // 触发一次 connectionstatechange（pc.close 会发，但保险起见手动）
+        setTimeout(() => state.net.goOnline('拓扑变化注入'), 1000)
+      }, Number(state.args['topology-change-after-ms']))
+    }
     if (state.args['go-online-after-ms']) {
       setTimeout(() => {
         // --kill-pc：模拟待机冻结（WebRTC 连接被系统切断）后再主动上线

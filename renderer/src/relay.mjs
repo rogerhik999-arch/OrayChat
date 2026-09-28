@@ -49,7 +49,13 @@ export class RelayTransport {
 
   connect(idx) {
     if (idx >= this.brokerUrls.length) {
-      this.onLog('MQTT 中继：所有 broker 连接失败（中继不可用，仅 P2P）', 'warn')
+      // 所有 broker 失败：指数退避整体重来（网络拓扑变化后自愈的关键——
+      // 原实现一轮失败就放弃，presence 停发，双方互相"蒸发"）
+      if (this.closed) return
+      this.reconnectAttempts = (this.reconnectAttempts || 0) + 1
+      const delay = Math.min(60000, 5000 * 2 ** Math.min(this.reconnectAttempts, 4))
+      this.onLog(`MQTT 中继：所有 broker 连接失败，${Math.round(delay / 1000)}s 后重试（第 ${this.reconnectAttempts} 轮）`, 'warn')
+      setTimeout(() => { if (!this.closed) this.connect(0) }, delay)
       return
     }
     const url = this.brokerUrls[idx]
@@ -60,6 +66,7 @@ export class RelayTransport {
     } catch (e) { this.connect(idx + 1); return }
     this.client = client
     client.on('connect', () => {
+      this.reconnectAttempts = 0
       this.onLog(`MQTT 中继已连接 ${url}`)
       client.subscribe([presence, inbox(this.selfId)], (err, granted) => {
         if (err) { this.onLog(`中继订阅失败: ${err.message}`, 'warn'); return }

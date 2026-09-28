@@ -627,6 +627,15 @@ export class ChatNet {
       this.hooks.onConnectionLost?.(peerId, peer, '直连已断开（网络变化？），正在经中继自动重连…')
       return
     }
+    // 中继也不可用（网络拓扑变化会同时切断两者）：主动上线自愈 ——
+    // 重建中继连接并恢复所有会话；窗口开着的桌面端此前没有任何触发源
+    if (!this.opts.forceRelay && !this.relay?.client?.connected && !this.goOnlineInflight) {
+      this.goOnlineInflight = true
+      this.hooks.onConnectionLost?.(peerId, peer, '网络已变化，正在自动重新上线…')
+      this.goOnline(`连接断开（${st}）且中继离线`)
+      setTimeout(() => { this.goOnlineInflight = false }, 30000) // 限频 30s
+      return
+    }
     peer.state = 'failed'
     peer.lastError = `连接断开（${st}）`
     this.hooks.onConnectionLost?.(peerId, peer, '连接已断开，请点击“重新连接”')
