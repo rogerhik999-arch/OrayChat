@@ -33,6 +33,7 @@ function link() {
 // 内存 io 适配器（与 web-shim 同构）
 function memIo() {
   const store = new Map()
+  const CS = 32 * 1024
   return {
     store,
     state: async (fid, { n }) => {
@@ -47,6 +48,12 @@ function memIo() {
       while (e.have.length <= bi) e.have.push(0)
       e.have[bi] |= 1 << (i & 7)
       return true
+    },
+    readChunk: async (fid, i, cs, len) => {
+      const e = store.get(fid)
+      if (!e?.chunks) return null
+      const c = e.chunks.get(i)
+      return c ? c.slice(0, len) : null
     },
     finalize: async (fid, shaHex) => {
       const e = store.get(fid)
@@ -303,5 +310,64 @@ const drain = (ms = 30) => new Promise((r) => setTimeout(r, ms))
   void netB
 }
 
-console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底/保护限时/停滞复活）')
+// ---- 11) P1-1 FEC：组内唯一缺失块由奇偶块本地恢复（免重传） ----
+{
+  const { wire, netA, netB } = link()
+  const fxA = mkFileX(netA)
+  const fxB = mkFileX(netB)
+  const content = new Uint8Array(32768 * 9) // 9 块 = 2 组（0..7 / 8）
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const fid = await fxA.sendFile('B', { bytes: content, name: 'fec.bin', size: content.length, mime: 'application/octet-stream', lastModified: 9 })
+  // 逐帧回放，但丢弃 i=3 的数据帧（模拟丢块）；奇偶块正常到达
+  let dropped3 = 0
+  for (let round = 0; round < 400; round++) {
+    const frames = wire.a2b.splice(0)
+    for (const f of frames) {
+      if (f.__fx && f.__fx.i === 3) { dropped3++; continue } // 块 3 永远丢
+      if (f.__fx) await fxB.onFrame('A', f.__fx)
+      else await fxB.onCtl('A', f)
+    }
+    for (const f of wire.b2a.splice(0)) { f.__fx ? await fxA.onFrame('B', f.__fx) : fxA.onCtl('B', f) }
+    if (fxA.tx.get(fid)?.state === 'done') break
+    await drain(20)
+  }
+  const rtx = fxB.tx.get(fid)
+  assert.ok(dropped3 >= 1, '块 3 至少被丢一次')
+  assert.equal(rtx.state, 'done', 'FEC 恢复后传输完成')
+  assert.ok(rtx.have[0] & (1 << 3), '块 3 位图已置位（由奇偶块恢复）')
+  assert.equal(await sha256Hex(await fxB.io.read(fid)), await sha256Hex(content), '恢复内容与原文一致')
+}
+
+const WINDOW_DEFAULT = 16 // P2P 默认窗口（与 filex WINDOW_P2P 一致）
+
+// ---- 12) P0-1 自适应窗口与 endgame 窗口 ----
+{
+  const { netA } = link()
+  const fxA = mkFileX(netA)
+  const tx = { n: 100, cs: 32768, have: new Uint8Array(13), rttEma: 0, rateEma: 0 }
+  assert.equal(fxA.windowFor(tx, WINDOW_DEFAULT), WINDOW_DEFAULT, '无采样时用路径默认窗口')
+  tx.rttEma = 50; tx.rateEma = 4 * 1024 * 1024 // 4MB/s × 50ms = 200KB ≈ 6 块 BDP
+  const w = fxA.windowFor(tx, WINDOW_DEFAULT)
+  assert.ok(w >= 4 && w <= 64, `自适应窗口在限幅内（${w}）`)
+  assert.ok(w >= 6, `窗口应 ≥ 1.5×BDP 块数（${w}）`)
+  // endgame：剩 2 块（≤max(2, 2)）→ 窗口翻倍
+  for (let k = 0; k < 98; k++) bitmapSet(tx.have, k)
+  const remain = 100 - bitmapCount(tx.have)
+  assert.equal(remain, 2)
+  const we = fxA.windowFor(tx, WINDOW_DEFAULT)
+  assert.equal(we, Math.min(128, w * 2), 'endgame 窗口加倍')
+  assert.equal(fxA.inflightTimeoutFor(tx), 750, 'endgame 重发阈值减半')
+}
+// ---- 13) P0-2 令牌桶速率预算 ----
+{
+  const { netA } = link()
+  const fxA = new FileX({ net: netA, io: memIo(), maxRateDm: 65536, hooks: {} }) // 64KB/s
+  assert.equal(fxA.paceTake(32000), 0, '首桶容量内立即可发')
+  const wait = fxA.paceTake(65000)
+  assert.ok(wait >= 400 && wait <= 1200, `超预算后应等待约 1s（实际 ${wait}ms）`)
+  const budget = fxA.paceLimit()
+  assert.equal(budget, 65536, '无中继传输时用 p2p 档预算')
+}
+
+console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底/保护限时/停滞复活/FEC/自适应窗口/令牌桶）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

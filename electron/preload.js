@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('oray', {
   fxWrite: (fid, i, cs, bytes) => ipcRenderer.invoke('fx:write', fid, i, cs, bytes),
   fxFinalize: (fid, shaHex, name) => ipcRenderer.invoke('fx:finalize', fid, shaHex, name),
   fxRead: (fid) => ipcRenderer.invoke('fx:read', fid),
+  fxReadRange: (fid, i, cs, len) => ipcRenderer.invoke('fx:read-range', fid, i, cs, len),
   fxSave: (fid, name) => ipcRenderer.invoke('fx:save', fid, name),
   fxOpen: (fid) => ipcRenderer.invoke('fx:open', fid),
   fxAbort: (fid) => ipcRenderer.invoke('fx:abort', fid),

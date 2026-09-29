@@ -21,20 +21,33 @@ import * as oc from './crypto.mjs'
 
 export const FX_CHUNK_SIZE = 32 * 1024 // 32KB：中继帧（b64 后 ~43KB）更小，与心跳/presence 交错更好、重传代价低
 export const FX_MAX_SIZE = 200 * 1024 * 1024
-const WINDOW_P2P = 16
+const WINDOW_P2P = 16 // 自适应前的初始窗口（就绪后按 BDP 自适应，见 windowFor）
 const WINDOW_MQTT = 4
 const MQTTPace_MS = 25
 const HAVE_INTERVAL_MS = 2000 // 接收方位图广播节奏（兼作重传请求）
+const WINDOW_MIN = 4
+const WINDOW_MAX = 64
+const WINDOW_ENDGAME_MAX = 128
 const INFLIGHT_TIMEOUT_MS = 1500 // 发送块未确认超时 → 重发
+const INFLIGHT_ENDGAME_MS = 750 // endgame（最后 2%）重发阈值减半（BitTorrent endgame 模式）
 const OFFER_RETRY_MS = 3000 // offer 未获首个 ACK 前的周期重发（offer 只发一次会因丢帧永久卡死）
 const RELAY_FALLBACK_MS = 12000 // p2p 发送零进展超时 → 后续块改走 MQTT 中继（接收方两路全收）
 const RELAY_REBUILD_MS = 20000 // 任意路径无新 ACK 超时 → 重建中继连接 + 重发 offer（防大块帧把心跳挤死后的死锁）
 const RELAY_REBUILD_COOLDOWN_MS = 30000
+// 速率预算（P0-2，LEDBAT 让路思想）：文件传输给交互流量让出余量——
+// v1.17.2 的"心跳被文件块挤死"的根治。令牌桶全局共享（所有传输合计）。
+const MAX_RATE_DM = 4 * 1024 * 1024 // p2p 总预算 4MB/s
+const MAX_RATE_RELAY = 1 * 1024 * 1024 // 中继总预算 1MB/s（公共 broker 礼让）
+const PACE_BUCKET_S = 1 // 令牌桶容量 = 1 秒预算（允许一个窗口的突发）
 // 传输活性：净来判死线（net.reapGhosts 的传输保护只在此窗口内生效 ——
 // 否则彻底卡死的传输会让保护永续，造出新的残体）与停滞暂停线（超线转
 // stalled 停泵，对端上线 onSessionReady 自动复活续传）
 const TRANSFER_PROTECT_MS = 90000
 const TX_STALL_MS = 5 * 60000
+// FEC（P1-1）：8+1 XOR 组——每 8 个数据块广播 1 个奇偶块（组内明文按块长补零异或），
+// 组内任丢 1 块由接收方本地恢复（免一次 RTT 重传）。奇偶块索引 = n + 组号，
+// 旧版接收方按 i>=tx.n 丢弃，天然向后兼容；丢奇偶块只是失去优化，数据重传兜底。
+export const FEC_GROUP = 8
 
 // ---------- deflate 助手（CompressionStream 全局可用：Electron/现代 WebView/Node 18+） ----------
 
@@ -73,7 +86,7 @@ export class FileX {
   // opts: { net, io, compress?, offerRetryMs?, relayFallbackMs?, hooks: {onEvent, onIncoming, onLog} }
   // io 适配器（Electron=主进程文件 / Web=内存）：state/write/finalize/read/abort
   // compress(file) → {bytes, w, h, mime, mode}（图片格式压缩；注入便于测试）
-  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, relayRebuildMs, transferProtectMs, hooks = {} }) {
+  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, relayRebuildMs, transferProtectMs, maxRateDm, maxRateRelay, hooks = {} }) {
     this.net = net
     this.io = io
     this.compress = compress
@@ -81,8 +94,13 @@ export class FileX {
     this.relayFallbackMs = relayFallbackMs || RELAY_FALLBACK_MS
     this.relayRebuildMs = relayRebuildMs || RELAY_REBUILD_MS
     this.transferProtectMs = transferProtectMs || TRANSFER_PROTECT_MS
+    this.maxRateDm = maxRateDm || MAX_RATE_DM
+    this.maxRateRelay = maxRateRelay || MAX_RATE_RELAY
     this.hooks = hooks
     this.tx = new Map() // fid -> 传输状态（收发同表）
+    // P0-2 令牌桶：所有传输共享一个字节预算（LEDBAT 式让路——预算随是否有
+    // 中继路径传输切换，交互消息/心跳天然获得余量）
+    this.pace = { tokens: this.maxRateDm * PACE_BUCKET_S, at: Date.now() }
     // 接收方保活：即使发端停滞也周期广播位图（对端重连后立刻拿到续传起点）；
     // 顺带做双向停滞检测 —— 超时转 stalled（停泵、退出传输保护），对端重新
     // 上线（onSessionReady）自动复活续传。不转态的话，死传输会让 reaper
@@ -158,6 +176,7 @@ export class FileX {
     const offer = {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
+      fec: 1, // P1-1：8+1 XOR 奇偶块广播（旧版接收方按 i>=n 丢弃，向后兼容）
     }
     tx.offer = offer
     await this.sendOffer(peerId, offer, tx)
@@ -172,6 +191,109 @@ export class FileX {
   async sendOffer(peerId, offer, tx) {
     tx.offers++
     try { await this.net.sendCtl(peerId, { ...offer }) } catch { /* 下轮重发 */ }
+  }
+
+  // ---------- P0 拥塞控制：令牌桶 + 自适应窗口 ----------
+
+  // 当前全局字节预算：有任何传输走中继（或被迫中继）时切中继档（公共 broker 礼让）
+  paceLimit() {
+    for (const tx of this.tx.values()) {
+      if (tx.state !== 'active' || tx.dir !== 'send') continue
+      const via = this.peer(tx.peerId)?.via
+      if (via === 'mqtt' || tx.forceRelay) return this.maxRateRelay
+    }
+    return this.maxRateDm
+  }
+
+  // 取 cost 字节的发送权；返回需要等待的毫秒（0 = 立即）
+  paceTake(cost) {
+    const now = Date.now()
+    const limit = this.paceLimit()
+    const cap = limit * PACE_BUCKET_S
+    this.pace.limit = limit
+    this.pace.tokens = Math.min(cap, this.pace.tokens + ((now - this.pace.at) / 1000) * limit)
+    this.pace.at = now
+    if (this.pace.tokens >= cost) { this.pace.tokens -= cost; return 0 }
+    const need = cost - this.pace.tokens
+    this.pace.tokens = 0
+    return Math.ceil((need / limit) * 1000)
+  }
+
+  // P0-1 自适应窗口：窗口 ≈ 1.5 × ACK 字节速率 × RTT（BDP，BBR 思想极简版），
+  // 限幅 [WINDOW_MIN, WINDOW_MAX]；尚无采样时用路径默认值
+  windowFor(tx, base) {
+    let w = base
+    if (tx.rttEma > 0 && tx.rateEma > 0) {
+      const bdpBlocks = (tx.rateEma * tx.rttEma) / 1000 / tx.cs
+      w = Math.max(WINDOW_MIN, Math.min(WINDOW_MAX, Math.ceil(bdpBlocks * 1.5)))
+    }
+    // P1-2 endgame：最后 ≤max(2, 2%) 块是重传 RTT 主导的长尾 → 窗口加倍 + 重发阈值减半
+    const remaining = tx.n - bitmapCount(tx.have)
+    if (remaining <= Math.max(2, Math.ceil(tx.n * 0.02))) w = Math.min(WINDOW_ENDGAME_MAX, w * 2)
+    return w
+  }
+
+  inflightTimeoutFor(tx) {
+    const remaining = tx.n - bitmapCount(tx.have)
+    return remaining <= Math.max(2, Math.ceil(tx.n * 0.02)) ? INFLIGHT_ENDGAME_MS : INFLIGHT_TIMEOUT_MS
+  }
+
+  // ---------- P1-1 FEC：8+1 XOR ----------
+
+  // 组 g 的奇偶块 = 组内明文块按位异或（短块补零）。明文直接来自文件字节，
+  // 无压缩干扰、接收方可从已落盘块读回参与异或。
+  parityFor(tx, g) {
+    const out = new Uint8Array(tx.cs)
+    const start = g * FEC_GROUP
+    const end = Math.min(start + FEC_GROUP, tx.n)
+    for (let j = start; j < end; j++) {
+      const from = j * tx.cs
+      const chunk = tx.bytes.subarray(from, Math.min(from + tx.cs, tx.bytes.length))
+      for (let k = 0; k < chunk.length; k++) out[k] ^= chunk[k]
+    }
+    return out
+  }
+
+  plainLen(tx, j) { return j === tx.n - 1 ? tx.size - (tx.n - 1) * tx.cs : tx.cs }
+
+  // 组 g 内缺失（未确认）的数据块下标
+  groupMissing(tx, g) {
+    const start = g * FEC_GROUP
+    const end = Math.min(start + FEC_GROUP, tx.n)
+    const miss = []
+    for (let j = start; j < end; j++) if (!bitmapHas(tx.have, j)) miss.push(j)
+    return miss
+  }
+
+  // 接收方：用奇偶块恢复组内唯一缺失块（其余块从本机 .part 读回参与异或）
+  async recoverWithParity(tx, g) {
+    if (!tx.parity?.has(g) || tx.recovering?.has(g)) return
+    const miss = this.groupMissing(tx, g)
+    if (miss.length !== 1) return
+    const missing = miss[0]
+    tx.recovering = tx.recovering || new Map()
+    tx.recovering.set(g, true)
+    try {
+      const acc = Uint8Array.from(tx.parity.get(g))
+      const start = g * FEC_GROUP
+      const end = Math.min(start + FEC_GROUP, tx.n)
+      for (let j = start; j < end; j++) {
+        if (j === missing) continue
+        const part = await this.io.readChunk(tx.fid, j, tx.cs, this.plainLen(tx, j))
+        if (!part || part.length !== this.plainLen(tx, j)) { tx.recovering.delete(g); return }
+        for (let k = 0; k < part.length; k++) acc[k] ^= part[k]
+      }
+      const plain = acc.slice(0, this.plainLen(tx, missing))
+      await this.io.write(tx.fid, missing, tx.cs, plain)
+      bitmapSet(tx.have, missing)
+      tx.lastProgressAt = Date.now()
+      tx.lastLifeAt = Date.now()
+      this.log(`FEC 恢复：${tx.name} 第 ${missing} 块已由奇偶块重建（免重传）`)
+      const done = bitmapCount(tx.have)
+      this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name })
+      if (done >= tx.n) await this.sendHave(tx.peerId, tx.fid)
+    } catch { /* 恢复失败：数据重传兜底 */ }
+    finally { tx.recovering?.delete(g) }
   }
 
   // 滑动窗口泵：每 200ms 扫一遍 —— 对端缺失的块里，未发过或 1.5s 未确认的
@@ -209,9 +331,18 @@ export class FileX {
           setTimeout(() => { if (tx.state === 'active') void this.sendOffer(tx.peerId, tx.offer, tx) }, 2500)
         }
       }
-      const window = (peer.via === 'mqtt' || tx.forceRelay) ? WINDOW_MQTT : WINDOW_P2P
+      const base = (peer.via === 'mqtt' || tx.forceRelay) ? WINDOW_MQTT : WINDOW_P2P
+      const window = this.windowFor(tx, base)
+      const infTimeout = this.inflightTimeoutFor(tx)
       for (const [i, ts] of tx.inflight) {
-        if (bitmapHas(tx.have, i) || now - ts > INFLIGHT_TIMEOUT_MS) tx.inflight.delete(i)
+        if (bitmapHas(tx.have, i) || now - ts > infTimeout) {
+          if (bitmapHas(tx.have, i) && tx.inflight.has(i)) {
+            // P0-1：RTT 采样（以最近一次发送为起点）
+            const sample = now - tx.inflight.get(i)
+            if (sample > 0 && sample < 10000) tx.rttEma = tx.rttEma ? Math.round(tx.rttEma * 0.7 + sample * 0.3) : sample
+          }
+          tx.inflight.delete(i)
+        }
       }
       if (tx.inflight.size >= window) return
       void (async () => {
@@ -232,12 +363,32 @@ export class FileX {
     const from = i * tx.cs
     const raw = tx.bytes.slice(from, Math.min(from + tx.cs, tx.bytes.length))
     const { data, z } = await maybeDeflate(raw)
+    // P0-2：字节级 pacing（令牌桶，所有传输共享预算）——按预算匀速发送，
+    // 而不是窗口突发灌爆（bufferbloat 的根源）
+    const wait = this.paceTake(data.length + 64)
+    if (wait > 0) await sleep(Math.min(wait, 1000))
     const e = oc.sealBin(peer.ctx, data, 'fx', tx.fid, i, z)
     try {
       await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e }, tx.forceRelay)
       tx.lastLifeAt = Date.now() // 实际发出即活性（对端可能活着只是 ACK 被挤）
     } catch { /* 会话抖动：超时后自动重发 */ }
+    // P1-1：组边界跟随奇偶块广播（组内任丢 1 块，接收方本地恢复免重传）
+    if (i % FEC_GROUP === FEC_GROUP - 1 || i === tx.n - 1) {
+      await this.sendParity(tx, Math.floor(i / FEC_GROUP))
+    }
     if (peer.via === 'mqtt' || tx.forceRelay) await sleep(MQTTPace_MS) // 公共 broker 节流
+  }
+
+  async sendParity(tx, g) {
+    const peer = this.peer(tx.peerId)
+    if (!peer || peer.state !== 'ready') return
+    const parity = this.parityFor(tx, g)
+    const wait = this.paceTake(parity.length + 64)
+    if (wait > 0) await sleep(Math.min(wait, 1000))
+    const e = oc.sealBin(peer.ctx, parity, 'fx', tx.fid, tx.n + g, 2) // flags=2：奇偶块命名空间
+    try {
+      await this.net.sendFx(tx.peerId, { fid: tx.fid, i: tx.n + g, z: 0, p: 1, e }, tx.forceRelay)
+    } catch { /* 奇偶块丢失只是失去优化 */ }
   }
 
   // ---------- 接收方 ----------
@@ -256,6 +407,7 @@ export class FileX {
         kind: o.kind === 'image' ? 'image' : 'file', sha: o.sha, mode: o.mode,
         w: o.w, h: o.h, orig: !!o.orig, thumb: o.thumb || '',
         have: st.have, caption: o.thumb ? (o.name || '图片') : (o.name || o.fid),
+        parity: new Map(), // FEC：组号 -> 奇偶块（内存态，丢失只失去优化）
         lastHaveAt: 0, lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
       }
       this.tx.set(o.fid, tx)
@@ -382,7 +534,21 @@ export class FileX {
     const peer = this.peer(peerId)
     if (!peer || !peer.ctx) return
     const i = f.i
-    if (!Number.isInteger(i) || i < 0 || i >= tx.n) return
+    if (!Number.isInteger(i) || i < 0) return
+    // P1-1 FEC：奇偶块（索引 ≥ n，flags=2）——入组缓存并尝试恢复组内唯一缺失块
+    if (i >= tx.n) {
+      if (!f.p) return
+      const g = i - tx.n
+      const gStart = g * FEC_GROUP
+      if (gStart >= tx.n) return
+      try {
+        const parity = oc.openBin(peer.ctx, f.e, 'fx', tx.fid, i, 2)
+        if (parity.length !== tx.cs) return
+        tx.parity.set(g, parity)
+        await this.recoverWithParity(tx, g)
+      } catch { /* 奇偶块解密失败：忽略，数据重传兜底 */ }
+      return
+    }
     if (bitmapHas(tx.have, i)) return
     try {
       let pt = oc.openBin(peer.ctx, f.e, 'fx', tx.fid, i, f.z ? 1 : 0)
@@ -395,6 +561,9 @@ export class FileX {
       bitmapSet(tx.have, i)
       tx.lastProgressAt = Date.now()
       tx.lastLifeAt = tx.lastProgressAt // 收到块 = 活性
+      // 组内有奇偶块且现在只剩唯一缺失 → 本地恢复
+      const g = Math.floor(i / FEC_GROUP)
+      if (tx.parity.has(g)) void this.recoverWithParity(tx, g)
       const done = bitmapCount(tx.have)
       this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name, speed: recentSpeed(tx, done) })
       // 水位前进 8 块或有节奏地回报位图

@@ -6,6 +6,17 @@ import * as oc from './crypto.mjs'
 import { dmConvKey } from './store.mjs'
 import { FileX, fmtSize } from './filex.mjs'
 
+// P1-3 unordered 通道（file-transfer-research P1-3）：DataChannel 默认 ordered=true
+// 存在队头阻塞——丢一帧，后面所有帧（包括心跳 ctl）都要等它重传。文件块语义
+// 乱序安全（每块独立 AEAD + 位图收账），协议层全量容忍乱序（seq/txid/AAD 去重
+// + 各控制帧自带重发），故全局切 unordered。msg 的 seq 乱序由 3s×3 重传兜底。
+try {
+  const origCreate = RTCPeerConnection.prototype.createDataChannel
+  RTCPeerConnection.prototype.createDataChannel = function (label, opts) {
+    return origCreate.call(this, label, { ...opts, ordered: false })
+  }
+} catch { /* 非 WebRTC 环境（node 单测） */ }
+
 const $ = (id) => document.getElementById(id)
 const state = {
   cfg: null,
@@ -793,6 +804,7 @@ async function doLogin(name, room) {
       write: (fid, i, cs, bytes) => window.oray.fxWrite(fid, i, cs, bytes),
       finalize: (fid, sha, name) => window.oray.fxFinalize(fid, sha, name),
       read: (fid) => window.oray.fxRead(fid),
+      readChunk: (fid, i, cs, len) => window.oray.fxReadRange(fid, i, cs, len),
       abort: (fid) => window.oray.fxAbort(fid),
     },
     compress: compressImageForSend,

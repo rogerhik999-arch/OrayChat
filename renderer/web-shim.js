@@ -92,6 +92,16 @@
       const e = (window.__orayFx || {})[fid]
       return e?.bytes || null
     },
+    fxReadRange: async (fid, i, cs, len) => {
+      const e = (window.__orayFx || {})[fid]
+      if (!e?.chunks) {
+        if (!e?.bytes) return null
+        return e.bytes.slice(i * cs, i * cs + len)
+      }
+      const chunk = e.chunks.get(i)
+      if (!chunk) return null
+      return chunk.slice(0, len)
+    },
     fxSave: async (fid, name) => {
       const e = (window.__orayFx || {})[fid]
       if (!e?.bytes) return { ok: false, why: 'not-found' }

@@ -213,6 +213,21 @@ function registerIpc() {
     } catch { return null }
   })
 
+  // FEC 恢复用：从 .part（接收中）或完成文件读第 i 块
+  ipcMain.handle('fx:read-range', (_e, fid, i, cs, len) => {
+    try {
+      const id = fxSafe(fid)
+      let p = fxPart(id)
+      if (!fs.existsSync(p)) p = fxDone(id)
+      const fd = fs.openSync(p, 'r')
+      try {
+        const buf = Buffer.alloc(len)
+        const read = fs.readSync(fd, buf, 0, len, i * cs)
+        return new Uint8Array(buf.subarray(0, read))
+      } finally { fs.closeSync(fd) }
+    } catch { return null }
+  })
+
   ipcMain.handle('fx:save', async (_e, fid, name) => {
     try {
       const src = fxDone(fxSafe(fid))
