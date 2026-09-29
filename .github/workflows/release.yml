@@ -70,6 +70,11 @@ jobs:
       - run: npm run build
       - run: node scripts/build-www.mjs
       - run: npx cap sync android
+      # cap sync 会重新生成 capacitor-cordova-android-plugins（含其仓库配置）。
+      # CI 在海外网络：把阿里云镜像替换为官方源，避免镜像 5xx 导致构建失败
+      - name: Point gradle repos at official sources (CI)
+        run: |
+          find android -name build.gradle -exec sed -i             -e 's|https://maven.aliyun.com/repository/public|https://repo.maven.apache.org/maven2|g'             -e 's|https://maven.aliyun.com/repository/google|https://maven.googleapis.com|g'             -e 's|https://maven.aliyun.com/repository/gradle-plugin|https://plugins.gradle.org/m2|g' {} +
       - run: node scripts/sync-version.mjs
       # 从仓库 Secrets 解码发布密钥库（未配置时产出 unsigned 包）
       - name: Prepare keystore
