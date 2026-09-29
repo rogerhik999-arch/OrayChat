@@ -23,6 +23,14 @@ const ACK_TIMEOUT_MS = 3000
 const ACK_MAX_RETRIES = 3
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000
 const PRESENCE_HEARTBEAT_MS = 15000
+// ---- 残身回收（v1.14.0）----
+// peerId 是 Trystero 的 selfId，每次启动随机生成：对端重启/换网就会以新
+// peerId 回来，旧条目若死亡路径未触发（崩溃时 WebRTC 没有 leave 事件、
+// p2p 会话不走 onRelayGone）会永远挂在在线列表里。回收判据见 reapGhosts。
+const REAP_INTERVAL_MS = 15000
+const GHOST_GRACE_MS = 90000 // 视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
+const RELAY_VIEW_WARMUP_MS = 75000 // 我方中继刚连上时视野不完整：预热期内不回收
+const REAP_COOLDOWN_MS = 5 * 60 * 1000 // 刚回收的 peerId 期间不再被摘要复种
 
 // 免费公共基础设施默认清单（可在 userData/oraychat-config.json 覆盖）
 export const DEFAULT_CONFIG = {
@@ -114,6 +122,12 @@ export class ChatNet {
     // 会话恢复票据（仅内存）：peerIdPubHex -> {key, epoch, sendSeq, recvSeqMax}
     this.resumable = new Map()
     this.sessionResume = opts.sessionResume !== false // 默认启用（设置页可关）
+    // 残身回收簿记：peerId -> ts（冷却期内不被摘要复种）；digestTries：间接介绍次数上限
+    this.recentlyReaped = new Map()
+    this.digestTries = new Map()
+    this.relayStableSince = 0
+    this._relayWasConn = false
+    this.reapTimer = setInterval(() => this.reapGhosts(), REAP_INTERVAL_MS)
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -270,9 +284,11 @@ export class ChatNet {
   ensurePeer(peerId, via) {
     let peer = this.peers.get(peerId)
     if (!peer) {
+      const now = Date.now()
       peer = {
         via, state: 'connecting', pc: null, name: null, ctx: null,
         safety: null, path: 'unknown', pending: null, hsTimer: null, lastError: null,
+        bornAt: now, lastProgress: now,
       }
       this.peers.set(peerId, peer)
       this.hooks.onPeerAdded?.(peerId, peer)
@@ -339,6 +355,7 @@ export class ChatNet {
     const existing = this.peers.get(peerId)
     if (existing) {
       // 对端仍在线但其会话曾失败（单向可见的根因之一）：借 presence 时机重新握手
+      existing.lastProgress = Date.now() // presence 即存活证据（reapGhosts 不回收）
       if (existing.state === 'failed' && existing.via !== 'p2p') {
         existing.retried = false
         existing.lastError = null
@@ -363,7 +380,17 @@ export class ChatNet {
 
   onRelayGone(peerId) {
     const peer = this.peers.get(peerId)
-    if (!peer || peer.via !== 'mqtt') return
+    if (!peer) return
+    if (peer.via !== 'mqtt') {
+      // 中继视野已判死，但直连会话不轻动：标记怀疑交 reapGhosts 裁决 ——
+      // pc 仍 connected 的是真直连（中继看不到也保留）；否则宽限期后回收。
+      // （对端崩溃/断网时 WebRTC 往往没有 leave 事件，这是残身的主来源）
+      if (peer.state === 'ready' && !peer.suspect) {
+        peer.suspect = true
+        peer.suspectAt = Date.now()
+      }
+      return
+    }
     this.dropPeer(peerId, peer)
   }
 
@@ -372,6 +399,7 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') return
     peer.suspect = true
+    peer.suspectAt = Date.now()
     this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… presence 超时，ping 确认中`, 'warn')
     try {
       const ping = { op: 'ping', n: oc.newMid() }
@@ -398,6 +426,7 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer) return
     peer.state = 'handshaking'
+    peer.lastProgress = Date.now()
     if (this.iAmInitiator(peerId)) {
       // 会话恢复：对该身份持有票据且启用时，hs1 附带 epoch 证明（对端不认则自动回退全握手）
       const ticket = this.sessionResume && peer.idPubHex ? this.resumable.get(peer.idPubHex) : null
@@ -479,6 +508,7 @@ export class ChatNet {
     if (!peer) return
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
     if (!this.acceptsVia(peer, via)) return
+    peer.lastProgress = Date.now() // 握手有来有回 = 双方都活着（reapGhosts 不回收）
     try {
       if (msg.t === 'OC-HS1-v1') {
         if (this.iAmInitiator(peerId)) return // 双方角色规则一致，不应收到 hs1；忽略竞态帧
@@ -555,8 +585,12 @@ export class ChatNet {
     if (peer.state === 'ready') return // 重复 hs3/hs3ack 幂等
     peer.state = 'ready'
     peer.suspect = false
+    peer.suspectAt = 0
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
+    peer.lastProgress = Date.now()
+    this.digestTries.delete(peerId) // 会话已建立：间接介绍计数清零
+    this.dedupeIdentity(peerId, peer)
     if (peer.ctx.peerName) this.peerNames.set(peer.idPubHex, peer.ctx.peerName)
     // 会话恢复票据：当前密钥/epoch/序号（仅内存；重连时免 X25519 且序号续接）
     if (this.sessionResume) {
@@ -644,6 +678,7 @@ export class ChatNet {
     try {
       const { text, t, mid, conv } = oc.open(peer.ctx, envelope)
       peer.lastSeen = Date.now()
+      peer.lastProgress = Date.now()
       this.relay?.markAlive(peerId) // 消息到达 = 存活证据（撤销 SWIM 怀疑）
       if (mid) {
         this.store.addMsg(this.storeKey(conv, peerId), {
@@ -769,6 +804,7 @@ export class ChatNet {
     if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
+      peer.lastProgress = Date.now()
       this.relay?.markAlive(peerId) // 心跳即存活证据（SWIM：任意消息撤销怀疑）
       this.hooks.onPresence?.(peerId, peer)
       this.absorbDigest(peerId, frame.digest)
@@ -951,9 +987,12 @@ export class ChatNet {
       // SWIM 复活：第三方仍看到他在线 → 撤销我方怀疑（ping-req 的等价实现）
       const known = this.relay?.peers?.get(pid)
       if (known?.suspectSince) this.relay.markAlive(pid)
+      if (this.recentlyReaped.has(pid)) continue // 刚回收的残身：冷却期内不被摘要复种
       const name = decodeURIComponent(encName || '')
       const existing = this.peers.get(pid)
       if (!existing) {
+        if ((this.digestTries.get(pid) || 0) >= 2) continue // 多次间接介绍未果：不再复种
+        this.digestTries.set(pid, (this.digestTries.get(pid) || 0) + 1)
         // 间接发现（第三方的介绍）：与该成员建立中继握手
         this.hooks.onLog?.(`经 ${this.peers.get(fromPeerId)?.name || fromPeerId.slice(0, 8)}… 的摘要发现 ${name || pid.slice(0, 8)}… 在线，主动连接`)
         const peer = this.ensurePeer(pid, 'mqtt')
@@ -980,6 +1019,67 @@ export class ChatNet {
       this.hooks.onLog?.(`周期重试失败会话 (${peer.name || peerId.slice(0, 8)}…)`)
       this.restartHandshake(peerId, peer.via === 'p2p' && this.room?.getPeers?.()?.[peerId] ? 'p2p' : 'mqtt')
     }
+  }
+
+  // ---- 残身回收（v1.14.0）----
+
+  // 同一身份重新上线：peerId 每次启动随机，握手学到 idPubHex 即可确认
+  // 「新旧条目是同一个人」→ 立即清理旧 peerId 条目（对端重启场景，残身秒清）。
+  // 同名接管：本产品昵称即登录账号；同名的 failed/handshaking 旧条目（重装换
+  // 身份密钥、握手早断）且中继视野里已无 presence → 一并清理。两台设备同名
+  // 且都 ready 的合法场景不受影响。
+  dedupeIdentity(peerId, peer) {
+    const relaySees = (pid) => this.relay?.peers?.has(pid)
+    for (const [pid, p] of [...this.peers.entries()]) {
+      if (pid === peerId || p === peer) continue
+      const sameIdentity = p.idPubHex && p.idPubHex === peer.idPubHex
+      const knownName = p.name || (p.idPubHex ? this.peerNames.get(p.idPubHex) : null)
+      const sameName = peer.name && knownName === peer.name && p.state !== 'ready'
+      if (sameIdentity || (sameName && !relaySees(pid))) {
+        this.hooks.onLog?.(`同一${sameIdentity ? '身份' : '昵称'}经新连接上线，清理旧会话条目（${knownName || pid.slice(0, 8)}…）`)
+        this.dropPeer(pid, p)
+      }
+    }
+  }
+
+  // 回收判据（两条可靠证据链须同时成立）：
+  //   1) 中继视野（我方 relay 稳定在线 ≥ 预热期）里已无他的 presence ——
+  //      presence TTL + 怀疑宽限早已过，他确实不在了；
+  //   2) 直连通道也不是 connected。
+  // 真直连（中继看不到但 pc connected）与仍在广播 presence 的一律保留。
+  // 回收的 peerId 进冷却名单，digest 摘要在冷却期内不再据此复种新条目。
+  reapGhosts() {
+    if (this.destroyed) return
+    const now = Date.now()
+    const conn = !!this.relay?.connected
+    if (conn && !this._relayWasConn) this.relayStableSince = now
+    if (!conn) this.relayStableSince = 0
+    this._relayWasConn = conn
+    for (const [pid, ts] of this.recentlyReaped) if (now - ts > REAP_COOLDOWN_MS) this.recentlyReaped.delete(pid)
+    // 我方中继不在线/刚连上：视野不可信，本轮不回收
+    if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) return
+    for (const [peerId, peer] of [...this.peers.entries()]) {
+      const pcAlive = !!peer.pc && peer.pc.connectionState === 'connected'
+      if (pcAlive) continue
+      if (this.relay?.peers?.has(peerId)) continue // 仍在广播 presence：真在线（哪怕握手失败）
+      if (peer.state === 'ready') {
+        const since = peer.suspectAt || 0
+        if (since) {
+          if (now - since > GHOST_GRACE_MS) this.dropGhost(peerId, peer, '对端已下线（中继视野消失且直连断开）')
+        } else {
+          peer.suspect = true // 未经过怀疑流程（如纯 p2p 会话）：观察一个宽限期，UI 同步显示怀疑态
+          peer.suspectAt = now
+        }
+      } else if (now - (peer.lastProgress || peer.bornAt || now) > GHOST_GRACE_MS) {
+        this.dropGhost(peerId, peer, peer.state === 'failed' ? '会话失败且对端已离线' : '握手无进展且对端已离线')
+      }
+    }
+  }
+
+  dropGhost(peerId, peer, why) {
+    this.recentlyReaped.set(peerId, Date.now())
+    this.hooks.onLog?.(`清理残身：${peer.name || peerId.slice(0, 8)}…（${why}）→ 移入历史联系人`, 'warn')
+    this.dropPeer(peerId, peer)
   }
 
   // ---------- 直连升级（自动 + 手动） ----------
@@ -1106,6 +1206,7 @@ export class ChatNet {
     clearInterval(this.heartbeatTimer)
     clearInterval(this.retryFailedTimer)
     clearInterval(this.antiEntropyTimer)
+    clearInterval(this.reapTimer)
     for (const [, a] of this.pendingAcks) clearTimeout(a.timer)
     this.pendingAcks.clear()
     clearInterval(this.directProbeTimer)

@@ -223,7 +223,7 @@ function renderPeers() {
     <div class="avatar" style="background:#3b5b8f">🏛️</div>
     <div class="p-info">
       <div class="p-name">大厅 · ${esc(state.room)}${unreadBadge('lobby')}</div>
-      <div class="p-state"><span class="dot ${readyCount ? 'ok' : 'off'}"></span>${readyCount} 人在线 · 全员可见</div>
+      <div class="p-state"><span class="dot ${readyCount ? 'ok' : 'off'}"></span>${readyCount} 人加密在线 · 全员可见</div>
     </div>`
   lobby.onclick = () => selectView({ conv: 'lobby' })
   list.appendChild(lobby)
@@ -276,7 +276,9 @@ function renderPeers() {
       list.appendChild(li)
     }
   }
-  $('peerCount').textContent = String(readyCount)
+  // 计数 = 列出的条目数（含连接中/失败：presence 层面仍在线）；
+  // 大厅行的"N 人在线"仍用就绪数（能实际收发消息的人）
+  $('peerCount').textContent = String(peers.length)
   renderChatHead()
 }
 
