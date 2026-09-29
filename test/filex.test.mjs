@@ -19,11 +19,13 @@ function link() {
   const peerB = { state: 'ready', via: 'p2p', ctx: ctxB, idPubHex: '11'.repeat(32) }
   const netA = {
     peers: new Map([['B', peerA]]),
+    readyPeerIds: () => ['B'],
     sendCtl: async (pid, frame) => { if (wire.aReady) wire.a2b.push(frame) },
     sendFx: async (pid, frame) => { if (wire.aReady) wire.a2b.push({ __fx: frame }) },
   }
   const netB = {
     peers: new Map([['A', peerB]]),
+    readyPeerIds: () => ['A'],
     sendCtl: async (pid, frame) => { if (wire.bReady) wire.b2a.push(frame) },
     sendFx: async (pid, frame) => { if (wire.bReady) wire.b2a.push({ __fx: frame }) },
   }
@@ -471,5 +473,38 @@ const WINDOW_DEFAULT = 16 // P2P 默认窗口（与 filex WINDOW_P2P 一致）
   void sentVia; void fxB
 }
 
-console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底/保护限时/停滞复活/FEC/自适应窗口/令牌桶/流压缩/块哈希/双路径）')
+// ---- 17) P3-1 多源获取：want 广播 → hold 应答 → req 拉块 → 终检完成 ----
+{
+  const { wire, netA, netB } = link()
+  // holder（netA）已持有文件（模拟：直接在其 io 写入完成内容）
+  const content = new Uint8Array(32768 * 5)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const holder = mkFileX(netA)
+  void content
+  // holder.io 放完整字节（模拟完成态）；fid 必须是内容的 sha256 前 24hex
+  // （内容寻址校验：fx-want/fx-hold 都会验 fid == sha 前缀）
+  const realContent = new Uint8Array(32768 * 5)
+  for (let i = 0; i < realContent.length; i++) realContent[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const FID = (await sha256Hex(realContent)).slice(0, 24)
+  holder.io.store.set(FID, { chunks: new Map(), have: [], bytes: realContent })
+  const requester = mkFileX(netB, { onEvent: () => {} })
+  // 双向回放协程：want/hold/req/chunk 全走 ctl+fx
+  const pump = (async () => {
+    for (let r = 0; r < 900; r++) {
+      for (const f of wire.a2b.splice(0)) { f.__fx ? await requester.onFrame('A', f.__fx) : await requester.onCtl('A', f) }
+      for (const f of wire.b2a.splice(0)) { f.__fx ? await holder.onFrame('B', f.__fx) : await holder.onCtl('B', f) }
+      await new Promise(res => setTimeout(res, 20))
+      const tx = requester.tx.get(FID)
+      if (tx?.state === 'done') break
+    }
+  })()
+  const pulled = await requester.pullFromPeers(FID, { name: 'multi.bin', type: 'file', mime: 'application/octet-stream' })
+  await pump
+  assert.equal(requester.tx.get(pulled)?.state, 'done', '多源拉取完成')
+  const got = await requester.io.read(pulled)
+  assert.ok(got, '拉取落盘')
+  assert.equal(await sha256Hex(got), await sha256Hex(realContent), '拉取内容与持有者一致')
+}
+
+console.log('filex.test.mjs ✓ 全部通过（…/流压缩/块哈希/双路径/多源获取）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

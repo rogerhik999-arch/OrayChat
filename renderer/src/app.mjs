@@ -562,6 +562,19 @@ function buildFileBubble(bubble, m, mine) {
         ? `🖼️ ${m.name || '图片'}（${fmtSize(m.size || 0)}）· ${m.author === state.myIdPubHex ? '发送' : '接收'}中 ${Math.round(((st?.done || 0) / Math.max(1, st?.total || 1)) * 100)}%`
         : `🖼️ ${m.name || '图片'}（${fmtSize(m.size || 0)}）· 未完成接收，重新发送可续传`
       bubble.appendChild(ph)
+      // P3-1：对方离线时代发的历史图片，可从当前在线成员多源获取
+      if (!active && !mine && state.filex && !state.filex.tx.has(m.fid)) {
+        const get = document.createElement('a')
+        get.className = 'fx-action'
+        get.textContent = '⤓ 从成员获取'
+        get.onclick = async () => {
+          try {
+            await state.filex.pullFromPeers(m.fid, m)
+            renderMessages()
+          } catch (e) { appendSys(`获取失败：${e.message}`) }
+        }
+        bubble.appendChild(get)
+      }
     } else {
       const img = document.createElement('img')
       img.className = 'fx-img'
@@ -590,7 +603,15 @@ function buildFileBubble(bubble, m, mine) {
     else {
       act.textContent = '下载'
       act.onclick = async () => {
-        const r = await window.oray.fxSave(m.fid, m.name)
+        let r = await window.oray.fxSave(m.fid, m.name)
+        if (!r?.ok && r?.why === 'not-found' && state.filex) {
+          // P3-1 多源获取：本机没有字节，向在线成员拉取后自动重试保存
+          appendSys(`本机没有 ${m.name} 的字节，正在向在线成员获取…`)
+          try {
+            await state.filex.pullFromPeers(m.fid, m)
+            r = await window.oray.fxSave(m.fid, m.name)
+          } catch (e) { appendSys(`获取失败：${e.message}`); return }
+        }
         if (!r?.ok) appendSys(`保存失败：${r?.why || '未知'}`)
         else appendSys(`已保存到 ${r.path}`)
       }

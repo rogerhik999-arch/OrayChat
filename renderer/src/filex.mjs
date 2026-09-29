@@ -124,6 +124,8 @@ export class FileX {
         if (tx.state !== 'active') continue
         if (tx.dir === 'recv' && now - tx.lastHaveAt > HAVE_INTERVAL_MS) {
           this.sendHave(tx.peerId, tx.fid).catch(() => {})
+        } else if (tx.dir === 'pull') {
+          this.requestMissing(tx) // 拉取事务：周期请求缺失块
         }
       }
     }, HAVE_INTERVAL_MS)
@@ -625,7 +627,7 @@ export class FileX {
   // 数据块入口（net 层双传输汇入）
   async onFrame(peerId, f) {
     const tx = this.tx.get(f?.fid)
-    if (!tx || tx.dir !== 'recv' || tx.state !== 'active') return
+    if (!tx || (tx.dir !== 'recv' && tx.dir !== 'pull') || tx.state !== 'active') return
     const peer = this.peer(peerId)
     if (!peer || !peer.ctx) return
     const i = f.i
@@ -671,11 +673,14 @@ export class FileX {
       tx.lastLifeAt = tx.lastProgressAt // 收到块 = 活性
       // 组内有奇偶块且现在只剩唯一缺失 → 本地恢复
       const g = Math.floor(i / FEC_GROUP)
-      if (tx.parity.has(g)) void this.recoverWithParity(tx, g)
+      if (tx.parity?.has(g)) void this.recoverWithParity(tx, g)
       const done = bitmapCount(tx.have)
       this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name, speed: recentSpeed(tx, done) })
-      // 水位前进 8 块或有节奏地回报位图
-      if (done >= tx.n || Date.now() - tx.lastHaveAt > HAVE_INTERVAL_MS) await this.sendHave(peerId, tx.fid)
+      // 水位前进 8 块或有节奏地回报位图（pull 事务完成走本地 finalize）
+      if (tx.dir === 'pull') {
+        if (done >= tx.n) await this.finishPull(tx)
+        else this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name })
+      } else if (done >= tx.n || Date.now() - tx.lastHaveAt > HAVE_INTERVAL_MS) await this.sendHave(peerId, tx.fid)
       else if (i % 8 === 0) await this.sendHave(peerId, tx.fid)
     } catch (e) {
       this.log(`文件块解密失败（${e?.message || e}）`, 'warn') // 篡改/密钥错位：丢弃，等重发
@@ -693,6 +698,141 @@ export class FileX {
     }
     else if (f.op === 'fx-done') this.onDone(peerId, f)
     else if (f.op === 'fx-cancel') this.onCancel(peerId, f).catch(() => {})
+    // ---- P3-1 多源种子协议 ----
+    else if (f.op === 'fx-want') this.onWant(peerId, f).catch(() => {})
+    else if (f.op === 'fx-hold') this.onHold(peerId, f)
+    else if (f.op === 'fx-req') this.onReq(peerId, f).catch(() => {})
+  }
+
+  // ---------- P3-1 多源获取（持有者广播 want → 持有者报 hold → 定向 req 拉块） ----------
+  // 完整性：fx-hold 携带完整 SHA-256，其 24hex 前缀必须等于 fid（内容寻址绑定，
+  // 伪造等价于 SHA 原像攻击）；finalize 再验全量哈希。持有者对 req 无状态应答
+  // （读盘→切块→限速发送），不维护种子会话。
+
+  // 本机是否持有该文件（完成态），带缓存
+  async holding(fid) {
+    if (this.holdingCache?.has(fid)) return this.holdingCache.get(fid)
+    if (!this.holdingCache) this.holdingCache = new Map()
+    let ok = false
+    try { ok = !!(await this.io.read(fid)) } catch { ok = false }
+    this.holdingCache.set(fid, ok)
+    return ok
+  }
+
+  async onWant(peerId, f) {
+    if (!f?.fid || this.tx.has(f.fid)) return
+    if (!(await this.holding(f.fid))) return
+    let meta = this.completed?.get(f.fid)
+    try {
+      const bytes = await this.io.read(f.fid)
+      if (!bytes) return
+      const sha = await sha256Hex(bytes)
+      if (sha.slice(0, 24) !== f.fid) return // 内容与 fid 不符：不 serving
+      meta = { sha, size: bytes.length, n: chunkCount(bytes.length, FX_CHUNK_SIZE), cs: FX_CHUNK_SIZE }
+      if (!this.completed) this.completed = new Map()
+      this.completed.set(f.fid, meta)
+    } catch { return }
+    this.net.sendCtl(peerId, { op: 'fx-hold', fid: f.fid, ...meta }).catch(() => {})
+  }
+
+  // 收集在线成员的 fx-hold 应答（want 广播后 2.5s 窗口）
+  onHold(peerId, f) {
+    if (!this.holdWaiters?.has(f?.fid)) return
+    const w = this.holdWaiters.get(f.fid)
+    // 完整 sha 的 24hex 前缀必须等于 fid（内容寻址绑定）
+    if (!f.sha || f.sha.slice(0, 24) !== f.fid || !Number.isInteger(f.n)) return
+    if (!w.holders.some((h) => h.peerId === peerId)) w.holders.push({ peerId, sha: f.sha, size: f.size, cs: f.cs || FX_CHUNK_SIZE, n: f.n })
+  }
+
+  queryHolders(fid) {
+    return new Promise((resolve) => {
+      if (!this.holdWaiters) this.holdWaiters = new Map()
+      const w = { holders: [] }
+      this.holdWaiters.set(fid, w)
+      const timer = setTimeout(() => { this.holdWaiters.delete(fid); resolve(w.holders) }, 2500)
+      void timer
+      for (const pid of this.net.readyPeerIds()) this.net.sendCtl(pid, { op: 'fx-want', fid }).catch(() => {})
+    })
+  }
+
+  // 从在线持有者拉取文件（入口：气泡上的"从成员获取"）。
+  // meta 来自日志条目（name/size/mime/kind/w/h/thumb）；完整 sha 由 fx-hold 提供
+  // （fid 前缀绑定防伪造），完成时全量终检。
+  async pullFromPeers(fid, meta = {}) {
+    if (this.tx.has(fid)) throw new Error('该文件已在传输队列中')
+    const holders = await this.queryHolders(fid)
+    if (!holders.length) throw new Error('在线成员都没有这个文件')
+    const h = holders[0]
+    const tx = {
+      fid, dir: 'pull', peerId: h.peerId, state: 'active', cs: h.cs, n: h.n, size: h.size,
+      sha: h.sha, name: meta.name || String(fid), mime: meta.mime || 'application/octet-stream',
+      kind: meta.type === 'image' ? 'image' : 'file', mode: meta.mode || '',
+      w: meta.w, h: meta.h, thumb: meta.thumb || '',
+      have: (await this.io.state(fid, { size: h.size, cs: h.cs, n: h.n })).have,
+      parity: new Map(), // 与 recv 事务共用 onFrame 处理路径
+      holders: holders.map((x) => x.peerId), // 备选持有者（主选停滞可切换）
+      lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
+      lastReqAt: 0,
+    }
+    this.tx.set(fid, tx)
+    this.log(`从 ${this.peer(h.peerId)?.name || h.peerId.slice(0, 8)}… 获取 ${tx.name}（${fmtSize(h.size)}，多源可续传）`)
+    this.emit({ fid, dir: 'recv', state: 'active', done: bitmapCount(tx.have), total: tx.n, name: tx.name })
+    this.requestMissing(tx)
+    return fid
+  }
+
+  // 拉取事务：周期向持有者请求缺失块（接收方驱动，与断点续传共用位图）
+  requestMissing(tx) {
+    const now = Date.now()
+    if (tx.state !== 'active' || now - tx.lastReqAt < HAVE_INTERVAL_MS) return
+    tx.lastReqAt = now
+    const miss = []
+    for (let k = 0; k < tx.n && miss.length < 16; k++) if (!bitmapHas(tx.have, k)) miss.push(k)
+    if (!miss.length) return
+    this.net.sendCtl(tx.peerId, { op: 'fx-req', fid: tx.fid, i: miss }).catch(() => {})
+    this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done: bitmapCount(tx.have), total: tx.n, name: tx.name })
+  }
+
+  // 拉取完成：全量终检（fid 前缀绑定 + hold 提供的完整 sha）
+  async finishPull(tx) {
+    if (tx.finalizing) return
+    tx.finalizing = true
+    try {
+      const r = await this.io.finalize(tx.fid, tx.sha, tx.name)
+      if (r.ok) {
+        tx.state = 'done'
+        if (!this.completed) this.completed = new Map()
+        this.completed.set(tx.fid, { sha: tx.sha, size: tx.size, n: tx.n, cs: tx.cs })
+        this.holdingCache?.set(tx.fid, true)
+        this.log(`已从成员获取 ${tx.name}（${fmtSize(tx.size)}，SHA-256 校验一致）`)
+        this.emit({ fid: tx.fid, dir: 'recv', state: 'done', done: tx.n, total: tx.n, name: tx.name })
+      } else {
+        tx.state = 'error'
+        this.log(`获取 ${tx.name} 校验失败（${r.why || 'io'}），已丢弃`, 'warn')
+        this.emit({ fid: tx.fid, dir: 'recv', state: 'error', done: 0, total: tx.n, name: tx.name })
+      }
+    } finally { tx.finalizing = false }
+  }
+
+  // 持有者服务：按请求读盘切块限速应答（无状态；会话就绪才服务）
+  async onReq(peerId, f) {    if (!f?.fid || !Array.isArray(f.i) || !f.i.length) return
+    if (!(await this.holding(f.fid))) return
+    const bytes = await this.io.read(f.fid)
+    if (!bytes) return
+    if (String((await sha256Hex(bytes)).slice(0, 24)) !== f.fid) return
+    const peer = this.peer(peerId)
+    if (!peer || peer.state !== 'ready') return
+    const n = chunkCount(bytes.length, FX_CHUNK_SIZE)
+    for (const i of f.i.slice(0, 16)) {
+      if (!Number.isInteger(i) || i < 0 || i >= n) continue
+      const raw = bytes.subarray(i * FX_CHUNK_SIZE, Math.min((i + 1) * FX_CHUNK_SIZE, bytes.length))
+      const { data, z } = await maybeDeflate(raw)
+      const wait = this.paceTake(data.length + 64)
+      if (wait > 0) await sleep(Math.min(wait, 1000))
+      const e = oc.sealBin(peer.ctx, data, 'fx', f.fid, i, z)
+      try { await this.net.sendFx(peerId, { fid: f.fid, i, z, e }) } catch { break }
+      if (peer.via === 'mqtt') await sleep(MQTTPace_MS)
+    }
   }
 
   // UI 查询：气泡渲染用
