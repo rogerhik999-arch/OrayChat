@@ -28,6 +28,19 @@ import * as oc from './crypto.mjs'
 
 const PRESENCE_INTERVAL_MS = 10000
 const PRESENCE_TTL_MS = 30000
+const TTL_MIN_MS = 15000
+const TTL_MAX_MS = 90000
+const ARRIVAL_HISTORY = 10
+
+// 简化 φ-accrual：按各端 presence 实际到达节奏自适应判离线阈值
+// ttl = clamp(avg*2 + 4*stddev, 15s, 90s)；样本不足时退回固定 30s
+function adaptiveTtl(entry) {
+  const h = entry.arrivals
+  if (!h || h.length < 3) return PRESENCE_TTL_MS
+  const avg = h.reduce((a, b) => a + b, 0) / h.length
+  const varr = h.reduce((a, b) => a + (b - avg) ** 2, 0) / h.length
+  return Math.max(TTL_MIN_MS, Math.min(TTL_MAX_MS, avg * 2 + 4 * Math.sqrt(varr)))
+}
 const SUSPECT_MS = 20000 // 怀疑 → 判死的宽限期（期间可被 ping/digest 复活）
 const DEDUP_WINDOW_MS = 60000
 const DEFAULT_PARALLEL = 2
@@ -52,7 +65,13 @@ export class RelayTransport {
     // 并联数不超过 broker 数
     this.parallelN = Math.max(1, Math.min(parallel || DEFAULT_PARALLEL, this.brokerUrls.length))
     for (let i = 0; i < this.parallelN; i++) this.spawnLink(this.brokerUrls[i])
-    this.presenceTimer = setInterval(() => this.announce(), PRESENCE_INTERVAL_MS)
+    // P2-5 抖动广播：10±2s 随机间隔（防多端同步广播的雷群效应）
+    const scheduleAnnounce = () => {
+      if (this.closed) return
+      const jitter = PRESENCE_INTERVAL_MS + (Math.random() * 4000 - 2000)
+      this.presenceTimer = setTimeout(() => { this.announce(); scheduleAnnounce() }, jitter)
+    }
+    scheduleAnnounce()
     this.pruneTimer = setInterval(() => this.prune(), 5000)
     this.dedupTimer = setInterval(() => {
       const now = Date.now()
@@ -121,7 +140,11 @@ export class RelayTransport {
     if (topic === RelayTransport.topics(this.appId, this.roomId).presence) {
       if (!msg?.id || msg.id === this.selfId) return
       const known = this.peers.has(msg.id)
-      this.peers.set(msg.id, { name: String(msg.name || '未知用户'), lastSeen: Date.now(), suspectSince: null })
+      const prev = this.peers.get(msg.id)
+      const now = Date.now()
+      const arrivals = prev?.arrivals?.slice(-ARRIVAL_HISTORY + 1) || []
+      if (prev?.lastSeen && now > prev.lastSeen) arrivals.push(now - prev.lastSeen)
+      this.peers.set(msg.id, { name: String(msg.name || '未知用户'), lastSeen: now, suspectSince: null, arrivals })
       if (!known) this.onAnnounce?.(msg.id, this.peers.get(msg.id))
     } else if (topic === RelayTransport.topics(this.appId, this.roomId).inbox(this.selfId)) {
       if (!msg?.from || msg.from === this.selfId) return
@@ -146,7 +169,7 @@ export class RelayTransport {
   prune() {
     const now = Date.now()
     for (const [id, p] of this.peers) {
-      if (now - p.lastSeen > PRESENCE_TTL_MS && !p.suspectSince) {
+      if (now - p.lastSeen > adaptiveTtl(p) && !p.suspectSince) {
         p.suspectSince = now
         this.onPeerSuspect?.(id) // SWIM 怀疑标记：交上层 ping/digest 确认
       } else if (p.suspectSince && now - p.suspectSince > SUSPECT_MS) {

@@ -54,7 +54,15 @@ function loadConfig() {
 }
 
 function registerIpc() {
-  ipcMain.handle('config:get', () => loadConfig())
+  // 设置页把用户覆盖项写进 local-state['oc-config']；读取时与内置默认+配置文件合并
+  // （否则设置页保存的配置永远不生效 —— "重启生效"承诺的兑现）
+  ipcMain.handle('config:get', () => {
+    const merged = loadConfig()
+    try {
+      const st = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'local-state.json'), 'utf8'))
+      return { ...merged, ...(st['oc-config'] || {}) }
+    } catch { return merged }
+  })
   ipcMain.handle('launch-args:get', () => argv)
   ipcMain.handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, profile: PROFILE }))
 

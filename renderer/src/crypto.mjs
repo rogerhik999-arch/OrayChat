@@ -123,7 +123,7 @@ function transcript1(roomId, a) {
 }
 
 // 发起方：构造 hs1。返回 {msg, pend}，pend 为发起方握手上下文（含临时私钥，绝不出网）
-export function makeHs1(myIdent, myName, roomId) {
+export function makeHs1(myIdent, myName, roomId, resumeTicket) {
   const ephSk = randomBytes(32)
   const ephPk = x25519.getPublicKey(ephSk)
   const sigMsg = concatBytes(
@@ -138,17 +138,25 @@ export function makeHs1(myIdent, myName, roomId) {
     eph: b64(ephPk),
     sig: b64(ed25519.sign(sigMsg, myIdent.edSeed)),
   }
+  // 会话恢复请求（可选项）：持有对端票据时附带证明；响应方不认则自然回退
+  let resumeNext = 0
+  if (resumeTicket?.key && Number.isInteger(resumeTicket.epoch)) {
+    resumeNext = resumeTicket.epoch + 1
+    msg.rs = { e: resumeNext, p: resumeRequestProof(resumeTicket.key, resumeNext, roomId) }
+  }
   const pend = {
     selfIdPub: myIdent.edPub,
     selfXPk: myIdent.xPk,
     selfEphSk: ephSk,
     room: roomId,
+    resumeTicket: resumeTicket || null,
+    resumeNext,
   }
   return { msg, pend }
 }
 
 // 响应方：校验 hs1，构造 hs2，派生会话密钥
-export function acceptHs1(myIdent, myName, roomId, hs1) {
+export function acceptHs1(myIdent, myName, roomId, hs1, resumeStore) {
   if (hs1.t !== HS1_TAG) throw new Error('非握手消息')
   if (hs1.room !== roomId) throw new Error('房间不匹配')
   const peerIdPub = unb64(hs1.idPub)
@@ -156,6 +164,34 @@ export function acceptHs1(myIdent, myName, roomId, hs1) {
   const peerEphPk = unb64(hs1.eph)
   const sigMsg = concatBytes(utf8(HS1_TAG), utf8(roomId), peerEphPk, peerXPk, peerIdPub, utf8(hs1.dn || ''))
   if (!ed25519.verify(unb64(hs1.sig), sigMsg, peerIdPub)) throw new Error('hs1 签名无效（身份伪造？）')
+
+  // 会话恢复：对端持有本会话的票据且证明有效 → epoch 链派生新钥，跳过 X25519
+  const myTicket = resumeStore?.get?.(hex(peerIdPub))
+  if (hs1.rs?.e && myTicket?.key && myTicket.epoch + 1 === hs1.rs.e
+    && verifyResumeRequest(myTicket.key, hs1.rs.e, roomId, hs1.rs.p)) {
+    const newKey = deriveResumeKey(myTicket.key, hs1.rs.e)
+    const msg = {
+      t: HS2_TAG,
+      dn: myName,
+      idPub: b64(myIdent.edPub),
+      xPk: b64(myIdent.xPk),
+      eph: b64(ephSkPlaceholder()), // 恢复模式不使用，占位保持帧形状
+      sig: b64(ed25519.sign(concatBytes(utf8(HS1_TAG), utf8(roomId), peerEphPk, peerXPk, peerIdPub, utf8(hs1.dn || '')), myIdent.edSeed)),
+      rs: { e: hs1.rs.e, p: resumeConfirmProof(newKey, hs1.rs.e) },
+    }
+    return {
+      msg,
+      resumed: { key: newKey, epoch: hs1.rs.e },
+      ctx: {
+        key: newKey, t1: new Uint8Array(32),
+        selfIdPub: myIdent.edPub,
+        peerIdPub, peerXPk,
+        peerName: hs1.dn || '未知用户',
+        iAmInitiator: false,
+        sendSeq: 0, recvSeqMax: 0, // 序号由 net 层按票据续接
+      },
+    }
+  }
 
   const ephSk = randomBytes(32)
   const ephPk = x25519.getPublicKey(ephSk)
@@ -193,6 +229,33 @@ export function acceptHs2(myIdent, pend, hs2) {
   const peerIdPub = unb64(hs2.idPub)
   const peerXPk = unb64(hs2.xPk)
   const peerEphPk = unb64(hs2.eph)
+
+  // 会话恢复分支：我方发起时附带票据，响应方确认 → 跳过签名验证与 X25519
+  // （对端身份已由"持有上一 epoch 密钥"证明绑定，等强于本次 Ed25519 签名）
+  if (hs2.rs?.e && pend.resumeTicket?.key && pend.resumeNext === hs2.rs.e) {
+    const newKey = deriveResumeKey(pend.resumeTicket.key, hs2.rs.e)
+    if (!verifyResumeConfirm(newKey, hs2.rs.e, hs2.rs.p)) {
+      throw new Error('会话恢复确认证明无效')
+    }
+    const t1z = new Uint8Array(32)
+    const msg = {
+      t: HS3_TAG,
+      mac: b64(hmac(sha256, newKey, concatBytes(utf8(HS3_TAG), t1z))),
+    }
+    return {
+      msg,
+      resumed: { key: newKey, epoch: hs2.rs.e },
+      ctx: {
+        key: newKey, t1: t1z,
+        selfIdPub: pend.selfIdPub,
+        peerIdPub, peerXPk,
+        peerName: hs2.dn || '未知用户',
+        iAmInitiator: true,
+        sendSeq: 0, recvSeqMax: 0, // 序号由 net 层按票据续接
+      },
+    }
+  }
+
   const t1 = transcript1(pend.room, { idPub: pend.selfIdPub, xPk: pend.selfXPk, ephPk: x25519.getPublicKey(pend.selfEphSk) })
   const sigMsg2 = concatBytes(utf8(HS2_TAG), t1, peerEphPk, peerXPk, peerIdPub, utf8(hs2.dn || ''))
   if (!ed25519.verify(unb64(hs2.sig), sigMsg2, peerIdPub)) throw new Error('hs2 签名无效（中间人？）')
@@ -263,6 +326,40 @@ function msgAad(senderIdPub, seq) {
 
 // 生成全局消息 id（96bit 随机，供共享日志去重与群体删除）
 export function newMid() { return hex(randomBytes(12)) }
+
+// ---------- 会话恢复（epoch 密钥链复用） ----------
+// 断线重连时跳过 X25519 重新协商：双方基于上一会话密钥派生新 epoch 密钥，
+// 消息序号续接。请求方在 hs1 附带 rs 证明；响应方持有同 epoch 票据则回 rs
+// 确认，否则按普通 hs2 走全握手（自动回退，无额外往返）。
+// 代价：自原握手点起的前向保密链被延续（票据仅存内存，退出即失效）。
+
+export const RESUME_INFO = 'oraychat-resume-v1'
+
+function ephSkPlaceholder() { return randomBytes(32) }
+
+export function deriveResumeKey(oldKey, nextEpoch) {
+  return hkdf(sha256, oldKey, utf8(`epoch:${nextEpoch}`), utf8(RESUME_INFO), 32)
+}
+
+// 恢复请求证明：证明持有当前 epoch 密钥（发起方在 hs1 里携带）
+export function resumeRequestProof(oldKey, nextEpoch, roomId) {
+  return b64(hmac(sha256, oldKey, utf8(`OC-RSQ|${nextEpoch}|${roomId}`)))
+}
+
+// 恢复确认证明：在新 epoch 密钥之下（响应方在 hs2 里携带）
+export function resumeConfirmProof(newKey, nextEpoch) {
+  return b64(hmac(sha256, newKey, utf8(`OC-RSR|${nextEpoch}`)))
+}
+
+export function verifyResumeRequest(oldKey, nextEpoch, roomId, proof) {
+  if (typeof proof !== 'string') return false
+  return equalCT(hmac(sha256, oldKey, utf8(`OC-RSQ|${nextEpoch}|${roomId}`)), unb64(proof))
+}
+
+export function verifyResumeConfirm(newKey, nextEpoch, proof) {
+  if (typeof proof !== 'string') return false
+  return equalCT(hmac(sha256, newKey, utf8(`OC-RSR|${nextEpoch}`)), unb64(proof))
+}
 
 // ---------- 房间口令（信令层加密 + 门禁） ----------
 //

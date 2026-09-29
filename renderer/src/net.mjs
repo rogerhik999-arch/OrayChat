@@ -94,8 +94,13 @@ export class ChatNet {
     })
     this.store.onChange((convKey) => this.hooks.onStoreChanged?.(convKey))
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
-    // 在线状态心跳：定期向所有就绪对端报告（对端据此显示在线状态与断线）
-    this.heartbeatTimer = setInterval(() => this.sendPresenceHeartbeat(), PRESENCE_HEARTBEAT_MS)
+    // 在线状态心跳（15±3s 抖动，防雷群）：定期向所有就绪对端报告在线
+    const scheduleHeartbeat = () => {
+      if (this.destroyed) return
+      const jitter = PRESENCE_HEARTBEAT_MS + (Math.random() * 6000 - 3000)
+      this.heartbeatTimer = setTimeout(() => { this.sendPresenceHeartbeat(); scheduleHeartbeat() }, jitter)
+    }
+    scheduleHeartbeat()
     // 直连升级探测：中继会话每 45s 静默检查一次 Trystero 侧是否已打通/可重试
     this.directProbeTimer = setInterval(() => this.probeDirectUpgrades(), 45000)
     // 失败会话周期性重试（60s）：修复"一侧显示失败、另一侧看不到"的单向可见
@@ -105,6 +110,9 @@ export class ChatNet {
     this.antiEntropyTimer = setInterval(() => this.runAntiEntropy(), ANTI_ENTROPY_MS + Math.floor(Math.random() * 30000))
     // 消息级 ACK 簿记：'peerId:seq' -> {envelope, via, tries, timer}
     this.pendingAcks = new Map()
+    // 会话恢复票据（仅内存）：peerIdPubHex -> {key, epoch, sendSeq, recvSeqMax}
+    this.resumable = new Map()
+    this.sessionResume = opts.sessionResume !== false // 默认启用（设置页可关）
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -162,6 +170,19 @@ export class ChatNet {
 
   iAmInitiator(peerId) { return selfId < peerId }
 
+  // make-before-break：就绪会话的传输切换（如中继→直连升级）后，旧路径在
+  // 宽限期内继续接收 —— 同一 ctx 密钥下双路并行，重复帧由序号去重兜住，
+  // 消除切换窗口的丢帧。非就绪状态（重握手中）严格匹配当前路径。
+  acceptsVia(peer, via) {
+    if (peer.via === via) return true
+    if (peer.state === 'ready' && peer.legacyVia === via && Date.now() < (peer.legacyUntil || 0)) return true
+    return false
+  }
+  markLegacyVia(peer) {
+    peer.legacyVia = peer.via
+    peer.legacyUntil = Date.now() + 10000
+  }
+
   ensurePeer(peerId, via) {
     let peer = this.peers.get(peerId)
     if (!peer) {
@@ -183,6 +204,7 @@ export class ChatNet {
     if (existing) {
       // 中继会话对端现在可以直连了 → 升级
       if (existing.via === 'mqtt' && existing.lockVia !== 'mqtt') {
+        this.markLegacyVia(existing) // make-before-break：旧中继路径宽限接收
         existing.via = 'p2p'
         existing.pc = this.room.getPeers()[peerId] || null
         this.attachConnectionWatch(peerId)
@@ -249,7 +271,7 @@ export class ChatNet {
 
   onRelayFrame(from, kind, data) {
     const peer = this.peers.get(from)
-    if (!peer || peer.via !== 'mqtt') return // 会话已升级/切换到 P2P：丢弃过期帧
+    if (!peer || !this.acceptsVia(peer, 'mqtt')) return // 升级后旧中继帧在宽限期内仍接收（MBB）
     if (kind === 'hs') this.onHandshakeFrame(from, data, 'mqtt')
     else if (kind === 'msg') this.onEnvelope(from, data, 'mqtt')
     else if (kind === 'ctl') this.onControlFrame(from, data, 'mqtt')
@@ -294,7 +316,9 @@ export class ChatNet {
     if (!peer) return
     peer.state = 'handshaking'
     if (this.iAmInitiator(peerId)) {
-      const { msg, pend } = oc.makeHs1(this.ident, this.myName, this.roomId)
+      // 会话恢复：对该身份持有票据且启用时，hs1 附带 epoch 证明（对端不认则自动回退全握手）
+      const ticket = this.sessionResume && peer.idPubHex ? this.resumable.get(peer.idPubHex) : null
+      const { msg, pend } = oc.makeHs1(this.ident, this.myName, this.roomId, ticket)
       peer.pending = pend
       peer.role = 'initiator'
       this.sendHs(peerId, msg)
@@ -371,7 +395,7 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer) return
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
-    if (peer.via !== via) return
+    if (!this.acceptsVia(peer, via)) return
     try {
       if (msg.t === 'OC-HS1-v1') {
         if (this.iAmInitiator(peerId)) return // 双方角色规则一致，不应收到 hs1；忽略竞态帧
@@ -382,20 +406,32 @@ export class ChatNet {
           this.sendHs(peerId, peer.cachedHs2)
           return
         }
-        const { msg: hs2, ctx } = oc.acceptHs1(this.ident, this.myName, this.roomId, msg)
+        const { msg: hs2, ctx, resumed } = oc.acceptHs1(this.ident, this.myName, this.roomId, msg, this.sessionResume ? this.resumable : null)
         peer.lastHs1Key = hs1Key
         peer.cachedHs2 = hs2
         peer.ctx = ctx
         peer.name = ctx.peerName
+        if (resumed && this.resumable.get(hexOf(ctx.peerIdPub))) {
+          const tk = this.resumable.get(hexOf(ctx.peerIdPub))
+          ctx.sendSeq = tk.sendSeq || 0
+          ctx.recvSeqMax = tk.recvSeqMax || 0 // 序号续接：ACK/去重窗口无缝
+          peer.resumed = true
+        }
         this.sendHs(peerId, hs2)
         this.hooks.onLog?.(`收到 hs1，已回 hs2（对端=${ctx.peerName}，${via}）`)
       } else if (msg.t === 'OC-HS2-v1') {
         if (peer.role !== 'initiator' || !peer.pending) return // 迟到/重复的 hs2：静默忽略
         this.clearRetransmit(peer) // hs2 已到，停止重传 hs1
-        const { msg: hs3, ctx } = oc.acceptHs2(this.ident, peer.pending, msg)
+        const { msg: hs3, ctx, resumed } = oc.acceptHs2(this.ident, peer.pending, msg)
+        const pendTicket = peer.pending?.resumeTicket
         peer.pending = null
         peer.ctx = ctx
         peer.name = ctx.peerName
+        if (resumed && pendTicket) {
+          ctx.sendSeq = pendTicket.sendSeq || 0
+          ctx.recvSeqMax = pendTicket.recvSeqMax || 0
+          peer.resumed = true
+        }
         this.sendHs(peerId, hs3)
         // hs3 丢了响应方不会就绪并重发 hs1：发起方在就绪前重发 hs3
         if (!peer.hs3Retry) {
@@ -439,6 +475,22 @@ export class ChatNet {
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
     if (peer.ctx.peerName) this.peerNames.set(peer.idPubHex, peer.ctx.peerName)
+    // 会话恢复票据：当前密钥/epoch/序号（仅内存；重连时免 X25519 且序号续接）
+    if (this.sessionResume) {
+      const prevEpoch = this.resumable.get(peer.idPubHex)?.epoch || 0
+      this.resumable.set(peer.idPubHex, {
+        key: peer.ctx.key,
+        epoch: peer.resumed ? (prevEpoch + 1) : 1,
+        sendSeq: peer.ctx.sendSeq,
+        recvSeqMax: peer.ctx.recvSeqMax,
+      })
+      if (this.resumable.size > 64) this.resumable.delete(this.resumable.keys().next().value)
+    }
+    if (peer.resumed) {
+      this.hooks.onLog?.(`与 ${peer.name || peerId.slice(0, 8)}… 会话恢复成功（epoch ${this.resumable.get(peer.idPubHex)?.epoch}，序号续接）`)
+      if (this.hooks.onSessionResumed) this.hooks.onSessionResumed(peerId, peer)
+      peer.resumed = false
+    }
     peer.safety = oc.safetyNumber(this.ident.edPub, peer.ctx.peerIdPub)
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
@@ -501,7 +553,7 @@ export class ChatNet {
 
   onEnvelope(peerId, envelope, via) {
     const peer = this.peers.get(peerId)
-    if (!peer?.ctx || peer.via !== via) {
+    if (!peer?.ctx || !this.acceptsVia(peer, via)) {
       this.hooks.onLog?.(`收到未握手对端 ${peerId.slice(0, 8)}… 的消息，已丢弃`, 'warn')
       return
     }
@@ -631,7 +683,7 @@ export class ChatNet {
 
   onControlFrame(peerId, frame, via) {
     const peer = this.peers.get(peerId)
-    if (!peer || peer.via !== via || peer.state !== 'ready') return
+    if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       this.relay?.markAlive(peerId) // 心跳即存活证据（SWIM：任意消息撤销怀疑）
@@ -697,7 +749,7 @@ export class ChatNet {
 
   onSyncFrame(peerId, frame, via) {
     const peer = this.peers.get(peerId)
-    if (!peer || peer.via !== via || peer.state !== 'ready') return
+    if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
     const wireConv = frame?.conv === 'lobby' ? 'lobby' : 'dm'
     const key = this.storeKey(wireConv, peerId)
     const changed = this.store.applyState(key, frame.state)

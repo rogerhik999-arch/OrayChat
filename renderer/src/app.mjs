@@ -490,7 +490,10 @@ async function doLogin(name, room) {
   state.net = new ChatNet(state.ident, state.name, state.room, {
     ...cfg,
     rtcConfig: buildRtcConfig(cfg),
-  }, netHooks(), { forceRelay: !!state.args['relay-only'] })
+  }, netHooks(), {
+    forceRelay: !!state.args['relay-only'],
+    sessionResume: state.cfg.sessionResume !== false, // 设置页可关（前向保密权衡）
+  })
 
   $('selfName').textContent = name
   $('selfFp').textContent = oc.identityFingerprint(state.ident.edPub)

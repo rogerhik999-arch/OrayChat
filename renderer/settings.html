@@ -46,6 +46,12 @@
         关闭窗口后驻留系统托盘后台运行（关掉后：关窗即退出）
       </label>
     </div>
+    <div class="row">
+      <input type="checkbox" id="sessionResume" style="width:auto" />
+      <label for="sessionResume" style="margin:0; color:var(--tx); font-size:13px; cursor:pointer">
+        会话恢复（断线秒级重连；轻微前向保密权衡，票据仅存内存）
+      </label>
+    </div>
     <button class="primary" id="saveGeneral">保存通用设置</button>
     <div class="hint">通用设置保存后需重新登录/重启应用生效。</div>
   </div>

@@ -31,6 +31,7 @@ async function load() {
   $('turnServers').value = JSON.stringify(cfg.turnServers || [], null, 1)
   $('relayBrokers').value = (cfg.relayBrokers || []).join('\n')
   $('trayEnabled').checked = info.trayEnabled !== false
+  $('sessionResume').checked = cfg.sessionResume !== false
 
   $('aboutVersion').textContent = `v${info.version}`
   $('aboutProfile').textContent = info.profile
@@ -69,6 +70,7 @@ function collectNetwork() {
 $('saveGeneral').onclick = async () => {
   const room = $('defaultRoom').value.trim() || DEFAULTS.defaultRoom
   const merged = { ...currentUserConfig, defaultRoom: room }
+  merged.sessionResume = $('sessionResume').checked
   await window.settings.setUserConfig(merged)
   await window.settings.setTrayEnabled($('trayEnabled').checked)
   toast('已保存（重启应用后全部生效）')

@@ -76,7 +76,7 @@ if (typeof window !== 'undefined' && !window.settings) {
     get: async () => {
       const userConfig = JSON.parse(localStorage.getItem('oray-config') || '{}')
       const identities = Object.keys(localStorage).filter((k) => k.startsWith('oray-kv:identity:')).map((k) => k.split('identity:')[1])
-      return { userConfig, trayEnabled: true, version: '1.7.0', profile: 'mobile', identities }
+      return { userConfig, trayEnabled: true, version: '1.7.0', profile: 'mobile', identities, sessionResume: userConfig.sessionResume !== false }
     },
     setUserConfig: async (cfg) => { localStorage.setItem('oray-config', JSON.stringify(cfg)); return true },
     setTrayEnabled: async () => true, // 移动端无托盘
