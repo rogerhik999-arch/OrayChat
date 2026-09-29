@@ -143,7 +143,17 @@ function registerIpc() {
   const fxSafe = (fid) => String(fid).replace(/[^0-9a-f]/g, '').slice(0, 24)
   const fxPart = (fid) => path.join(filesDir(), `${fxSafe(fid)}.part`)
   const fxMeta = (fid) => path.join(filesDir(), `${fxSafe(fid)}.json`)
-  const fxDone = (fid) => path.join(filesDir(), fxSafe(fid))
+  // 完成文件按 <fid><原始扩展名> 落盘（finalize 改名时附扩展名）——查找须兼容两种
+  const fxFind = (id) => {
+    const dir = filesDir()
+    const exact = path.join(dir, id)
+    if (fs.existsSync(exact)) return exact
+    try {
+      const hit = fs.readdirSync(dir).find((f) => f.startsWith(id + '.') && !f.endsWith('.part') && !f.endsWith('.json'))
+      return hit ? path.join(dir, hit) : exact
+    } catch { return exact }
+  }
+  const fxDone = (fid) => fxFind(fxSafe(fid))
 
   ipcMain.handle('fx:state', (_e, fid, { size, cs, n }) => {
     fs.mkdirSync(filesDir(), { recursive: true })
@@ -199,22 +209,16 @@ function registerIpc() {
 
   ipcMain.handle('fx:read', (_e, fid) => {
     try {
-      const id = fxSafe(fid)
-      const dir = filesDir()
-      const hit = fs.existsSync(fxDone(id)) ? fxDone(id)
-        : (fs.readdirSync(dir).find((f) => f.startsWith(id + '.') && !f.endsWith('.part') && !f.endsWith('.json')) || null)
-      const p = hit ? path.join(dir, hit) : fxDone(id)
-      return new Uint8Array(fs.readFileSync(p))
+      return new Uint8Array(fs.readFileSync(fxDone(fid)))
     } catch { return null }
   })
 
   ipcMain.handle('fx:save', async (_e, fid, name) => {
     try {
-      const id = fxSafe(fid)
-      const src = fxDone(id)
+      const src = fxDone(fxSafe(fid))
       if (!fs.existsSync(src)) return { ok: false, why: 'not-found' }
       const dir = app.getPath('downloads')
-      let dest = path.join(dir, path.basename(String(name || id)))
+      let dest = path.join(dir, path.basename(String(name || id2name(src))))
       const base = dest
       let k = 1
       while (fs.existsSync(dest)) dest = base.replace(/(\.[^.]*)?$/, (m) => ` (${k++})${m}`)
@@ -222,6 +226,8 @@ function registerIpc() {
       return { ok: true, path: dest }
     } catch (e) { return { ok: false, why: e?.message || 'io' } }
   })
+
+  const id2name = (p) => path.basename(p)
 
   ipcMain.handle('fx:open', (_e, fid) => {
     try { shell.openPath(fxDone(fxSafe(fid))); return true } catch { return false }

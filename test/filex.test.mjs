@@ -66,8 +66,8 @@ function memIo() {
   }
 }
 
-function mkFileX(net, hooks = {}, compress = null) {
-  return new FileX({ net, io: memIo(), compress, hooks })
+function mkFileX(net, hooks = {}, compress = null, opts = {}) {
+  return new FileX({ net, io: memIo(), compress, ...opts, hooks })
 }
 
 const drain = (ms = 30) => new Promise((r) => setTimeout(r, ms))
@@ -222,5 +222,45 @@ const drain = (ms = 30) => new Promise((r) => setTimeout(r, ms))
   void fxB
 }
 
-console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式）')
+// ---- 7) offer 丢帧自愈：首次 offer 未达 → 周期重发直到 ACK ----
+{
+  const { wire, netA, netB } = link()
+  const fxA = mkFileX(netA, {}, null, { offerRetryMs: 300 })
+  const fxB = mkFileX(netB)
+  const content = new Uint8Array(70000)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const fid = await fxA.sendFile('B', { bytes: content, name: 'y.bin', size: content.length, mime: 'application/octet-stream', lastModified: 5 })
+  // 不回放 offer（模拟丢帧），只等重发
+  await new Promise((r) => setTimeout(r, 1100))
+  const tx = fxA.tx.get(fid)
+  assert.ok(tx.offers >= 2, `offer 应周期重发（实际 ${tx.offers} 次）`)
+  // 现在恢复回放：重发的 offer 让接收方建事务 → 完成
+  for (let round = 0; round < 200 && tx.state !== 'done'; round++) {
+    for (const f of wire.a2b.splice(0)) { f.__fx ? await fxB.onFrame('A', f.__fx) : fxB.onCtl('A', f) }
+    for (const f of wire.b2a.splice(0)) { f.__fx ? await fxA.onFrame('B', f.__fx) : fxA.onCtl('B', f) }
+    await drain(30)
+  }
+  assert.equal(tx.state, 'done', 'offer 重发后传输完成')
+  assert.equal(await sha256Hex(await fxB.io.read(fid)), await sha256Hex(content))
+}
+
+// ---- 8) p2p 零进展自动切中继兜底（sendFx 第三参 forceRelay） ----
+{
+  const { wire, netA, netB } = link()
+  const sentVia = []
+  netA.sendFx = async (pid, frame, forceRelay) => { sentVia.push(!!forceRelay) } // 吞掉块：p2p 无响应
+  const fxA = mkFileX(netA, {}, null, { offerRetryMs: 200, relayFallbackMs: 700 })
+  const content = new Uint8Array(70000)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  await fxA.sendFile('B', { bytes: content, name: 'z.bin', size: content.length, mime: 'application/octet-stream', lastModified: 6 })
+  // 等 forceRelay 切换（700ms）+ inflight 1.5s 超时后的重发
+  await new Promise((r) => setTimeout(r, 2600))
+  const tx = [...fxA.tx.values()][0]
+  assert.equal(tx.forceRelay, true, '零进展后应切换 forceRelay')
+  assert.ok(sentVia.length > 2, `应有超时重发（实际发送 ${sentVia.length} 次）`)
+  assert.ok(sentVia.slice(-2).every(Boolean), '切换后重发的块应带 forceRelay=true')
+  void wire; void netB
+}
+
+console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

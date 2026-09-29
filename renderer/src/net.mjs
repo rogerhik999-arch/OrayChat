@@ -398,10 +398,11 @@ export class ChatNet {
     this.filex.onFrame(peerId, data)
   }
 
-  async sendFx(peerId, data) {
+  async sendFx(peerId, data, forceRelay = false) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') throw new Error('会话未就绪')
-    if (peer.via === 'mqtt') this.relay.send(peerId, 'fx', data)
+    // forceRelay：p2p 零进展的传输兜底改走中继（接收方就绪会话两路全收）
+    if (peer.via === 'mqtt' || forceRelay) this.relay.send(peerId, 'fx', data)
     else await this.fxAction?.send(data, { target: peerId })
   }
 

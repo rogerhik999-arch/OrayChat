@@ -26,6 +26,8 @@ const WINDOW_MQTT = 4
 const MQTTPace_MS = 25
 const HAVE_INTERVAL_MS = 2000 // 接收方位图广播节奏（兼作重传请求）
 const INFLIGHT_TIMEOUT_MS = 1500 // 发送块未确认超时 → 重发
+const OFFER_RETRY_MS = 3000 // offer 未获首个 ACK 前的周期重发（offer 只发一次会因丢帧永久卡死）
+const RELAY_FALLBACK_MS = 12000 // p2p 发送零进展超时 → 后续块改走 MQTT 中继（接收方两路全收）
 const STALL_TIMEOUT_MS = 120000 // 传输整体无进展超时
 
 // ---------- deflate 助手（CompressionStream 全局可用：Electron/现代 WebView/Node 18+） ----------
@@ -62,13 +64,15 @@ export async function sha256Hex(u8) {
 // ---------- 传输管理器 ----------
 
 export class FileX {
-  // opts: { net, io, compress?, hooks: {onEvent, onIncoming, onLog} }
-  // io 适配器（Electron=主进程文件 / Web=内存）：state/write/finalize/read/abort/readPath
+  // opts: { net, io, compress?, offerRetryMs?, relayFallbackMs?, hooks: {onEvent, onIncoming, onLog} }
+  // io 适配器（Electron=主进程文件 / Web=内存）：state/write/finalize/read/abort
   // compress(file) → {bytes, w, h, mime, mode}（图片格式压缩；注入便于测试）
-  constructor({ net, io, compress, hooks = {} }) {
+  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, hooks = {} }) {
     this.net = net
     this.io = io
     this.compress = compress
+    this.offerRetryMs = offerRetryMs || OFFER_RETRY_MS
+    this.relayFallbackMs = relayFallbackMs || RELAY_FALLBACK_MS
     this.hooks = hooks
     this.tx = new Map() // fid -> 传输状态（收发同表）
     // 接收方保活：即使发端停滞也周期广播位图（对端重连后立刻拿到续传起点）
@@ -115,6 +119,8 @@ export class FileX {
       name: file.name, size: bytes.length, mime, kind, w, h, mode, orig,
       have: new Uint8Array(Math.ceil(n / 8)), // 对端确认位图
       acked: 0, inflight: new Map(), // i -> 发送时刻（1.5s 未确认即重发）
+      offers: 0, // offer 发送次数（首个 ACK 前周期重发）
+      forceRelay: false, // p2p 零进展自动切换：后续块改走 MQTT 中继
       lastProgressAt: Date.now(), startedAt: Date.now(),
       sentHist: [], // [ts, ackedTotal] 速率采样
       caption: caption || file.name, thumb: file.thumb || '',
@@ -128,18 +134,28 @@ export class FileX {
       peerId,
     })
 
-    await this.net.sendCtl(peerId, {
+    const offer = {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
-    })
+    }
+    tx.offer = offer
+    await this.sendOffer(peerId, offer, tx)
     this.log(`发送${kind === 'image' ? '图片' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}）`)
     this.emit({ fid, dir: 'send', state: 'active', done: 0, total: n, name: tx.name })
     this.startPump(fid)
     return fid
   }
 
+  // offer 重发（首个 ACK 前每 3s 一次）：ctl 帧只发一次会因丢帧/对端初始化
+  // 失败而永久卡死 —— 这是"发送进度 0%"的根因（接收方无事务，块全部丢弃）
+  async sendOffer(peerId, offer, tx) {
+    tx.offers++
+    try { await this.net.sendCtl(peerId, { ...offer }) } catch { /* 下轮重发 */ }
+  }
+
   // 滑动窗口泵：每 200ms 扫一遍 —— 对端缺失的块里，未发过或 1.5s 未确认的
   // （丢块/会话抖动自动重发），补足窗口；接收方 fx-have 位图是唯一确认源。
+  // 附带两条自愈：offer 未获 ACK 周期重发；p2p 零进展 12s 自动切中继兜底。
   startPump(fid) {
     const tx = this.tx.get(fid)
     if (!tx || tx.pumpTimer) return
@@ -147,8 +163,21 @@ export class FileX {
       if (tx.state !== 'active') { clearInterval(tx.pumpTimer); tx.pumpTimer = null; return }
       const peer = this.peer(tx.peerId)
       if (!peer || peer.state !== 'ready') return // 会话断开：等 onSessionReady 恢复
-      const window = peer.via === 'mqtt' ? WINDOW_MQTT : WINDOW_P2P
       const now = Date.now()
+      // 自愈 1：首个 ACK 迟迟不到 → 重发 offer（接收方才能建事务、回位图）
+      if (tx.acked === 0 && now - tx.startedAt > this.offerRetryMs && now - tx.startedAt < 600000) {
+        if (!tx.lastOfferAt || now - tx.lastOfferAt >= this.offerRetryMs) {
+          tx.lastOfferAt = now
+          void this.sendOffer(tx.peerId, tx.offer, tx)
+          if (tx.offers === 3) this.log(`传输 ${tx.name}：对端迟迟未响应，正在重发传输请求（若持续失败请检查连接）`, 'warn')
+        }
+      }
+      // 自愈 2：p2p 零进展 → 后续块改走 MQTT 中继（接收方 make-before-break 两路全收）
+      if (!tx.forceRelay && peer.via === 'p2p' && tx.acked === 0 && now - tx.startedAt > this.relayFallbackMs) {
+        tx.forceRelay = true
+        this.log(`传输 ${tx.name}：直连通道无响应，改经 MQTT 中继`, 'warn')
+      }
+      const window = (peer.via === 'mqtt' || tx.forceRelay) ? WINDOW_MQTT : WINDOW_P2P
       for (const [i, ts] of tx.inflight) {
         if (bitmapHas(tx.have, i) || now - ts > INFLIGHT_TIMEOUT_MS) tx.inflight.delete(i)
       }
@@ -173,9 +202,9 @@ export class FileX {
     const { data, z } = await maybeDeflate(raw)
     const e = oc.sealBin(peer.ctx, data, 'fx', tx.fid, i, z)
     try {
-      await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e })
+      await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e }, tx.forceRelay)
     } catch { /* 会话抖动：超时后自动重发 */ }
-    if (peer.via === 'mqtt') await sleep(MQTTPace_MS) // 公共 broker 节流
+    if (peer.via === 'mqtt' || tx.forceRelay) await sleep(MQTTPace_MS) // 公共 broker 节流
   }
 
   // ---------- 接收方 ----------
@@ -327,7 +356,7 @@ export class FileX {
   // 控制帧入口
   onCtl(peerId, f) {
     if (!f?.op) return
-    if (f.op === 'fx-offer') this.onOffer(peerId, f).catch((e) => this.log(`接收初始化失败：${e?.message || e}`, 'warn'))
+    if (f.op === 'fx-offer') this.onOffer(peerId, f).catch((e) => this.log(`接收初始化失败：${e?.message || e}`, 'error'))
     else if (f.op === 'fx-have') this.onHave(peerId, f)
     else if (f.op === 'fx-done') this.onDone(peerId, f)
     else if (f.op === 'fx-cancel') this.onCancel(peerId, f).catch(() => {})

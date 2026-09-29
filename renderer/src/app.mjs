@@ -778,6 +778,8 @@ async function doLogin(name, room) {
     hooks: {
       onLog: (msg, level) => {
         if (state.args.bot) window.oray.botLog(`[BOT] LOG ${level || 'info'} ${msg}`)
+        // 传输异常对人类用户可见（此前只进 bot 日志，出问题时两边都无提示）
+        if (level === 'warn' || level === 'error') appendSys(`📤 ${msg}`)
       },
       onOutgoing: (e) => {
         state.net.store.addMsg(state.net.storeKey('dm', e.peerId), {
