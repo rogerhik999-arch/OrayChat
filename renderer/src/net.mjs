@@ -93,7 +93,7 @@ export class ChatNet {
       load: () => this.hooks.onStoreLoad?.(),
     })
     this.store.onChange((convKey) => this.hooks.onStoreChanged?.(convKey))
-    this.migrateLegacyDmKeys() // v1.12.1：旧版单侧公钥键 → 联合哈希键（见 store.dmConvKey 注释）
+    this.migrateAndScrubDmKeys() // 旧键迁移 + 混桶清洗（见 store.dmConvKey 注释；幂等）
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
     // 在线状态心跳（15±3s 抖动，防雷群）：定期向所有就绪对端报告在线
     const scheduleHeartbeat = () => {
@@ -159,11 +159,12 @@ export class ChatNet {
 
   // ---------- 会话键 ----------
 
-  // 旧版私聊键迁移：64-hex 裸键（单侧公钥）按条目作者拆分重组。
-  // - 键 = 对端公钥（对端比我小）：桶内只含该对端 → 整体迁移
-  // - 键 = 我自己的公钥（我比所有人小，多人消息混入）：按作者拆到各对端；
-  //   我自己发出的消息无法归属（旧键已丢失对端信息）→ 存入 dm-legacy-orphan 保留不展示
-  migrateLegacyDmKeys() {
+  // 旧版私聊键迁移 + 污染清洗（幂等，每次启动执行）：
+  // 迁移：64-hex 裸键（单侧公钥）按条目作者拆分重组；我方全局最小时的混桶中
+  //       我方消息无法归属 → dm-legacy:orphan 隔离不展示
+  // 清洗：旧版本对端同步曾把"其与第三方"的消息推进我们的分桶（跨桶污染）——
+  //       把每个 dm: 桶中非本对作者的条目搬回该作者自己的对桶；我方重复 mid 只留一份
+  migrateAndScrubDmKeys() {
     let migrated = 0, orphaned = 0
     for (const [key, conv] of [...this.store.convs]) {
       if (key === 'lobby' || key.startsWith('dm:') || key.startsWith('dm-unknown:') || key.startsWith('dm-legacy:')) continue
@@ -205,8 +206,40 @@ export class ChatNet {
       }
       this.store.convs.delete(key)
     }
-    if (migrated || orphaned) {
-      this.hooks.onLog?.(`私聊记录迁移完成：重组 ${migrated} 组会话${orphaned ? `；${orphaned} 条我方旧消息无法归属对端（已隔离不展示）` : ''}`)
+    // ---- 清洗：dm: 桶中非本对作者归位 + 我方重复 mid 去重 ----
+    let moved = 0, deduped = 0
+    const myMids = new Map() // mid -> bucketKey（我方消息首见桶）
+    for (let pass = 0; pass < 2; pass++) {
+      for (const [key, conv] of [...this.store.convs]) {
+        if (key === 'lobby' || !key.startsWith('dm:')) continue
+        for (const [mid, e] of [...conv.entries]) {
+          if (e.author && e.author !== this.myIdPubHex) {
+            const homeKey = dmConvKey(this.myIdPubHex, e.author)
+            if (homeKey !== key) {
+              const home = this.store.convs.get(homeKey) || { entries: new Map(), dels: new Map(), clearT: 0 }
+              if (!home.entries.has(mid)) home.entries.set(mid, e)
+              this.store.convs.set(homeKey, home)
+              conv.entries.delete(mid)
+              moved++
+            }
+          } else if (e.author === this.myIdPubHex) {
+            const first = myMids.get(mid)
+            if (first && first !== key) {
+              conv.entries.delete(mid) // 我方消息已在别的桶（污染复制）→ 去重
+              deduped++
+            } else myMids.set(mid, key)
+          }
+        }
+      }
+    }
+    if (moved || deduped) migrated = migrated // 计数并入下方日志
+
+    const notices = []
+    if (migrated || orphaned) notices.push(`私聊记录迁移完成：重组 ${migrated} 组会话${orphaned ? `；${orphaned} 条我方旧消息无法归属对端（已隔离）` : ''}`)
+    if (moved || deduped) notices.push(`私聊记录清洗完成：${moved} 条他人消息归位、${deduped} 条重复消息去除`)
+    if (notices.length) {
+      for (const n of notices) this.hooks.onLog?.(n)
+      this.hooks.onStoreNotice?.(notices.join('；'))
       this.hooks.onStorePersist?.(this.store.exportAll())
     }
   }
@@ -805,7 +838,19 @@ export class ChatNet {
     if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
     const wireConv = frame?.conv === 'lobby' ? 'lobby' : 'dm'
     const key = this.storeKey(wireConv, peerId)
-    const changed = this.store.applyState(key, frame.state)
+    let state = frame.state
+    if (wireConv === 'dm' && state?.entries?.length) {
+      // 私聊会话只接受"我 ↔ 本对端"两方的条目：旧版本对端的混桶可能携带
+      // 其与第三方的消息（旧键碰撞时代的遗留），混入即污染本对端会话
+      const me = this.myIdPubHex
+      const peerHex = peer.idPubHex
+      const filtered = state.entries.filter((e) => !e?.author || e.author === me || e.author === peerHex)
+      if (filtered.length !== state.entries.length) {
+        this.hooks.onLog?.(`忽略 dm 同步中 ${state.entries.length - filtered.length} 条第三方消息（旧版混桶污染）`, 'warn')
+        state = { ...state, entries: filtered }
+      }
+    }
+    const changed = this.store.applyState(key, state)
     // 合并对端传播的昵称映射（gossip；仅显示用途）
     if (frame.names && typeof frame.names === 'object') {
       for (const [id, n] of Object.entries(frame.names)) {

@@ -381,6 +381,23 @@ function renderMessages() {
   box.scrollTop = box.scrollHeight
 }
 
+// 数据迁移/清洗结果横条（自动消失）
+function flushNotices() {
+  if (!state.pendingNotice) return
+  const msg = state.pendingNotice
+  state.pendingNotice = null
+  let bar = $('noticeBar')
+  if (!bar) {
+    bar = document.createElement('div')
+    bar.id = 'noticeBar'
+    bar.className = 'reconnect-bar'
+    $('chatHead').after(bar)
+  }
+  bar.textContent = `🧹 ${msg}`
+  bar.classList.remove('hidden')
+  setTimeout(() => bar.classList.add('hidden'), 10000)
+}
+
 function renderReconnectBar() {
   let bar = $('reconnectBar')
   if (!bar) {
@@ -500,6 +517,7 @@ async function doLogin(name, room) {
   $('selfRoom').textContent = room
   $('loginView').classList.add('hidden')
   $('mainView').classList.remove('hidden')
+  setTimeout(flushNotices, 600)
   // 默认进入第一个在线成员的私聊（避免误以为输入框是私聊却群发）；无人在线才落大厅
   const firstReady = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
   if (firstReady) selectView({ conv: 'dm', peerId: firstReady[0] })
@@ -517,6 +535,10 @@ function showExistingId(text, createdAt) {
 function netHooks() {
   return {
     // 共享日志经主进程文件 KV 持久化（localStorage 在强杀/退出时不保证落盘）
+    onStoreNotice: (msg) => {
+      state.pendingNotice = msg // doLogin 完成后由 flushNotices 显示（net 构造时 DOM 未就绪定位）
+      if (state.args.bot) window.oray.botLog(`[BOT] STORE-NOTICE ${JSON.stringify(msg)}`)
+    },
     onStorePersist: (all) => {
       window.oray.kvSet(`oc-log2:${state.room}`, all).catch(() => {})
     },
