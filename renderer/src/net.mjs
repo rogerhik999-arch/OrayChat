@@ -91,6 +91,13 @@ export class ChatNet {
     // （仅显示用途；身份以公钥/安全码为准）。随同步帧 gossip，让未直接
     // 握手的成员（离线作者的历史消息）也能解析出名字。
     this.peerNames = new Map([[this.myIdPubHex, myName]])
+    // 身份别名（重装/清数据换密钥的旧身份 → 当前活身份）：仅驱动「读时合并」
+    // （名录归并 + 会话视图合并），原始分桶不动 —— 清掉 oc-id-aliases 即还原
+    this.idAliases = new Map(Object.entries(opts.idAliases || {}))
+    // 种入历史学到的 昵称 映射（本机 KV），启动即可归并"自己的旧身份"
+    for (const [k, v] of Object.entries(opts.names || {})) {
+      if (typeof v === 'string' && v && k !== this.myIdPubHex && !this.peerNames.has(k)) this.peerNames.set(k, v)
+    }
 
     // 房间口令：Trystero 信令加密 + 门禁；并派生房间密钥加密中继回退层帧
     this.roomKey = oc.deriveRoomKey(opts.roomPassword, APP_ID, roomId)
@@ -169,6 +176,8 @@ export class ChatNet {
     } else {
       this.hooks.onLog?.(`以纯中继模式加入房间 ${roomId}（--relay-only）`)
     }
+    // 启动即归并"自己的旧身份"（种入的名字映射已就绪；幂等）
+    this.mergeSelfIdentities()
   }
 
   // ---------- 会话键 ----------
@@ -591,6 +600,7 @@ export class ChatNet {
     peer.lastProgress = Date.now()
     this.digestTries.delete(peerId) // 会话已建立：间接介绍计数清零
     this.dedupeIdentity(peerId, peer)
+    this.mergeOldIdentities(peer)
     if (peer.ctx.peerName) this.peerNames.set(peer.idPubHex, peer.ctx.peerName)
     // 会话恢复票据：当前密钥/epoch/序号（仅内存；重连时免 X25519 且序号续接）
     if (this.sessionResume) {
@@ -786,16 +796,29 @@ export class ChatNet {
     }
   }
 
-  // 删除单条消息（发起方调用）：本地先生效 + 全体传播
+  // 删除单条消息（发起方调用）：本地先生效 + 全体传播。
+  // 私聊在合并视图下可能来自旧身份分桶：按 mid 对全部相关桶生效（mid 全局唯一）
   async deleteMessage(wireConv, mid, onlyPeer) {
-    this.store.applyDel(this.storeKey(wireConv, onlyPeer), mid)
+    if (wireConv === 'dm') {
+      const pub = this.peers.get(onlyPeer)?.idPubHex
+      if (pub) { for (const k of this.dmMergedBucketKeys(pub)) this.store.applyDel(k, mid) }
+      else this.store.applyDel(this.storeKey(wireConv, onlyPeer), mid)
+    } else {
+      this.store.applyDel(this.storeKey(wireConv, onlyPeer), mid)
+    }
     await this.propagateCtl(wireConv, { conv: wireConv, op: 'del', mid }, onlyPeer)
   }
 
-  // 清空整个会话（发起方调用）
+  // 清空整个会话（发起方调用）：私聊清空需覆盖合并视图的全部相关桶
   async clearConv(wireConv, onlyPeer) {
     const clearT = Date.now()
-    this.store.applyClear(this.storeKey(wireConv, onlyPeer), clearT)
+    if (wireConv === 'dm') {
+      const pub = this.peers.get(onlyPeer)?.idPubHex
+      if (pub) { for (const k of this.dmMergedBucketKeys(pub)) this.store.applyClear(k, clearT) }
+      else this.store.applyClear(this.storeKey(wireConv, onlyPeer), clearT)
+    } else {
+      this.store.applyClear(this.storeKey(wireConv, onlyPeer), clearT)
+    }
     await this.propagateCtl(wireConv, { conv: wireConv, op: 'clear', t: clearT }, onlyPeer)
   }
 
@@ -891,6 +914,7 @@ export class ChatNet {
         if (this.peerNames.get(id) !== n) this.peerNames.set(id, n)
         this.hooks.onPeerName?.(peerId, peer, id, n)
       }
+      this.mergeSelfIdentities() // 名字认知更新后重扫"自己的旧身份"（幂等）
     }
     this.hooks.onSyncApplied?.(peerId, peer, { wireConv, changed, state: frame.state })
   }
@@ -1040,6 +1064,79 @@ export class ChatNet {
         this.dropPeer(pid, p)
       }
     }
+  }
+
+  // ---- 旧身份归并（v1.15.0）----
+  // 重装/清数据会生成新身份密钥：同一昵称（本产品昵称即账号）的旧公钥在
+  // 名录里变成多条"历史联系人"、聊天记录被拆进不同分桶。这里建立
+  // 旧身份 → 当前活身份的别名，驱动「读时合并」：名录只显示当前身份、
+  // 会话视图把所有相关分桶合并成一条时间线。原始桶不动、可回退
+  // （清 oc-id-aliases 即还原）。
+  //
+  // 别名只在两个可信时机建立：
+  //   - mergeOldIdentities：E2EE 握手就绪（名字受签名保护）——同昵称的
+  //     非活跃身份即此人的旧身份；当前另有就绪会话的除外（同名另一台活设备）
+  //   - mergeSelfIdentities：与我同名的其他身份即我自己的旧身份（否则
+  //     自己的残身会出现在名录里）；当前有就绪会话的除外（同名好友防误并）
+
+  resolveId(pub) {
+    let cur = String(pub || '')
+    for (let hops = 0; hops < 8 && this.idAliases.has(cur); hops++) cur = this.idAliases.get(cur)
+    return cur
+  }
+
+  // 会话视图键：以解析后的「当前身份」计算（旧身份的新消息也归到同一视图键 → 未读/渲染一致）
+  dmViewKey(peerPub) { return dmConvKey(this.myIdPubHex, this.resolveId(peerPub)) }
+
+  // 归并到该会话的全部存储桶键：{我 ∪ 我的旧身份} × {对端 ∪ 对端的旧身份}
+  dmMergedBucketKeys(peerPub) {
+    const P = this.resolveId(peerPub)
+    const side = (canon) => [canon, ...[...this.idAliases].filter(([, c]) => this.resolveId(c) === canon).map(([o]) => o)]
+    const keys = new Set()
+    for (const a of side(this.myIdPubHex)) for (const b of side(P)) keys.add(dmConvKey(a, b))
+    return keys
+  }
+
+  hasReadySession(idPubHex) {
+    for (const p of this.peers.values()) if (p.state === 'ready' && p.idPubHex === idPubHex) return true
+    return false
+  }
+
+  mergeOldIdentities(peer) {
+    const name = this.peerNames.get(peer.idPubHex) || peer.name
+    if (!name) return
+    let merged = 0
+    for (const [pub, n] of this.peerNames) {
+      if (n !== name || pub === peer.idPubHex || pub === this.myIdPubHex) continue
+      if (this.resolveId(pub) === peer.idPubHex) continue // 已归并
+      // 同名（昵称即账号）一律并入刚完成握手的新身份：多设备/重装都是同一个人，
+      // 记录合并为一条时间线正是预期；名录侧仍对"当前有就绪会话"的旧身份保留单列
+      this.idAliases.set(pub, peer.idPubHex)
+      merged++
+    }
+    if (merged) this.commitAliases(`${name} 的 ${merged} 个旧身份已并入当前会话（重装/换设备的记录合并显示）`)
+  }
+
+  mergeSelfIdentities() {
+    let merged = 0
+    for (const [pub, n] of this.peerNames) {
+      if (n !== this.myName || pub === this.myIdPubHex) continue
+      if (this.resolveId(pub) === this.myIdPubHex) continue
+      if (this.hasReadySession(pub)) continue // 同名好友当前在线：不误并
+      this.idAliases.set(pub, this.myIdPubHex)
+      merged++
+    }
+    if (merged) this.commitAliases(`检测到自己的 ${merged} 个旧身份（本机重装/换密钥），已并入当前身份`)
+  }
+
+  // 拍平别名链（old→中间 → old→最终）并通知持久化 + 界面横条
+  commitAliases(notice) {
+    for (const old of [...this.idAliases.keys()]) {
+      this.idAliases.set(old, this.resolveId(this.idAliases.get(old)))
+    }
+    this.hooks.onLog?.(notice)
+    this.hooks.onStoreNotice?.(notice)
+    this.hooks.onIdAliases?.(Object.fromEntries(this.idAliases))
   }
 
   // 回收判据（两条可靠证据链须同时成立）：

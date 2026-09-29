@@ -130,10 +130,10 @@ async function renderSavedAccounts() {
 
 function viewKey(v = state.view) {
   if (v.conv === 'lobby') return 'lobby'
-  if (v.conv === 'dm-offline') return dmConvKey(state.myIdPubHex, v.idPubHex)
+  if (v.conv === 'dm-offline') return state.net ? state.net.dmViewKey(v.idPubHex) : dmConvKey(state.myIdPubHex, v.idPubHex)
   const peer = state.net?.peers.get(v.peerId)
   const peerHex = peer?.idPubHex || v.peerId
-  return dmConvKey(state.myIdPubHex, peerHex)
+  return state.net ? state.net.dmViewKey(peerHex) : dmConvKey(state.myIdPubHex, peerHex)
 }
 function viewWireConv(v = state.view) { return v.conv === 'lobby' ? 'lobby' : 'dm' }
 
@@ -188,6 +188,11 @@ function buildRoster() {
         seen.set(e.author, { name: authorName(e.author) })
       }
     }
+  }
+  // 已归并的旧身份（重装换密钥 → 别名指向当前身份）不再单列：
+  // 其记录已合并显示在当前身份的会话里；当前另有就绪会话的除外（同名活设备）
+  for (const [id] of [...seen.keys()]) {
+    if (state.net && state.net.resolveId(id) !== id && !state.net.hasReadySession(id)) seen.delete(id)
   }
   // 附加在线状态与显示名兜底
   for (const [id, info] of seen) {
@@ -249,7 +254,7 @@ function renderPeers() {
     li.innerHTML = `
       <div class="avatar" style="background:${avatarColor(peerId)}">${esc(name.slice(0, 1).toUpperCase())}</div>
       <div class="p-info">
-        <div class="p-name">${esc(name)}${unreadBadge(state.net.storeKey('dm', peerId))}</div>
+        <div class="p-name">${esc(name)}${unreadBadge(state.net.dmViewKey(p.idPubHex || peerId))}</div>
         <div class="p-state"><span class="dot ${dotCls}"></span>${esc(stateText)}</div>
       </div>`
     li.onclick = () => selectView({ conv: 'dm', peerId })
@@ -352,9 +357,24 @@ function renderChatHead() {
 }
 
 // 渲染整个消息区（共享日志驱动；mid 幂等，删除/清空/同步都会触发重绘）
+// 当前视图的消息列表：大厅读单桶；私聊读时合并「我∪我的旧身份 × 对端∪对端的旧身份」
+// 的全部相关分桶（重装换密钥的历史记录归成一条时间线），各桶自带的清空标记独立生效
+function viewMessages() {
+  const v = state.view
+  if (!state.net) return []
+  if (v.conv === 'lobby') return state.net.store.visible('lobby')
+  const pub = v.conv === 'dm-offline' ? v.idPubHex : state.net.peers.get(v.peerId)?.idPubHex
+  if (!pub) return []
+  const merged = []
+  for (const k of state.net.dmMergedBucketKeys(pub)) {
+    if (state.net.store.convs.has(k)) merged.push(...state.net.store.visible(k))
+  }
+  merged.sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1))
+  return merged
+}
+
 function renderMessages() {
-  const key = viewKey()
-  const msgs = state.net ? state.net.store.visible(key) : []
+  const msgs = viewMessages()
   const box = $('msgs')
   box.innerHTML = ''
   if (!msgs.length) {
@@ -491,7 +511,13 @@ async function confirmThenClear() {
   if (btn.dataset.confirm) {
     delete btn.dataset.confirm
     btn.textContent = '清空全体记录'
-    if (state.view.conv === 'dm-offline') { appendSys('对方离线，本机记录将在下次同步时按删除标记收敛'); await state.net.store.applyClear(viewKey(), Date.now()); renderMessages(); return }
+    if (state.view.conv === 'dm-offline') {
+      appendSys('对方离线，本机记录将在下次同步时按删除标记收敛')
+      const t = Date.now()
+      for (const k of state.net.dmMergedBucketKeys(state.view.idPubHex)) await state.net.store.applyClear(k, t)
+      renderMessages()
+      return
+    }
     try { await state.net.clearConv(viewWireConv(), state.view.peerId) }
     catch (e) { appendSys(`清空失败：${e.message}`) }
   } else {
@@ -528,6 +554,7 @@ async function doLogin(name, room) {
   state.room = room
   await loadNames()
   saveName(state.myIdPubHex, name)
+  state.idAliases = await window.oray.kvGet(`oc-id-aliases:${room}`).catch(() => null) || {}
   state.logData = await window.oray.kvGet(`oc-log2:${room}`)
   // 登录历史：按昵称记住房间
   await upsertLogin(name, room)
@@ -539,6 +566,8 @@ async function doLogin(name, room) {
   }, netHooks(), {
     forceRelay: !!state.args['relay-only'],
     sessionResume: state.cfg.sessionResume !== false, // 设置页可关（前向保密权衡）
+    idAliases: state.idAliases || {}, // 旧身份→当前身份 别名（读时合并；清此 KV 即还原）
+    names: Object.fromEntries(state.names), // 历史学到的 昵称 映射（启动即可归并自己的旧身份）
   })
 
   $('selfName').textContent = name
@@ -570,6 +599,13 @@ function netHooks() {
     },
     onStorePersist: (all) => {
       window.oray.kvSet(`oc-log2:${state.room}`, all).catch(() => {})
+    },
+    // 旧身份→当前身份 别名变更（重装换密钥归并）：持久化 + 界面刷新
+    onIdAliases: (obj) => {
+      state.idAliases = obj
+      window.oray.kvSet(`oc-id-aliases:${state.room}`, obj).catch(() => {})
+      renderPeers()
+      if (state.view.conv !== 'lobby') renderConv()
     },
     onStoreLoad: () => state.logData || null,
     onStoreChanged: (convKey) => {
@@ -605,7 +641,9 @@ function netHooks() {
         else window.oray.botLog(`[BOT] RECV from=${p.name} text=${JSON.stringify(msg.text)}`)
       }
       // 未读与通知：不在当前会话或窗口失焦时计数；失焦时弹系统通知（主进程按对端 10s 节流）
-      const convKey = state.net.storeKey(msg.conv, peerId)
+      // 会话键走身份解析（dmViewKey）：对端若换了身份密钥，旧会话/新会话的未读都落在同一视图键
+      const convKey = msg.conv === 'lobby' ? 'lobby'
+        : (p.idPubHex ? state.net.dmViewKey(p.idPubHex) : state.net.storeKey('dm', peerId))
       const isCurrent = convKey === viewKey()
       const focused = document.hasFocus() && !document.hidden
       if (!isCurrent || !focused) {
