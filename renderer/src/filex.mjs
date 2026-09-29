@@ -30,7 +30,11 @@ const OFFER_RETRY_MS = 3000 // offer 未获首个 ACK 前的周期重发（offer
 const RELAY_FALLBACK_MS = 12000 // p2p 发送零进展超时 → 后续块改走 MQTT 中继（接收方两路全收）
 const RELAY_REBUILD_MS = 20000 // 任意路径无新 ACK 超时 → 重建中继连接 + 重发 offer（防大块帧把心跳挤死后的死锁）
 const RELAY_REBUILD_COOLDOWN_MS = 30000
-const STALL_TIMEOUT_MS = 120000 // 传输整体无进展超时
+// 传输活性：净来判死线（net.reapGhosts 的传输保护只在此窗口内生效 ——
+// 否则彻底卡死的传输会让保护永续，造出新的残体）与停滞暂停线（超线转
+// stalled 停泵，对端上线 onSessionReady 自动复活续传）
+const TRANSFER_PROTECT_MS = 90000
+const TX_STALL_MS = 5 * 60000
 
 // ---------- deflate 助手（CompressionStream 全局可用：Electron/现代 WebView/Node 18+） ----------
 
@@ -69,20 +73,32 @@ export class FileX {
   // opts: { net, io, compress?, offerRetryMs?, relayFallbackMs?, hooks: {onEvent, onIncoming, onLog} }
   // io 适配器（Electron=主进程文件 / Web=内存）：state/write/finalize/read/abort
   // compress(file) → {bytes, w, h, mime, mode}（图片格式压缩；注入便于测试）
-  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, relayRebuildMs, hooks = {} }) {
+  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, relayRebuildMs, transferProtectMs, hooks = {} }) {
     this.net = net
     this.io = io
     this.compress = compress
     this.offerRetryMs = offerRetryMs || OFFER_RETRY_MS
     this.relayFallbackMs = relayFallbackMs || RELAY_FALLBACK_MS
     this.relayRebuildMs = relayRebuildMs || RELAY_REBUILD_MS
+    this.transferProtectMs = transferProtectMs || TRANSFER_PROTECT_MS
     this.hooks = hooks
     this.tx = new Map() // fid -> 传输状态（收发同表）
-    // 接收方保活：即使发端停滞也周期广播位图（对端重连后立刻拿到续传起点）
+    // 接收方保活：即使发端停滞也周期广播位图（对端重连后立刻拿到续传起点）；
+    // 顺带做双向停滞检测 —— 超时转 stalled（停泵、退出传输保护），对端重新
+    // 上线（onSessionReady）自动复活续传。不转态的话，死传输会让 reaper
+    // 的传输保护永续，反而造出新的残体。
     this.tickTimer = setInterval(() => {
+      const now = Date.now()
       for (const tx of this.tx.values()) {
+        if (tx.state === 'active' && now - (tx.lastLifeAt || tx.startedAt || 0) > TX_STALL_MS) {
+          tx.state = 'stalled'
+          if (tx.pumpTimer) { clearInterval(tx.pumpTimer); tx.pumpTimer = null }
+          this.log(`传输 ${tx.name} 长时间无进展，已暂停（对端上线后会自动续传）`, 'warn')
+          this.emit({ fid: tx.fid, dir: tx.dir, state: 'stalled', done: bitmapCount(tx.have), total: tx.n, name: tx.name })
+          continue
+        }
         if (tx.state !== 'active') continue
-        if (tx.dir === 'recv' && Date.now() - tx.lastHaveAt > HAVE_INTERVAL_MS) {
+        if (tx.dir === 'recv' && now - tx.lastHaveAt > HAVE_INTERVAL_MS) {
           this.sendHave(tx.peerId, tx.fid).catch(() => {})
         }
       }
@@ -125,6 +141,7 @@ export class FileX {
       offers: 0, // offer 发送次数（首个 ACK 前周期重发）
       forceRelay: false, // p2p 零进展自动切换：后续块改走 MQTT 中继
       lastAckAt: 0, // 最近一次收到对端位图/确认的时刻（自愈 3 判据）
+      lastLifeAt: Date.now(), // 最近活性时刻（收到 ACK / 实际发块）——传输保护窗口判据
       lastProgressAt: Date.now(), startedAt: Date.now(),
       sentHist: [], // [ts, ackedTotal] 速率采样
       caption: caption || file.name, thumb: file.thumb || '',
@@ -218,6 +235,7 @@ export class FileX {
     const e = oc.sealBin(peer.ctx, data, 'fx', tx.fid, i, z)
     try {
       await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e }, tx.forceRelay)
+      tx.lastLifeAt = Date.now() // 实际发出即活性（对端可能活着只是 ACK 被挤）
     } catch { /* 会话抖动：超时后自动重发 */ }
     if (peer.via === 'mqtt' || tx.forceRelay) await sleep(MQTTPace_MS) // 公共 broker 节流
   }
@@ -238,7 +256,7 @@ export class FileX {
         kind: o.kind === 'image' ? 'image' : 'file', sha: o.sha, mode: o.mode,
         w: o.w, h: o.h, orig: !!o.orig, thumb: o.thumb || '',
         have: st.have, caption: o.thumb ? (o.name || '图片') : (o.name || o.fid),
-        lastHaveAt: 0, lastProgressAt: Date.now(), startedAt: Date.now(),
+        lastHaveAt: 0, lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
       }
       this.tx.set(o.fid, tx)
       // 落本地日志（含缩略图，随共享日志同步；字节不进日志）
@@ -285,6 +303,7 @@ export class FileX {
     const tx = this.tx.get(f?.fid)
     if (!tx || tx.dir !== 'send' || tx.state !== 'active' || !Array.isArray(f.have)) return
     tx.lastAckAt = Date.now()
+    tx.lastLifeAt = tx.lastAckAt
     const bm = Uint8Array.from(f.have)
     for (let k = 0; k < tx.n && k < bm.length * 8; k++) {
       if (bitmapHas(bm, k) && !bitmapHas(tx.have, k)) { bitmapSet(tx.have, k); tx.acked++ }
@@ -331,20 +350,27 @@ export class FileX {
     this.emit({ fid, dir: tx.dir, state: 'cancel', done: 0, total: tx.n, name: tx.name })
   }
 
-  // 会话就绪：接收方重广播位图（断线重连后自动续传）；发送方恢复泵
+  // 会话就绪：接收方重广播位图（断线重连后自动续传）；发送方恢复泵；
+  // 停滞中的传输一并复活
   onSessionReady(peerId) {
     for (const tx of this.tx.values()) {
-      if (tx.peerId !== peerId || tx.state !== 'active') continue
+      if (tx.peerId !== peerId || (tx.state !== 'active' && tx.state !== 'stalled')) continue
+      tx.state = 'active'
+      tx.lastLifeAt = Date.now()
       if (tx.dir === 'recv') this.sendHave(peerId, tx.fid)
       else this.startPump(tx.fid)
     }
   }
 
-  // 该对端是否有进行中的传输（net.reapGhosts 用：传输中心跳可能被大帧挤死，
-  // 不能据此判死拆会话 —— 拆了 ACK 断流，发送端会卡在半路）
+  // 该对端是否有「活着」的传输（net.reapGhosts 用：传输中心跳可能被大帧挤死，
+  // 不能据此判死拆会话 —— 拆了 ACK 断流，发送端会卡在半路）。
+  // 保护必须限时：活性窗口（收到 ACK / 实际收发块）内的才算数，否则彻底卡死
+  // 的传输会让保护永续，反过来造出新的残体。
   hasActiveTransfer(peerId) {
+    const now = Date.now()
     for (const tx of this.tx.values()) {
-      if (tx.peerId === peerId && tx.state === 'active') return true
+      if (tx.peerId !== peerId || tx.state !== 'active') continue
+      if (now - (tx.lastLifeAt || tx.startedAt || 0) < this.transferProtectMs) return true
     }
     return false
   }
@@ -368,6 +394,7 @@ export class FileX {
       await this.io.write(tx.fid, i, tx.cs, pt)
       bitmapSet(tx.have, i)
       tx.lastProgressAt = Date.now()
+      tx.lastLifeAt = tx.lastProgressAt // 收到块 = 活性
       const done = bitmapCount(tx.have)
       this.emit({ fid: tx.fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name, speed: recentSpeed(tx, done) })
       // 水位前进 8 块或有节奏地回报位图

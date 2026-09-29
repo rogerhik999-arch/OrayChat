@@ -588,7 +588,7 @@ function buildFileBubble(bubble, m, mine) {
     bubble.appendChild(card)
   }
   // 传输进度 / 异常态
-  if (st && (st.state === 'active' || st.state === 'cancel' || st.state === 'error')) {
+  if (st) {
     if (st.state === 'active') {
       const bar = document.createElement('div')
       bar.className = 'fx-progress'
@@ -604,10 +604,20 @@ function buildFileBubble(bubble, m, mine) {
       cancel.onclick = () => state.filex.cancel(m.fid)
       bar.append(fill, pct, cancel)
       bubble.appendChild(bar)
-    } else {
+    } else if (st.state === 'stalled') {
       const note = document.createElement('div')
       note.className = 'fx-sub'
-      note.textContent = st.state === 'cancel' ? '传输已取消（重新发送同一文件将自动续传）' : '传输校验失败'
+      note.textContent = '⏸ 传输已暂停（对端暂不可达）· 对方上线后自动续传'
+      bubble.appendChild(note)
+    } else if (st.state === 'cancel') {
+      const note = document.createElement('div')
+      note.className = 'fx-sub'
+      note.textContent = '传输已取消（重新发送同一文件将自动续传）'
+      bubble.appendChild(note)
+    } else if (st.state === 'error') {
+      const note = document.createElement('div')
+      note.className = 'fx-sub'
+      note.textContent = '传输校验失败'
       bubble.appendChild(note)
     }
   }
@@ -807,7 +817,7 @@ async function doLogin(name, room) {
         })
       },
       onEvent: (e) => {
-        if (state.args.bot && (e.state === 'done' || e.state === 'error' || e.state === 'cancel')) {
+        if (state.args.bot && e.state !== 'active') {
           window.oray.botLog(`[BOT] FILE-${e.state.toUpperCase()} dir=${e.dir} fid=${e.fid} name=${JSON.stringify(e.name || '')} done=${e.done}/${e.total}`)
         }
         const now = Date.now()

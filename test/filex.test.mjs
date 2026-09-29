@@ -262,5 +262,46 @@ const drain = (ms = 30) => new Promise((r) => setTimeout(r, ms))
   void wire; void netB
 }
 
-console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底）')
+// ---- 9) 传输保护限时：活性窗口内保护 reaper，超窗后不再保护（防新残体）----
+{
+  const { netA } = link()
+  const fxA = mkFileX(netA, {}, null, { transferProtectMs: 300 })
+  const content = new Uint8Array(70000)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  await fxA.sendFile('B', { bytes: content, name: 'p.bin', size: content.length, mime: 'application/octet-stream', lastModified: 7 })
+  assert.equal(fxA.hasActiveTransfer('B'), true, '活跃传输应受保护')
+  // 模拟彻底卡死（对端消失，无 ACK 无重发活性）……但泵每 200ms 发块 = 活性！
+  // 发块也算活性是对的（对端可能活着只是 ACK 被挤）——保护窗口判据在 onFrame/onHave。
+  // 对"对端已死"的真实判定：net 层 relay.peers 消失 + pc 断 → pump 里 peer.state!=='ready'
+  // 时 pump 只 return 不发块 → lastLifeAt 不再更新 → 超窗后不再保护。
+  netA.peers.get('B').state = 'connecting' // 会话抖动：泵空转
+  await new Promise((r) => setTimeout(r, 450))
+  assert.equal(fxA.hasActiveTransfer('B'), false, '活性超窗后应退出传输保护（reaper 可回收残体）')
+}
+
+// ---- 10) 停滞转 stalled，会话就绪自动复活 ----
+{
+  const { wire, netA, netB } = link()
+  const fxA = mkFileX(netA, {}, null, { transferProtectMs: 300 })
+  const fxB = mkFileX(netB)
+  const content = new Uint8Array(140000)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const fid = await fxA.sendFile('B', { bytes: content, name: 'q.bin', size: content.length, mime: 'application/octet-stream', lastModified: 8 })
+  // 接收方直接把 tx 转 stalled（模拟长停滞）……发送方经 onOffer 重放恢复
+  await new Promise((r) => setTimeout(r, 600))
+  const rtx = [...fxB.tx.values()][0]
+  if (rtx) { rtx.state = 'stalled' }
+  // 恢复回放直到双方 done
+  for (let round = 0; round < 300; round++) {
+    for (const f of wire.a2b.splice(0)) { f.__fx ? await fxB.onFrame('A', f.__fx) : fxB.onCtl('A', f) }
+    for (const f of wire.b2a.splice(0)) { f.__fx ? await fxA.onFrame('B', f.__fx) : fxA.onCtl('B', f) }
+    if (fxA.tx.get(fid)?.state === 'done') break
+    await drain(25)
+  }
+  assert.equal(fxA.tx.get(fid)?.state, 'done', '恢复后完成')
+  assert.equal(await sha256Hex(await fxB.io.read(fid)), await sha256Hex(content))
+  void netB
+}
+
+console.log('filex.test.mjs ✓ 全部通过（压缩/位图/全流程/断点续传/篡改拒绝/原图模式/offer重发/中继兜底/保护限时/停滞复活）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出
