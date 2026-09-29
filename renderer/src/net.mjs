@@ -93,6 +93,7 @@ export class ChatNet {
       load: () => this.hooks.onStoreLoad?.(),
     })
     this.store.onChange((convKey) => this.hooks.onStoreChanged?.(convKey))
+    this.migrateLegacyDmKeys() // v1.12.1：旧版单侧公钥键 → 联合哈希键（见 store.dmConvKey 注释）
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
     // 在线状态心跳（15±3s 抖动，防雷群）：定期向所有就绪对端报告在线
     const scheduleHeartbeat = () => {
@@ -158,7 +159,59 @@ export class ChatNet {
 
   // ---------- 会话键 ----------
 
-  // wireConv: 'lobby' | 'dm'（线上帧用）；本地存储键：'lobby' | 双方公钥字典序较小者（两端一致）
+  // 旧版私聊键迁移：64-hex 裸键（单侧公钥）按条目作者拆分重组。
+  // - 键 = 对端公钥（对端比我小）：桶内只含该对端 → 整体迁移
+  // - 键 = 我自己的公钥（我比所有人小，多人消息混入）：按作者拆到各对端；
+  //   我自己发出的消息无法归属（旧键已丢失对端信息）→ 存入 dm-legacy-orphan 保留不展示
+  migrateLegacyDmKeys() {
+    let migrated = 0, orphaned = 0
+    for (const [key, conv] of [...this.store.convs]) {
+      if (key === 'lobby' || key.startsWith('dm:') || key.startsWith('dm-unknown:') || key.startsWith('dm-legacy:')) continue
+      if (!/^[0-9a-f]{64}$/.test(key)) continue
+      const byPeer = new Map() // peerHex -> entries[]
+      for (const e of conv.entries.values()) {
+        if (!e.author) continue
+        if (e.author === this.myIdPubHex) continue // 归属不明，见下
+        if (!byPeer.has(e.author)) byPeer.set(e.author, [])
+        byPeer.get(e.author).push(e)
+      }
+      const myEntries = [...conv.entries.values()].filter((e) => e.author === this.myIdPubHex)
+      if (byPeer.size === 1 && key !== this.myIdPubHex) {
+        // 干净场景：桶 = 我与该对端（含双方消息）
+        const peerHex = byPeer.keys().next().value
+        const nk = dmConvKey(this.myIdPubHex, peerHex)
+        const tgt = this.store.convs.get(nk) || { entries: new Map(), dels: new Map(), clearT: 0 }
+        for (const e of [...byPeer.get(peerHex), ...myEntries]) if (!tgt.entries.has(e.mid)) tgt.entries.set(e.mid, e)
+        for (const [mid, t] of conv.dels) if (!tgt.dels.has(mid)) tgt.dels.set(mid, t)
+        tgt.clearT = Math.max(tgt.clearT, conv.clearT)
+        this.store.convs.set(nk, tgt)
+        migrated++
+      } else {
+        // 混桶（我的公钥全局最小）：按对端拆分；我的消息进孤儿桶
+        for (const [peerHex, entries] of byPeer) {
+          const nk = dmConvKey(this.myIdPubHex, peerHex)
+          const tgt = this.store.convs.get(nk) || { entries: new Map(), dels: new Map(), clearT: 0 }
+          for (const e of entries) if (!tgt.entries.has(e.mid)) tgt.entries.set(e.mid, e)
+          tgt.clearT = Math.max(tgt.clearT, conv.clearT)
+          this.store.convs.set(nk, tgt)
+          migrated++
+        }
+        if (myEntries.length) {
+          const ok = `dm-legacy:orphan:${key.slice(0, 8)}`
+          const o = { entries: new Map(myEntries.map((e) => [e.mid, e])), dels: new Map(), clearT: conv.clearT }
+          this.store.convs.set(ok, o)
+          orphaned += myEntries.length
+        }
+      }
+      this.store.convs.delete(key)
+    }
+    if (migrated || orphaned) {
+      this.hooks.onLog?.(`私聊记录迁移完成：重组 ${migrated} 组会话${orphaned ? `；${orphaned} 条我方旧消息无法归属对端（已隔离不展示）` : ''}`)
+      this.hooks.onStorePersist?.(this.store.exportAll())
+    }
+  }
+
+  // wireConv: 'lobby' | 'dm'（线上帧用）；本地存储键：'lobby' | 双方联合哈希（两端一致）
   storeKey(wireConv, peerId) {
     if (wireConv === 'lobby') return 'lobby'
     const peer = this.peers.get(peerId)

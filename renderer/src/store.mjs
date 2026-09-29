@@ -179,7 +179,21 @@ export class LogStore {
   }
 }
 
-// 会话键：大厅固定 'lobby'；私聊用双方身份公钥（hex）字典序较小者，两端一致
+// 会话键：大厅固定 'lobby'；私聊 = 双方身份公钥的联合哈希（排序后 sha256），
+// 两端一致且对每对身份唯一。此前"取字典序较小者"是错的——当我的公钥比
+// 所有对话方都小时，与每个人的私聊共享同一键，消息全部混入一个桶
+// （v1.12.1 修复；旧键由 net 层按作者身份迁移）。
 export function dmConvKey(myIdPubHex, peerIdPubHex) {
-  return myIdPubHex < peerIdPubHex ? myIdPubHex : peerIdPubHex
+  const [a, b] = myIdPubHex < peerIdPubHex ? [myIdPubHex, peerIdPubHex] : [peerIdPubHex, myIdPubHex]
+  return 'dm:' + sha256HexStr(a + '|' + b)
 }
+
+// 供迁移/显示使用的 sha256（hex 字符串输入）
+function sha256HexStr(str) {
+  // 延迟绑定：避免在纯逻辑模块顶部引入 webcrypto 差异；noble sha256 接受字符串 utf8
+  return toHex(sha256(utf8ToBytes(str)))
+}
+
+import { sha256 } from '@noble/hashes/sha2.js'
+import { utf8ToBytes } from '@noble/hashes/utils.js'
+const toHex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('')

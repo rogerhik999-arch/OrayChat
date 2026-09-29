@@ -110,9 +110,11 @@ assert.deepEqual(rs2.visible('r').map((e) => e.mid), [mid('later')], '30 天自�
 assert.ok(!JSON.stringify(rs2.exportConv('r')).includes('keep'))
 console.log('✅ 30 天保留期（写入过滤 + 定期清扫 + 同步过滤）')
 
-// --- 私聊会话键两端一致 ---
-assert.equal(dmConvKey('bbb', 'aaa'), 'aaa')
-assert.equal(dmConvKey('aaa', 'bbb'), 'aaa')
-console.log('✅ 私聊会话键规范（两端同键）')
+// --- 私聊会话键：两端一致 + 对每对唯一（v1.12.1：修复"取较小者"导致的混桶） ---
+assert.equal(dmConvKey('bbb', 'aaa'), dmConvKey('aaa', 'bbb'), '两端同键')
+const me = '0'.repeat(64) // 我比所有对端都小 —— 旧实现在此场景下与每个人的键相同！
+assert.notEqual(dmConvKey(me, 'a'.repeat(64)), dmConvKey(me, 'b'.repeat(64)), '同一我与不同对端的键必须不同')
+assert.ok(dmConvKey(me, 'a'.repeat(64)).startsWith('dm:'), '新键带 dm: 前缀')
+console.log('✅ 私聊会话键：两端一致 + 每对唯一（含"我全局最小"场景）')
 
 console.log('\n✅ history.test.mjs 全部通过')
