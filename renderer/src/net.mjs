@@ -53,6 +53,9 @@ export const DEFAULT_CONFIG = {
     'wss://broker.emqx.io:8084/mqtt',
     'wss://test.mosquitto.org:8081/mqtt',
   ],
+  // P2-3：文件帧中继 QoS（0=至多一次，1=至少一次+协议层去重=恰好一次）。
+  // QoS1 借 broker 重传兜丢帧，代价是公共 broker 更易限流——实验开关（oraychat-config.json 覆盖）
+  relayQos: 0,
   defaultRoom: 'oraychat-hall',
 }
 
@@ -401,8 +404,9 @@ export class ChatNet {
   async sendFx(peerId, data, forceRelay = false) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') throw new Error('会话未就绪')
-    // forceRelay：p2p 零进展的传输兜底改走中继（接收方就绪会话两路全收）
-    if (peer.via === 'mqtt' || forceRelay) this.relay.send(peerId, 'fx', data)
+    // forceRelay：p2p 零进展的传输兜底改走中继（接收方就绪会话两路全收）；
+    // P2-3：文件帧 QoS 按配置（relayQos:1 时借 broker PUBACK 重传兜丢帧）
+    if (peer.via === 'mqtt' || forceRelay) this.relay.send(peerId, 'fx', data, { qos: this.cfg?.relayQos || 0 })
     else await this.fxAction?.send(data, { target: peerId })
   }
 

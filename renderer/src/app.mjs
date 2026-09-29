@@ -802,7 +802,7 @@ async function doLogin(name, room) {
     io: {
       state: (fid, meta) => window.oray.fxState(fid, meta),
       write: (fid, i, cs, bytes) => window.oray.fxWrite(fid, i, cs, bytes),
-      finalize: (fid, sha, name) => window.oray.fxFinalize(fid, sha, name),
+      finalize: (fid, sha, name, fin) => window.oray.fxFinalize(fid, sha, name, fin),
       read: (fid) => window.oray.fxRead(fid),
       readChunk: (fid, i, cs, len) => window.oray.fxReadRange(fid, i, cs, len),
       abort: (fid) => window.oray.fxAbort(fid),

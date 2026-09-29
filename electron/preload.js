@@ -20,7 +20,7 @@ contextBridge.exposeInMainWorld('oray', {
   // 文件传输存储层（filex io 适配器：分片落盘/位图/校验/读取/另存）
   fxState: (fid, meta) => ipcRenderer.invoke('fx:state', fid, meta),
   fxWrite: (fid, i, cs, bytes) => ipcRenderer.invoke('fx:write', fid, i, cs, bytes),
-  fxFinalize: (fid, shaHex, name) => ipcRenderer.invoke('fx:finalize', fid, shaHex, name),
+  fxFinalize: (fid, shaHex, name, fin) => ipcRenderer.invoke('fx:finalize', fid, shaHex, name, fin),
   fxRead: (fid) => ipcRenderer.invoke('fx:read', fid),
   fxReadRange: (fid, i, cs, len) => ipcRenderer.invoke('fx:read-range', fid, i, cs, len),
   fxSave: (fid, name) => ipcRenderer.invoke('fx:save', fid, name),

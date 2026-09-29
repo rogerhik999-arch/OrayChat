@@ -73,7 +73,7 @@
       e.have[bi] |= 1 << (i & 7)
       return true
     },
-    fxFinalize: async (fid, shaHex, name) => {
+    fxFinalize: async (fid, shaHex, name, fin) => {
       const s = window.__orayFx || {}
       const e = s[fid]
       if (!e) return { ok: false, why: 'not-found' }
@@ -86,6 +86,15 @@
       const hexs = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
       if (hexs !== shaHex) return { ok: false, why: 'sha-mismatch' }
       e.bytes = all; e.name = name
+      if (fin?.alg === 'deflate') {
+        // P2-1 流压缩：整文件解压后终检原始哈希
+        const stream = new Blob([all]).stream().pipeThrough(new DecompressionStream('deflate-raw'))
+        const raw = new Uint8Array(await new Response(stream).arrayBuffer())
+        const rd = await crypto.subtle.digest('SHA-256', raw)
+        const rhex = [...new Uint8Array(rd)].map((b) => b.toString(16).padStart(2, '0')).join('')
+        if (rhex !== fin.rawSha) return { ok: false, why: 'raw-sha-mismatch' }
+        e.bytes = raw
+      }
       return { ok: true, path: `mem:${fid}` }
     },
     fxRead: async (fid) => {

@@ -202,13 +202,15 @@ export class RelayTransport {
 
   get connected() { return this.aliveLinks().length > 0 }
 
-  send(peerId, kind, data) {
+  send(peerId, kind, data, opts = {}) {
     const alive = this.aliveLinks()
     if (!alive.length) throw new Error('MQTT 中继未连接（所有并联链路断开）')
     const link = alive[Math.floor(Math.random() * alive.length)] // 随机分流
     const { inbox } = RelayTransport.topics(this.appId, this.roomId)
     const frame = oc.sealRoom(this.roomKey, { from: this.selfId, txid: oc.newMid(), kind, data })
-    link.client.publish(inbox(peerId), JSON.stringify(frame))
+    // P2-3：QoS 可选（默认 0；文件帧可按配置走 QoS1 借 broker 重传兜丢帧，
+    // 我们协议层的 txid 去重保证恰好一次语义）
+    link.client.publish(inbox(peerId), JSON.stringify(frame), { qos: opts.qos || 0 })
   }
 
   setName(name) { this.myName = name; this.announce() }

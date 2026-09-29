@@ -54,11 +54,16 @@ export const FEC_GROUP = 8
 export async function maybeDeflate(u8) {
   if (u8.length < 512) return { data: u8, z: 0 }
   try {
-    const stream = new Blob([u8]).stream().pipeThrough(new CompressionStream('deflate-raw'))
-    const out = new Uint8Array(await new Response(stream).arrayBuffer())
+    const out = await deflateBytes(u8)
     if (out.length < u8.length * 0.97) return { data: out, z: 1 } // 收益 ≥3% 才值得
   } catch { /* 环境不支持：原样发 */ }
   return { data: u8, z: 0 }
+}
+
+// 无阈值 deflate（P2-1 流式整文件压缩用）
+export async function deflateBytes(u8) {
+  const stream = new Blob([u8]).stream().pipeThrough(new CompressionStream('deflate-raw'))
+  return new Uint8Array(await new Response(stream).arrayBuffer())
 }
 
 export async function inflate(u8) {
@@ -98,6 +103,7 @@ export class FileX {
     this.maxRateRelay = maxRateRelay || MAX_RATE_RELAY
     this.hooks = hooks
     this.tx = new Map() // fid -> 传输状态（收发同表）
+    this.peerCaps = new Map() // peerId -> {s:1} 接收方能力（流压缩），probe 学习
     // P0-2 令牌桶：所有传输共享一个字节预算（LEDBAT 式让路——预算随是否有
     // 中继路径传输切换，交互消息/心跳天然获得余量）
     this.pace = { tokens: this.maxRateDm * PACE_BUCKET_S, at: Date.now() }
@@ -138,7 +144,8 @@ export class FileX {
     if (file.size > FX_MAX_SIZE) throw new Error(`文件超过 ${Math.round(FX_MAX_SIZE / 1048576)}MB 上限`)
     if (this.tx.size > 8) throw new Error('传输任务过多，请稍后再试')
 
-    let bytes = file.bytes, w, h, mime = file.mime || 'application/octet-stream', mode = 'raw'
+    const rawSha = await sha256Hex(file.bytes) // 原始内容指纹（兼探测 id 与流压缩终检）
+    let bytes = file.bytes, w, h, mime = file.mime || 'application/octet-stream', mode = 'raw', alg = ''
     if (kind === 'image' && !orig && this.compress) {
       try {
         const c = await this.compress(file)
@@ -146,18 +153,44 @@ export class FileX {
       } catch (e) { this.log(`图片压缩失败，按原图发送：${e?.message || e}`, 'warn') }
     }
 
+    // P2-1 能力探测：流式整文件压缩需要接收方支持解压 finalize（caps.s）。
+    // 探针 offer 只交换能力不建事务（旧版收到 probe 也回 have 但无 caps → legacy 模式）。
+    // 仅在该对端「无能力缓存」时探测一次；缓存 {s:0}（已知 legacy）不再重复探测。
+    // 图片已经格式压缩（webp/jpeg），整文件 deflate 无收益 → 仅普通文件启用。
+    let stream = false
+    if (kind === 'file' && !this.peerCaps.has(peerId)) {
+      const caps = await this.probeCaps(peerId, rawSha.slice(0, 24))
+      this.peerCaps.set(peerId, caps)
+    }
+    if (kind === 'file' && this.peerCaps.get(peerId)?.s) {
+      try {
+        const packed = await deflateBytes(file.bytes) // P2-1：整文件流式压缩（全局字典，压缩率优于逐块）
+        if (packed.length < file.bytes.length * 0.97) { bytes = packed; alg = 'deflate'; stream = true }
+      } catch { /* 环境不支持：legacy 逐块 */ }
+    }
+
     const sha = await sha256Hex(bytes)
     const fid = sha.slice(0, 24) // 内容寻址：同内容 = 同 fid = 天然续传键
     if (this.tx.has(fid)) throw new Error('相同文件正在传输中')
     const cs = FX_CHUNK_SIZE
     const n = chunkCount(bytes.length, cs)
+    // P2-2 扁平块哈希清单（BitTorrent piece hash 简化版）：每块 8 hex 截断哈希随
+    // offer 下发，接收方边收边验——坏块即时丢弃重传，完整性不再"全有全无"
+    let hashes = null
+    if (n <= 8192) {
+      hashes = []
+      for (let i = 0; i < n; i++) hashes.push((await sha256Hex(bytes.subarray(i * cs, Math.min((i + 1) * cs, bytes.length)))).slice(0, 8))
+    }
     const tx = {
-      fid, dir: 'send', peerId, state: 'active', bytes, sha, cs, n,
-      name: file.name, size: bytes.length, mime, kind, w, h, mode, orig,
+      fid, dir: 'send', peerId, state: 'active', bytes, sha, cs, n, hashes,
+      name: file.name, size: bytes.length, mime, kind, w, h, mode, orig, alg,
+      rawSha, rawSize: file.bytes.length,
       have: new Uint8Array(Math.ceil(n / 8)), // 对端确认位图
-      acked: 0, inflight: new Map(), // i -> 发送时刻（1.5s 未确认即重发）
+      acked: 0, inflight: new Map(), // i -> {ts, relay}（1.5s 未确认即重发；relay=本块走中继）
       offers: 0, // offer 发送次数（首个 ACK 前周期重发）
-      forceRelay: false, // p2p 零进展自动切换：后续块改走 MQTT 中继
+      forceRelay: false, // 分路仍无进展后的最终兜底：全部走中继
+      split: false, // P2-4 双路径拆分：p2p 零进展时部分块经中继、部分留直连
+      lastP2pAckAt: 0, // 最近一次归属直连路径的 ACK（分路回收判据）
       lastAckAt: 0, // 最近一次收到对端位图/确认的时刻（自愈 3 判据）
       lastLifeAt: Date.now(), // 最近活性时刻（收到 ACK / 实际发块）——传输保护窗口判据
       lastProgressAt: Date.now(), startedAt: Date.now(),
@@ -177,13 +210,26 @@ export class FileX {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
       fec: 1, // P1-1：8+1 XOR 奇偶块广播（旧版接收方按 i>=n 丢弃，向后兼容）
+      hashes, // P2-2：逐块哈希清单（n>8192 时为 null 跳过）
     }
+    if (stream) { offer.alg = 'deflate'; offer.raw = file.bytes.length; offer.rsha = rawSha }
     tx.offer = offer
     await this.sendOffer(peerId, offer, tx)
-    this.log(`发送${kind === 'image' ? '图片' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}）`)
+    this.log(`发送${kind === 'image' ? '图片' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}${stream ? '，流压缩' : ''}）`)
     this.emit({ fid, dir: 'send', state: 'active', done: 0, total: n, name: tx.name })
     this.startPump(fid)
     return fid
+  }
+
+  // P2-1 能力探测：probe offer → 带 caps 的 have；1.2s 超时按无能力处理（legacy 兼容）
+  probeCaps(peerId, probeFid) {
+    return new Promise((resolve) => {
+      if (!this.capsWaiters) this.capsWaiters = new Map()
+      const done = (caps) => { if (!this.capsWaiters.has(probeFid)) return; this.capsWaiters.delete(probeFid); clearTimeout(timer); resolve(caps) }
+      this.capsWaiters.set(probeFid, done)
+      const timer = setTimeout(() => done({}), 1200)
+      this.net.sendCtl(peerId, { op: 'fx-offer', probe: 1, fid: probeFid }).catch(() => done({}))
+    })
   }
 
   // offer 重发（首个 ACK 前每 3s 一次）：ctl 帧只发一次会因丢帧/对端初始化
@@ -284,6 +330,11 @@ export class FileX {
         for (let k = 0; k < part.length; k++) acc[k] ^= part[k]
       }
       const plain = acc.slice(0, this.plainLen(tx, missing))
+      // P2-2 块哈希校验（有清单时）：恢复出的块同样必须过验
+      if (tx.hashes && tx.hashes[missing] !== undefined) {
+        const h = (await sha256Hex(plain)).slice(0, 8)
+        if (h !== tx.hashes[missing]) { tx.recovering.delete(g); return }
+      }
       await this.io.write(tx.fid, missing, tx.cs, plain)
       bitmapSet(tx.have, missing)
       tx.lastProgressAt = Date.now()
@@ -316,10 +367,19 @@ export class FileX {
           if (tx.offers === 3) this.log(`传输 ${tx.name}：对端迟迟未响应，正在重发传输请求（若持续失败请检查连接）`, 'warn')
         }
       }
-      // 自愈 2：p2p 零进展 → 后续块改走 MQTT 中继（接收方 make-before-break 两路全收）
-      if (!tx.forceRelay && peer.via === 'p2p' && tx.acked === 0 && now - tx.startedAt > this.relayFallbackMs) {
+      // 自愈 2 升级（P2-4 双路径拆分）：p2p 零进展先"分路"——部分块留直连、
+      // 部分改走中继；直连恢复（有归属 ACK）自动回收分路；分路仍无进展才整体转中继
+      if (!tx.forceRelay && !tx.split && peer.via === 'p2p' && now - lastLife > this.relayFallbackMs) {
+        tx.split = true
+        this.log(`传输 ${tx.name}：直连无响应，启用双路径分路（部分块改走中继）`, 'warn')
+      }
+      if (tx.split && !tx.forceRelay && tx.lastP2pAckAt && now - tx.lastP2pAckAt < 8000) {
+        tx.split = false
+        this.log(`传输 ${tx.name}：直连已恢复，回收分路`)
+      }
+      if (tx.split && !tx.forceRelay && now - lastLife > this.relayFallbackMs * 2) {
         tx.forceRelay = true
-        this.log(`传输 ${tx.name}：直连通道无响应，改经 MQTT 中继`, 'warn')
+        this.log(`传输 ${tx.name}：分路仍无进展，全部改经 MQTT 中继`, 'warn')
       }
       // 自愈 3：任意路径 20s 无新 ACK → 大概率是文件块把心跳/位图帧挤死（QoS0
       // 拥堵）或会话被对端回收 → 重建中继连接（限频）+ 重发 offer 唤醒接收方
@@ -334,22 +394,26 @@ export class FileX {
       const base = (peer.via === 'mqtt' || tx.forceRelay) ? WINDOW_MQTT : WINDOW_P2P
       const window = this.windowFor(tx, base)
       const infTimeout = this.inflightTimeoutFor(tx)
-      for (const [i, ts] of tx.inflight) {
-        if (bitmapHas(tx.have, i) || now - ts > infTimeout) {
+      for (const [i, fl] of tx.inflight) {
+        if (bitmapHas(tx.have, i) || now - fl.ts > infTimeout) {
           if (bitmapHas(tx.have, i) && tx.inflight.has(i)) {
-            // P0-1：RTT 采样（以最近一次发送为起点）
-            const sample = now - tx.inflight.get(i)
+            // P0-1：RTT 采样（以最近一次发送为起点）；P2-4：直连归属信用
+            const sample = now - fl.ts
             if (sample > 0 && sample < 10000) tx.rttEma = tx.rttEma ? Math.round(tx.rttEma * 0.7 + sample * 0.3) : sample
+            if (!fl.relay) tx.lastP2pAckAt = now
           }
           tx.inflight.delete(i)
         }
       }
       if (tx.inflight.size >= window) return
       void (async () => {
+        let toggle = 0
         for (let k = 0; k < tx.n && tx.inflight.size < window && tx.state === 'active'; k++) {
           if (bitmapHas(tx.have, k) || tx.inflight.has(k)) continue
-          tx.inflight.set(k, Date.now())
-          await this.sendChunk(tx, k)
+          const viaMqtt = peer.via === 'mqtt'
+          const useRelay = tx.forceRelay || viaMqtt || (tx.split && toggle++ % 2 === 1)
+          tx.inflight.set(k, { ts: Date.now(), relay: useRelay })
+          await this.sendChunk(tx, k, useRelay)
         }
         const done = bitmapCount(tx.have)
         this.emit({ fid: tx.fid, dir: 'send', state: 'active', done, total: tx.n, name: tx.name, speed: recentSpeed(tx) })
@@ -357,7 +421,7 @@ export class FileX {
     }, 200)
   }
 
-  async sendChunk(tx, i) {
+  async sendChunk(tx, i, useRelay = false) {
     const peer = this.peer(tx.peerId)
     if (!peer || peer.state !== 'ready') return
     const from = i * tx.cs
@@ -369,17 +433,17 @@ export class FileX {
     if (wait > 0) await sleep(Math.min(wait, 1000))
     const e = oc.sealBin(peer.ctx, data, 'fx', tx.fid, i, z)
     try {
-      await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e }, tx.forceRelay)
+      await this.net.sendFx(tx.peerId, { fid: tx.fid, i, z, e }, useRelay || tx.forceRelay)
       tx.lastLifeAt = Date.now() // 实际发出即活性（对端可能活着只是 ACK 被挤）
     } catch { /* 会话抖动：超时后自动重发 */ }
     // P1-1：组边界跟随奇偶块广播（组内任丢 1 块，接收方本地恢复免重传）
     if (i % FEC_GROUP === FEC_GROUP - 1 || i === tx.n - 1) {
-      await this.sendParity(tx, Math.floor(i / FEC_GROUP))
+      await this.sendParity(tx, Math.floor(i / FEC_GROUP), useRelay)
     }
-    if (peer.via === 'mqtt' || tx.forceRelay) await sleep(MQTTPace_MS) // 公共 broker 节流
+    if (peer.via === 'mqtt' || useRelay || tx.forceRelay) await sleep(MQTTPace_MS) // 公共 broker 节流
   }
 
-  async sendParity(tx, g) {
+  async sendParity(tx, g, useRelay = false) {
     const peer = this.peer(tx.peerId)
     if (!peer || peer.state !== 'ready') return
     const parity = this.parityFor(tx, g)
@@ -387,13 +451,19 @@ export class FileX {
     if (wait > 0) await sleep(Math.min(wait, 1000))
     const e = oc.sealBin(peer.ctx, parity, 'fx', tx.fid, tx.n + g, 2) // flags=2：奇偶块命名空间
     try {
-      await this.net.sendFx(tx.peerId, { fid: tx.fid, i: tx.n + g, z: 0, p: 1, e }, tx.forceRelay)
+      await this.net.sendFx(tx.peerId, { fid: tx.fid, i: tx.n + g, z: 0, p: 1, e }, useRelay || tx.forceRelay)
     } catch { /* 奇偶块丢失只是失去优化 */ }
   }
 
   // ---------- 接收方 ----------
 
   async onOffer(peerId, o) {
+    // P2-1 能力探测：probe offer 无 n/cs（不建事务），须在字段校验前处理，
+    // 只回能力位（流式压缩需新 finalize）
+    if (o?.probe) {
+      this.net.sendCtl(peerId, { op: 'fx-have', fid: o.fid, have: [], probe: 1, caps: { s: 1 } }).catch(() => {})
+      return
+    }
     if (!o?.fid || !Number.isInteger(o.n) || o.n <= 0 || !o.cs) return
     if (o.size > FX_MAX_SIZE) { this.net.sendCtl(peerId, { op: 'fx-cancel', fid: o.fid, why: 'too-large' }).catch(() => {}); return }
     const peer = this.peer(peerId)
@@ -406,6 +476,8 @@ export class FileX {
         name: String(o.name || o.fid), mime: o.mime || 'application/octet-stream',
         kind: o.kind === 'image' ? 'image' : 'file', sha: o.sha, mode: o.mode,
         w: o.w, h: o.h, orig: !!o.orig, thumb: o.thumb || '',
+        hashes: Array.isArray(o.hashes) ? o.hashes : null, // P2-2 逐块哈希清单
+        alg: o.alg === 'deflate' ? 'deflate' : '', rawSha: o.rsha || '', rawSize: o.raw || 0, // P2-1 流压缩
         have: st.have, caption: o.thumb ? (o.name || '图片') : (o.name || o.fid),
         parity: new Map(), // FEC：组号 -> 奇偶块（内存态，丢失只失去优化）
         lastHaveAt: 0, lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
@@ -430,21 +502,28 @@ export class FileX {
     tx.lastHaveAt = Date.now()
     const done = bitmapCount(tx.have)
     if (done >= tx.n) {
-      const r = await this.io.finalize(fid, tx.sha, tx.name)
-      if (r.ok) {
-        tx.state = 'done'
-        this.net.sendCtl(peerId, { op: 'fx-done', fid, sha: tx.sha }).catch(() => {})
-        this.log(`${tx.kind === 'image' ? '图片' : '文件'} ${tx.name} 接收完成（SHA-256 校验一致）`)
-        this.emit({ fid, dir: 'recv', state: 'done', done: tx.n, total: tx.n, name: tx.name })
-      } else {
-        tx.state = 'error'
-        this.net.sendCtl(peerId, { op: 'fx-cancel', fid, why: 'sha-mismatch' }).catch(() => {})
-        this.log(`文件 ${tx.name} 校验失败（内容与清单不符），已丢弃`, 'warn')
-        this.emit({ fid, dir: 'recv', state: 'error', done, total: tx.n, name: tx.name })
-      }
+      // 防重入：FEC 恢复与重发块到达可能同时触发完成——并发 finalize 会因
+      // 第一个成功后 part 已 rename 而误报"校验失败"，把 done 覆盖成 error
+      if (tx.finalizing) return
+      tx.finalizing = true
+      try {
+        // P2-1 流压缩：finalize 时解压并终检原始内容哈希
+        const r = await this.io.finalize(fid, tx.sha, tx.name, tx.alg ? { alg: tx.alg, rawSha: tx.rawSha, rawSize: tx.rawSize } : null)
+        if (r.ok) {
+          tx.state = 'done'
+          this.net.sendCtl(peerId, { op: 'fx-done', fid, sha: tx.sha }).catch(() => {})
+          this.log(`${tx.kind === 'image' ? '图片' : '文件'} ${tx.name} 接收完成（SHA-256 校验一致${tx.alg ? '，已解压' : ''}）`)
+          this.emit({ fid, dir: 'recv', state: 'done', done: tx.n, total: tx.n, name: tx.name })
+        } else {
+          tx.state = 'error'
+          this.net.sendCtl(peerId, { op: 'fx-cancel', fid, why: 'sha-mismatch' }).catch(() => {})
+          this.log(`文件 ${tx.name} 校验失败（内容与清单不符），已丢弃`, 'warn')
+          this.emit({ fid, dir: 'recv', state: 'error', done, total: tx.n, name: tx.name })
+        }
+      } finally { tx.finalizing = false }
       return
     }
-    this.net.sendCtl(peerId, { op: 'fx-have', fid, have: [...tx.have] }).catch(() => {})
+    this.net.sendCtl(peerId, { op: 'fx-have', fid, have: [...tx.have], caps: { s: 1 } }).catch(() => {})
     this.emit({ fid, dir: 'recv', state: 'active', done, total: tx.n, name: tx.name })
   }
 
@@ -452,17 +531,33 @@ export class FileX {
 
   // 发送方收到对端位图：合并确认、驱动窗口前进
   onHave(peerId, f) {
+    // 能力位学习（P2-1）：任何 have 都携带 caps，接收方升级后即时生效
+    if (f?.caps && this.peerCaps.get(peerId)?.s !== f.caps.s) this.peerCaps.set(peerId, f.caps)
     const tx = this.tx.get(f?.fid)
     if (!tx || tx.dir !== 'send' || tx.state !== 'active' || !Array.isArray(f.have)) return
     tx.lastAckAt = Date.now()
     tx.lastLifeAt = tx.lastAckAt
     const bm = Uint8Array.from(f.have)
+    let gained = 0
     for (let k = 0; k < tx.n && k < bm.length * 8; k++) {
-      if (bitmapHas(bm, k) && !bitmapHas(tx.have, k)) { bitmapSet(tx.have, k); tx.acked++ }
+      if (bitmapHas(bm, k) && !bitmapHas(tx.have, k)) {
+        bitmapSet(tx.have, k); tx.acked++; gained++
+        // P2-4 路径归属：该块最近一次从直连发出 → 直连有信用（分路回收判据）
+        const fl = tx.inflight.get(k)
+        if (fl && !fl.relay) tx.lastP2pAckAt = Date.now()
+      }
     }
     const done = bitmapCount(tx.have)
-    tx.lastProgressAt = Date.now()
-    tx.sentHist.push([Date.now(), done])
+    // P0-1 速率 EMA（自适应窗口输入）：相邻两次位图间的瞬时速率
+    const now = Date.now()
+    if (tx.lastHaveTs && now > tx.lastHaveTs && gained > 0) {
+      const inst = Math.min((gained * tx.cs * 1000) / (now - tx.lastHaveTs), 100 * 1024 * 1024)
+      tx.rateEma = tx.rateEma ? Math.round(tx.rateEma * 0.6 + inst * 0.4) : Math.round(inst)
+    }
+    tx.lastHaveTs = now
+    tx.lastHaveDone = done
+    tx.lastProgressAt = now
+    tx.sentHist.push([now, done])
     if (tx.sentHist.length > 30) tx.sentHist.shift()
     this.emit({
       fid: tx.fid, dir: 'send', state: done >= tx.n ? 'done' : 'active',
@@ -557,6 +652,19 @@ export class FileX {
         const expectLast = tx.size - (tx.n - 1) * tx.cs
         if (pt.length !== expectLast) throw new Error('末块长度不符')
       } else if (pt.length !== tx.cs) throw new Error('块长度不符')
+      // P2-2 逐块哈希：不符即终止（AEAD 已保证传输无损，不符=清单/内容级问题，
+      // 重传无意义；宁可中止也不静默写坏文件）
+      if (tx.hashes && tx.hashes[i] !== undefined) {
+        const h = (await sha256Hex(pt)).slice(0, 8)
+        if (h !== tx.hashes[i]) {
+          this.log(`块 ${i} 哈希与清单不符，终止传输（内容级异常）`, 'error')
+          tx.state = 'error'
+          this.emit({ fid: tx.fid, dir: 'recv', state: 'error', done: bitmapCount(tx.have), total: tx.n, name: tx.name })
+          this.io.abort(tx.fid).catch(() => {})
+          this.net.sendCtl(peerId, { op: 'fx-cancel', fid: tx.fid, why: 'hash-mismatch' }).catch(() => {})
+          return
+        }
+      }
       await this.io.write(tx.fid, i, tx.cs, pt)
       bitmapSet(tx.have, i)
       tx.lastProgressAt = Date.now()
@@ -578,7 +686,11 @@ export class FileX {
   onCtl(peerId, f) {
     if (!f?.op) return
     if (f.op === 'fx-offer') this.onOffer(peerId, f).catch((e) => this.log(`接收初始化失败：${e?.message || e}`, 'error'))
-    else if (f.op === 'fx-have') this.onHave(peerId, f)
+    else if (f.op === 'fx-have') {
+      // P2-1 能力探测回包（接收方无此 fid 的事务）
+      if (f.probe && this.capsWaiters?.has(f.fid)) { this.capsWaiters.get(f.fid)(f.caps || {}); return }
+      this.onHave(peerId, f)
+    }
     else if (f.op === 'fx-done') this.onDone(peerId, f)
     else if (f.op === 'fx-cancel') this.onCancel(peerId, f).catch(() => {})
   }

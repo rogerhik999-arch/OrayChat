@@ -9,6 +9,7 @@ const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell } = require(
 const path = require('node:path')
 const fs = require('node:fs')
 const crypto2 = require('node:crypto')
+const zlib = require('node:zlib')
 
 const argv = {}
 for (const a of process.argv.slice(2)) {
@@ -185,7 +186,7 @@ function registerIpc() {
     return true
   })
 
-  ipcMain.handle('fx:finalize', async (_e, fid, shaHex, name) => {
+  ipcMain.handle('fx:finalize', async (_e, fid, shaHex, name, fin) => {
     const id = fxSafe(fid)
     const part = fxPart(id)
     try {
@@ -197,11 +198,31 @@ function registerIpc() {
         rs.on('error', reject)
       })
       if (hash.digest('hex') !== String(shaHex)) return { ok: false, why: 'sha-mismatch' }
-      // 完整性通过：改名为内容寻址文件，附带原始扩展名便于识别
       const ext = path.extname(String(name || '')).slice(0, 16)
-      fs.renameSync(part, fxDone(id) + ext)
+      const dest = fxDone(id) + ext
+      // P2-1 流压缩：.part 是整文件 deflate 流——解压后终检原始哈希再落盘
+      if (fin?.alg === 'deflate') {
+        const chunks = []
+        const rawHash = crypto2.createHash('sha256')
+        await new Promise((resolve, reject) => {
+          const rs = fs.createReadStream(part)
+          const inf = zlib.createInflateRaw()
+          inf.on('data', (d) => { chunks.push(d); rawHash.update(d) })
+          inf.on('end', resolve)
+          inf.on('error', reject)
+          rs.pipe(inf)
+        })
+        const raw = Buffer.concat(chunks)
+        if (rawHash.digest('hex') !== String(fin.rawSha)) return { ok: false, why: 'raw-sha-mismatch' }
+        fs.writeFileSync(dest, raw, { mode: 0o600 })
+        try { fs.unlinkSync(part) } catch { /* 忽略 */ }
+        try { fs.unlinkSync(fxMeta(id)) } catch { /* 忽略 */ }
+        return { ok: true, path: dest }
+      }
+      // 完整性通过：改名为内容寻址文件，附带原始扩展名便于识别
+      fs.renameSync(part, dest)
       try { fs.unlinkSync(fxMeta(id)) } catch { /* 忽略 */ }
-      return { ok: true, path: fxDone(id) + ext }
+      return { ok: true, path: dest }
     } catch (e) {
       return { ok: false, why: e?.message || 'io' }
     }
