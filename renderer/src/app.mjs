@@ -17,6 +17,7 @@ const state = {
   // 当前视图：{conv:'lobby'} 或 {conv:'dm', peerId}
   view: { conv: 'lobby' },
   names: new Map(), // idPubHex -> 显示名（含自己），本地文件持久化
+  ignoredIds: new Set(), // 已删除的联系人（本机不再出现在历史名录；对方上线互联即自动恢复）
   logData: null, // 登录时从主进程文件 KV 读入的共享日志
   unread: new Map(), // 会话键(viewKey) -> 未读数
 }
@@ -176,15 +177,15 @@ function onlinePeerIdByPub(idPubHex) {
 
 function buildRoster() {
   const seen = new Map() // idPubHex -> {name}
-  // a) 名字映射（含自己）
+  // a) 名字映射（含自己）；已删除的联系人（ignoredIds）不再出现在历史名录
   for (const [id, n] of state.names) {
-    if (id === state.myIdPubHex) continue
+    if (id === state.myIdPubHex || state.ignoredIds.has(id)) continue
     seen.set(id, { name: n })
   }
   // b) 大厅 + 所有 DM 日志里出现过的作者
   for (const c of state.net?.store?.convs?.values() || []) {
     for (const e of c.entries.values()) {
-      if (e.author && e.author !== state.myIdPubHex && !seen.has(e.author)) {
+      if (e.author && e.author !== state.myIdPubHex && !state.ignoredIds.has(e.author) && !seen.has(e.author)) {
         seen.set(e.author, { name: authorName(e.author) })
       }
     }
@@ -292,7 +293,10 @@ function renderChatHead() {
   if (state.view.conv === 'dm-offline') {
     $('chatTitle').textContent = state.view.name || '历史联系人'
     $('chatSub').textContent = '该成员当前离线 · 以下为本机保存的聊天记录（30 天内）；对方上线互连后可继续聊天'
-    $('chatBadges').innerHTML = `<span class="badge">📴 离线</span><span class="badge">保留 30 天</span>`
+    $('chatBadges').innerHTML = `<span class="badge">📴 离线</span><span class="badge">保留 30 天</span>` +
+      `<button id="delContactBtn" class="ghost danger">删除联系人</button>`
+    const dbtn = $('delContactBtn')
+    if (dbtn) dbtn.onclick = () => confirmThenDeleteContact(state.view.idPubHex, state.view.name)
     return
   }
   const readyCount = state.net ? [...state.net.peers.values()].filter((p) => p.state === 'ready').length : 0
@@ -506,6 +510,47 @@ async function deleteMessage(mid) {
   } catch (e) { appendSys(`删除失败：${e.message}`) }
 }
 
+// ---------- 删除联系人（僵尸历史条目清理） ----------
+// 本机删除：私聊分桶（含旧身份合并桶）+ 名字映射 + 未读一并清除；该身份进
+// ignoredIds 不再出现在历史名录。对方真上线互联或发来私聊即自动恢复显示 ——
+// 删除只是"不再保留这个人的痕迹"，不是拉黑；大厅公共记录不受影响（那是全员日志）。
+function persistIgnoredIds() {
+  window.oray.kvSet(`oc-ignored-ids:${state.room}`, [...state.ignoredIds]).catch(() => {})
+}
+
+function reviveIgnored(pub) {
+  if (pub && state.ignoredIds.delete(pub)) persistIgnoredIds()
+}
+
+function confirmThenDeleteContact(idPubHex, name) {
+  const btn = $('delContactBtn')
+  if (!btn) return
+  if (btn.dataset.confirm) {
+    delete btn.dataset.confirm
+    btn.textContent = '删除联系人'
+    doDeleteContact(idPubHex, name)
+    if (state.view.conv === 'dm-offline') selectView({ conv: 'lobby' })
+  } else {
+    btn.dataset.confirm = '1'
+    btn.textContent = '再次点击确认删除（含聊天记录）'
+    setTimeout(() => { if (btn.isConnected) { delete btn.dataset.confirm; btn.textContent = '删除联系人' } }, 3000)
+  }
+}
+
+function doDeleteContact(idPubHex, name) {
+  const who = name || `${idPubHex.slice(0, 8)}…`
+  for (const k of state.net.dmMergedBucketKeys(idPubHex)) state.net.store.dropConv(k)
+  if (state.names.delete(idPubHex)) window.oray.kvSet(`oc-names:${state.room}`, Object.fromEntries(state.names)).catch(() => {})
+  state.ignoredIds.add(idPubHex)
+  persistIgnoredIds()
+  clearUnread(dmConvKey(state.myIdPubHex, idPubHex))
+  appendSys(`已删除联系人 ${who}：本机私聊记录一并清除；对方上线互联会重新出现在在线列表`)
+  if (state.args.bot) {
+    window.oray.botLog(`[BOT] CONTACT-DELETED pub=${idPubHex}`)
+    window.oray.botLog(`[BOT] ROSTER ${buildRoster().map((r) => r.id.slice(0, 8)).join(',') || '(empty)'}`)
+  }
+}
+
 async function confirmThenClear() {
   const btn = $('clearBtn')
   if (btn.dataset.confirm) {
@@ -555,6 +600,7 @@ async function doLogin(name, room) {
   await loadNames()
   saveName(state.myIdPubHex, name)
   state.idAliases = await window.oray.kvGet(`oc-id-aliases:${room}`).catch(() => null) || {}
+  state.ignoredIds = new Set(await window.oray.kvGet(`oc-ignored-ids:${room}`).catch(() => []) || [])
   state.logData = await window.oray.kvGet(`oc-log2:${room}`)
   // 登录历史：按昵称记住房间
   await upsertLogin(name, room)
@@ -621,6 +667,7 @@ function netHooks() {
       renderPeers()
     },
     onPeerReady: (peerId, p) => {
+      reviveIgnored(p.idPubHex) // 已删除的联系人上线互联：自动恢复显示
       saveName(p.idPubHex, p.name)
       if (state.view.conv === 'dm' && state.view.peerId === peerId) {
         $('input').disabled = false
@@ -642,6 +689,7 @@ function netHooks() {
       }
       // 未读与通知：不在当前会话或窗口失焦时计数；失焦时弹系统通知（主进程按对端 10s 节流）
       // 会话键走身份解析（dmViewKey）：对端若换了身份密钥，旧会话/新会话的未读都落在同一视图键
+      reviveIgnored(p.idPubHex) // 已删除的联系人发来消息：自动恢复显示
       const convKey = msg.conv === 'lobby' ? 'lobby'
         : (p.idPubHex ? state.net.dmViewKey(p.idPubHex) : state.net.storeKey('dm', peerId))
       const isCurrent = convKey === viewKey()
@@ -687,6 +735,7 @@ function netHooks() {
       renderPeers()
     },
     onPeerName: (peerId, p, idPubHex, name) => {
+      reviveIgnored(idPubHex) // 对端同步传播来的名字：视为主动恢复
       if (saveName(idPubHex, name)) { renderConv(); renderPeers() }
       if (state.args.bot) window.oray.botLog(`[BOT] NAME name=${JSON.stringify(name)} id=${idPubHex.slice(0, 8)}…`)
     },
@@ -957,6 +1006,15 @@ async function main() {
           window.oray.botLog(`[BOT] TRY-DIRECT ok=${r.ok} detail=${JSON.stringify(r.detail)} path=${ready[1].path}`)
         } catch (e) { window.oray.botLog(`[BOT] TRY-DIRECT error=${e.message}`) }
       }, Number(state.args['try-direct-after-ms']))
+    }
+    if (state.args['del-contact']) {
+      // 注入器：按昵称删除联系人（实机验证名录抑制/桶清除/上线恢复）
+      const delay = Number(state.args['del-contact-after-ms']) || 8000
+      setTimeout(() => {
+        const target = [...state.names.entries()].find(([, n]) => n === state.args['del-contact'])
+        if (!target) { window.oray.botLog(`[BOT] CONTACT-NOTFOUND name=${state.args['del-contact']}`); return }
+        doDeleteContact(target[0], target[1])
+      }, delay)
     }
   } else {
     // 人类模式：显示登录界面，预填房间，聚焦昵称，显示版本与本机保存的登录

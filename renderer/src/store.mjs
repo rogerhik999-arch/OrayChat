@@ -125,6 +125,14 @@ export class LogStore {
     return this.visible(key).find((e) => e.text.includes(substr)) || null
   }
 
+  // 删除整个分桶（本机"删除联系人"用；只影响本机数据，不影响对端）
+  dropConv(key) {
+    if (!this.convs.has(key)) return false
+    this.convs.delete(key)
+    this.#changed(key)
+    return true
+  }
+
   // 导出单个会话状态（用于同步给对端；只含保留期内数据，确定性排序保证两端字节一致）
   exportConv(key) {
     const c = this.conv(key)

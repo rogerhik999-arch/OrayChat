@@ -119,4 +119,17 @@ function bareNet({ names = {}, aliases = {}, myName = 'mac' } = {}) {
   assert.equal(net.store.visible(K_old).length, 0, '清空应覆盖旧身份桶')
 }
 
-console.log('identity-merge.test.mjs ✓ 全部通过（旧身份归并 / 链拍平 / 桶合并 / 跨桶删除清空）')
+// ---- 7) dropConv：删除联系人 = 清除相关分桶（幂等、未知键安全） ----
+{
+  const { net } = bareNet({ aliases: { [X1]: X3 } })
+  const base = Date.now() - 60000
+  net.store.addMsg(dmConvKey(ME, X3), { mid: 'm1', author: X3, text: 'a', t: base + 1000 })
+  net.store.addMsg(dmConvKey(ME, X1), { mid: 'm2', author: X1, text: 'b', t: base + 2000 })
+  net.store.addMsg('lobby', { mid: 'm3', author: X3, text: 'lobby msg', t: base + 3000 })
+  for (const k of net.dmMergedBucketKeys(X3)) net.store.dropConv(k)
+  assert.equal(net.store.convs.size, 1, '删除联系人后仅剩大厅桶')
+  assert.ok(net.store.convs.has('lobby') && net.store.visible('lobby').length === 1, '大厅公共记录不受影响')
+  assert.equal(net.store.dropConv('dm:nonexistent'), false, '未知键幂等安全')
+}
+
+console.log('identity-merge.test.mjs ✓ 全部通过（旧身份归并 / 链拍平 / 桶合并 / 跨桶删除清空 / dropConv）')
