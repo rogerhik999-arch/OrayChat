@@ -256,17 +256,15 @@ export class ChatNet {
 
   iAmInitiator(peerId) { return selfId < peerId }
 
-  // make-before-break：就绪会话的传输切换（如中继→直连升级）后，旧路径在
-  // 宽限期内继续接收 —— 同一 ctx 密钥下双路并行，重复帧由序号去重兜住，
-  // 消除切换窗口的丢帧。非就绪状态（重握手中）严格匹配当前路径。
+  // make-before-break：就绪会话期间，任意传输路径的帧都接收 —— 发送方各自
+  // 选路（升级有先后），接收方就绪即全收；同一 ctx 密钥下两路皆可信，
+  // 重复帧由信封序号/帧 txid 去重兜住。非就绪（重握手中）严格匹配当前
+  // 路径，避免旧会话的滞留帧干扰新握手。
+  // （v1.12.2 曾用"宽限期旧路径"实现，但升级竞态下对端先切直连发送、
+  //  本侧未升级即拒收 → 整段消息丢失；改为就绪全收。）
   acceptsVia(peer, via) {
-    if (peer.via === via) return true
-    if (peer.state === 'ready' && peer.legacyVia === via && Date.now() < (peer.legacyUntil || 0)) return true
-    return false
-  }
-  markLegacyVia(peer) {
-    peer.legacyVia = peer.via
-    peer.legacyUntil = Date.now() + 10000
+    if (via === peer.via) return true
+    return peer.state === 'ready'
   }
 
   ensurePeer(peerId, via) {
@@ -290,7 +288,6 @@ export class ChatNet {
     if (existing) {
       // 中继会话对端现在可以直连了 → 升级
       if (existing.via === 'mqtt' && existing.lockVia !== 'mqtt') {
-        this.markLegacyVia(existing) // make-before-break：旧中继路径宽限接收
         existing.via = 'p2p'
         existing.pc = this.room.getPeers()[peerId] || null
         this.attachConnectionWatch(peerId)
