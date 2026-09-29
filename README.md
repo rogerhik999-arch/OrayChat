@@ -172,6 +172,8 @@ npm run check:services   # 公共服务连通性探测（STUN Binding / TURN All
   实施路径见 [docs/mobile-background.md](docs/mobile-background.md)
 - **网络健壮性增强**（多 broker 并联、周期性反熵、SWIM 完整化、消息 ACK 等）
   的调研与实施路线见 [docs/robust-network-roadmap.md](docs/robust-network-roadmap.md)
+- **文件稳定传输**（拥塞控制/FEC/BitTorrent 工程学/WebRTC 通道特性等理论调研
+  与 P0-P3 落地路线）见 [docs/file-transfer-research.md](docs/file-transfer-research.md)
 - 文件传输（v1.17.0）已支持私聊 1:1：协议级 deflate 压缩 + 断点续传（分片位图持久化）
   + 图片默认 WebP 格式压缩（可勾"原图"）；字节不进共享日志（本机保存，日志仅元数据+缩略图）
 - 多设备登录同一身份未支持
