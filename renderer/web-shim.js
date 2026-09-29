@@ -58,6 +58,9 @@
       return true
     },
 
+    setUnread: () => {},
+    notifyMsg: () => { /* Web 版通知走 Notification API 由上层自理 */ },
+
     botLog: (line) => console.log(line),
     botExit: (code) => console.log(`[botExit] ${code}`),
     captureWindow: async () => null,

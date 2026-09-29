@@ -21,6 +21,30 @@ const IS_BOT = !!argv.bot
 
 let tray = null
 let isQuiting = false // 区分“关窗隐藏到托盘”与“真正退出”
+let unreadCount = 0
+const notifyThrottle = new Map() // peerKey -> lastTs（每对端 10s 一条通知）
+
+function updateBadges() {
+  // macOS：Dock 角标 + 托盘标题（模板图旁的数字）
+  try {
+    if (process.platform === 'darwin') {
+      if (app.dock) app.dock.setBadge(unreadCount > 0 ? String(unreadCount) : '')
+      tray?.setTitle(unreadCount > 0 ? String(unreadCount) : '')
+    }
+  } catch { /* 忽略 */ }
+  try { tray?.setToolTip(`OrayChat — 私有 P2P 加密聊天${unreadCount > 0 ? `（${unreadCount} 条未读）` : '（运行中）'}`) } catch { /* 忽略 */ }
+}
+
+function showMessageNotification({ title, body, peerKey }) {
+  const now = Date.now()
+  if (notifyThrottle.get(peerKey) && now - notifyThrottle.get(peerKey) < 10000) return
+  notifyThrottle.set(peerKey, now)
+  try {
+    const n = new Notification({ title: title || 'OrayChat', body: body || '新消息' })
+    n.on('click', showMainWindow)
+    n.show()
+  } catch { /* 通知不可用时退化为仅角标 */ }
+}
 
 app.setName('OrayChat')
 app.setPath('userData', path.join(app.getPath('appData'), 'OrayChat', PROFILE))
@@ -171,7 +195,21 @@ function registerIpc() {
   ipcMain.handle('settings:open-main', () => { showMainWindow() })
   ipcMain.handle('settings:open', () => { createSettingsWindow() })
   ipcMain.on('win:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
+  ipcMain.on('unread:update', (_e, n) => {
+    unreadCount = Math.max(0, Number(n) || 0)
+    updateBadges()
+  })
+  ipcMain.on('notify:msg', (_e, { title, body, peerKey }) => {
+    showMessageNotification({ title, body, peerKey })
+  })
   ipcMain.on('win:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
+  ipcMain.on('unread:update', (_e, n) => {
+    unreadCount = Math.max(0, Number(n) || 0)
+    updateBadges()
+  })
+  ipcMain.on('notify:msg', (_e, { title, body, peerKey }) => {
+    showMessageNotification({ title, body, peerKey })
+  })
 }
 
 function createWindow() {
@@ -269,6 +307,8 @@ function showMainWindow() {
     if (win.isMinimized()) win.restore()
     win.show()
     win.focus()
+    // Windows 任务栏闪烁提醒（窗口曾隐藏时）
+    if (process.platform === 'win32') win.flashFrame(false)
   } else createWindow()
 }
 
@@ -277,7 +317,7 @@ function createTray() {
   // 注意：setTemplateImage 必须放在任何 resize 之后 —— resize 返回新图像会丢失模板标记
   const p = process.platform === 'darwin'
     ? path.join(__dirname, 'assets', 'trayTemplate.png')   // 22px，另有 @2x 44px 自动适配视网膜屏
-    : path.join(__dirname, 'assets', 'tray-color.png')      // 32px
+    : path.join(__dirname, 'assets', 'tray-win.png')        // 32px 满幅加粗版（Windows 小尺寸醒目）
   let icon = nativeImage.createFromPath(p)
   if (icon.isEmpty()) {
     process.stdout.write(`[tray] 警告：托盘图标资源缺失 ${p}\n`)

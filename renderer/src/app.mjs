@@ -18,6 +18,7 @@ const state = {
   view: { conv: 'lobby' },
   names: new Map(), // idPubHex -> 显示名（含自己），本地文件持久化
   logData: null, // 登录时从主进程文件 KV 读入的共享日志
+  unread: new Map(), // 会话键(viewKey) -> 未读数
 }
 
 // ---------- 工具 ----------
@@ -136,6 +137,31 @@ function viewKey(v = state.view) {
 }
 function viewWireConv(v = state.view) { return v.conv === 'lobby' ? 'lobby' : 'dm' }
 
+// ---------- 未读提醒 ----------
+
+function unreadBadge(convKey) {
+  const n = state.unread.get(convKey) || 0
+  return n > 0 ? ` <span class="unread-badge">${n > 99 ? '99+' : n}</span>` : ''
+}
+
+function bumpUnread(convKey, n = 1) {
+  state.unread.set(convKey, (state.unread.get(convKey) || 0) + n)
+  const total = [...state.unread.values()].reduce((a, b) => a + b, 0)
+  window.oray.setUnread?.(total)
+  renderPeers()
+}
+
+function clearUnread(convKey) {
+  if (state.unread.delete(convKey)) {
+    const total = [...state.unread.values()].reduce((a, b) => a + b, 0)
+    window.oray.setUnread?.(total)
+    renderPeers()
+  }
+}
+
+// 窗口获得焦点：清除当前会话未读（其余会话保留）
+window.addEventListener('focus', () => { if (state.net) clearUnread(viewKey()) })
+
 // ---------- 名录（roster）：房间出现过的所有人 ----------
 // 来源：oc-names 映射（握手 + 同步帧学习）∪ 共享日志里的作者公钥。
 // 在线状态：有就绪会话 = 在线；否则离线（仍可点开查看历史）。
@@ -196,7 +222,7 @@ function renderPeers() {
   lobby.innerHTML = `
     <div class="avatar" style="background:#3b5b8f">🏛️</div>
     <div class="p-info">
-      <div class="p-name">大厅 · ${esc(state.room)}</div>
+      <div class="p-name">大厅 · ${esc(state.room)}${unreadBadge('lobby')}</div>
       <div class="p-state"><span class="dot ${readyCount ? 'ok' : 'off'}"></span>${readyCount} 人在线 · 全员可见</div>
     </div>`
   lobby.onclick = () => selectView({ conv: 'lobby' })
@@ -223,7 +249,7 @@ function renderPeers() {
     li.innerHTML = `
       <div class="avatar" style="background:${avatarColor(peerId)}">${esc(name.slice(0, 1).toUpperCase())}</div>
       <div class="p-info">
-        <div class="p-name">${esc(name)}</div>
+        <div class="p-name">${esc(name)}${unreadBadge(state.net.storeKey('dm', peerId))}</div>
         <div class="p-state"><span class="dot ${dotCls}"></span>${esc(stateText)}</div>
       </div>`
     li.onclick = () => selectView({ conv: 'dm', peerId })
@@ -243,7 +269,7 @@ function renderPeers() {
       li.innerHTML = `
         <div class="avatar" style="background:${avatarColor(r.id)}; opacity:.55">${esc(r.name.slice(0, 1).toUpperCase())}</div>
         <div class="p-info">
-          <div class="p-name">${esc(r.name)}</div>
+          <div class="p-name">${esc(r.name)}${unreadBadge(dmConvKey(state.myIdPubHex, r.id))}</div>
           <div class="p-state"><span class="dot off"></span>离线 · 点开查看聊天记录</div>
         </div>`
       li.onclick = () => selectView({ conv: 'dm-offline', idPubHex: r.id, name: r.name })
@@ -441,6 +467,7 @@ function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages()
 function selectView(v) {
   state.view = v
   document.body.classList.remove('sidebar-open') // 手机上选中即收起侧栏
+  clearUnread(viewKey(v))
   renderConv()
   renderPeers()
   const canSend = v.conv !== 'dm-offline' && (v.conv === 'lobby' || state.net?.peers.get(v.peerId)?.state === 'ready')
@@ -574,6 +601,21 @@ function netHooks() {
       if (state.args.bot) {
         if (msg.conv === 'lobby') window.oray.botLog(`[BOT] LOBBY-RECV from=${p.name} text=${JSON.stringify(msg.text)}`)
         else window.oray.botLog(`[BOT] RECV from=${p.name} text=${JSON.stringify(msg.text)}`)
+      }
+      // 未读与通知：不在当前会话或窗口失焦时计数；失焦时弹系统通知（主进程按对端 10s 节流）
+      const convKey = state.net.storeKey(msg.conv, peerId)
+      const isCurrent = convKey === viewKey()
+      const focused = document.hasFocus() && !document.hidden
+      if (!isCurrent || !focused) {
+        bumpUnread(convKey)
+        if (!focused) {
+          window.oray.notifyMsg?.({
+            title: msg.conv === 'lobby' ? `${p.name || '成员'} · 大厅` : (p.name || '新消息'),
+            body: String(msg.text || '').slice(0, 60),
+            peerKey: convKey,
+          })
+        }
+        if (state.args.bot) window.oray.botLog(`[BOT] UNREAD total=${[...state.unread.values()].reduce((a, b) => a + b, 0)}`)
       }
       botOnMessage(peerId, p, msg)
     },

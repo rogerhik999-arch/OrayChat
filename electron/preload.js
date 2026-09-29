@@ -18,6 +18,10 @@ contextBridge.exposeInMainWorld('oray', {
   kvSet: (key, val) => ipcRenderer.invoke('kv:set', key, val),
 
   // 测试/诊断
+  // 未读与通知
+  setUnread: (n) => ipcRenderer.send('unread:update', n),
+  notifyMsg: ({ title, body, peerKey }) => ipcRenderer.send('notify:msg', { title, body, peerKey }),
+
   botLog: (line) => ipcRenderer.send('bot:log', line),
   botExit: (code) => ipcRenderer.send('bot:exit', code),
   captureWindow: () => ipcRenderer.invoke('win:capture'),

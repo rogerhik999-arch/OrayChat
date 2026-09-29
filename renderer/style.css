@@ -252,3 +252,10 @@ button.ghost.warn2:hover { background: #3a2d1c; }
   letter-spacing: .8px; text-transform: none; list-style: none;
 }
 .peer-item.offline { opacity: .82; }
+
+/* 未读徽标 */
+.unread-badge {
+  display: inline-block; min-width: 18px; padding: 1px 5px; border-radius: 9px;
+  background: var(--err); color: #fff; font-size: 10.5px; font-weight: 700;
+  text-align: center; vertical-align: middle; margin-left: 2px;
+}
