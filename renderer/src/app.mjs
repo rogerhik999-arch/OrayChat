@@ -213,6 +213,7 @@ function renderPeers() {
         : p.path === 'relay' ? '已加密 · TURN中继' : '已加密 · P2P直连',
       failed: `握手失败：${p.lastError || '未知'}`,
     }[p.state] || p.state
+    if (p.state === 'ready' && p.suspect) stateText += ' · 疑似离线，确认中…'
     if (p.state === 'ready' && p.lastSeen) {
       const ago = Math.max(0, Math.round((Date.now() - p.lastSeen) / 1000))
       stateText += ago <= 20 ? ` · ${ago}s 前在线报告` : ` · ⚠ ${ago}s 未报告`
@@ -571,6 +572,9 @@ function netHooks() {
       if (state.args.bot) window.oray.botLog(`[BOT] GO-ONLINE reason=${JSON.stringify(reason)}`)
       renderPeers()
     },
+    onAck: (peerId, k) => {
+      if (state.args.bot) window.oray.botLog(`[BOT] ACK from=${state.net?.peers.get(peerId)?.name || peerId.slice(0, 8)} k=${k}`)
+    },
     onPresence: (peerId, p) => {
       if (state.args.bot) window.oray.botLog(`[BOT] PRESENCE from=${p.name}`)
       renderPeers()
@@ -785,7 +789,7 @@ async function main() {
       // 模拟网络拓扑变化：中继与 WebRTC 同时被切断（等价 Wi-Fi 切换）
       setTimeout(() => {
         window.oray.botLog('[BOT] TOPO-CHANGE 注入：杀 relay + 全部 pc')
-        try { state.net.relay.forceReconnect(); state.net.relay.client?.end(true) } catch { /* 忽略 */ }
+        try { state.net.relay.forceReconnect() } catch { /* 忽略 */ }
         for (const [, pp] of state.net.peers) { try { pp.pc?.close() } catch { /* 忽略 */ } }
         // 触发一次 connectionstatechange（pc.close 会发，但保险起见手动）
         setTimeout(() => state.net.goOnline('拓扑变化注入'), 1000)

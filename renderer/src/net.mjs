@@ -18,6 +18,9 @@ import { LogStore, dmConvKey } from './store.mjs'
 
 const APP_ID = 'oraychat-p2p-v1'
 const HANDSHAKE_TIMEOUT_MS = 15000
+const ANTI_ENTROPY_MS = 5 * 60 * 1000 // 周期性反熵全量对账
+const ACK_TIMEOUT_MS = 3000
+const ACK_MAX_RETRIES = 3
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000
 const PRESENCE_HEARTBEAT_MS = 15000
 
@@ -97,6 +100,11 @@ export class ChatNet {
     this.directProbeTimer = setInterval(() => this.probeDirectUpgrades(), 45000)
     // 失败会话周期性重试（60s）：修复"一侧显示失败、另一侧看不到"的单向可见
     this.retryFailedTimer = setInterval(() => this.retryFailedSessions(), 60000)
+    // 周期性反熵（5 分钟 + 抖动）：向随机就绪对端全量对账，保证长在线期间
+    // 删除传播与离线消息也收敛（Dynamo 式 anti-entropy，CRDT 合并天然幂等）
+    this.antiEntropyTimer = setInterval(() => this.runAntiEntropy(), ANTI_ENTROPY_MS + Math.floor(Math.random() * 30000))
+    // 消息级 ACK 簿记：'peerId:seq' -> {envelope, via, tries, timer}
+    this.pendingAcks = new Map()
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -108,6 +116,7 @@ export class ChatNet {
       onAnnounce: (id, info) => this.onRelayAnnounce(id, info),
       onFrame: (from, kind, data) => this.onRelayFrame(from, kind, data),
       onPeerGone: (id) => this.onRelayGone(id),
+      onPeerSuspect: (id) => this.onRelaySuspect(id),
       onLog: (m, lv) => this.hooks.onLog?.(m, lv),
     })
 
@@ -210,6 +219,7 @@ export class ChatNet {
 
   dropPeer(peerId, peer) {
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
+    this.clearAcksFor(peerId)
     this.clearRetransmit(peer)
     if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
     if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
@@ -252,6 +262,31 @@ export class ChatNet {
     this.dropPeer(peerId, peer)
   }
 
+  // SWIM 怀疑：presence 超时 → 先 ping 直接确认（20s 宽限期内可被 pong/digest 复活）
+  onRelaySuspect(peerId) {
+    const peer = this.peers.get(peerId)
+    if (!peer || peer.state !== 'ready') return
+    peer.suspect = true
+    this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… presence 超时，ping 确认中`, 'warn')
+    try {
+      const ping = { op: 'ping', n: oc.newMid() }
+      if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', ping)
+      else this.ctlAction?.send(ping, { target: peerId }).catch(() => {})
+    } catch { /* 宽限期后由 prune 判死 */ }
+  }
+
+  // 周期性反熵：向随机就绪对端推送大厅+私聊全量状态（CRDT 幂等合并）
+  runAntiEntropy() {
+    if (this.destroyed) return
+    const ready = this.readyPeerIds()
+    if (!ready.length) return
+    const peerId = ready[Math.floor(Math.random() * ready.length)]
+    const name = this.peers.get(peerId)?.name || peerId.slice(0, 8)
+    this.hooks.onLog?.(`反熵对账 → ${name}（全量状态同步）`)
+    this.pushSync(peerId, 'lobby')
+    this.pushSync(peerId, 'dm')
+  }
+
   // ---------- E2EE 握手状态机（传输无关） ----------
 
   startHandshake(peerId) {
@@ -292,6 +327,7 @@ export class ChatNet {
   restartHandshake(peerId, via) {
     const peer = this.peers.get(peerId)
     if (!peer) return
+    this.clearAcksFor(peerId) // 旧会话 seq 作废，簿记一并清除
     this.clearRetransmit(peer)
     peer.lastHs1Key = null
     peer.cachedHs2 = null
@@ -305,7 +341,7 @@ export class ChatNet {
   handleHandshakeTimeout(peerId) {
     const peer = this.peers.get(peerId)
     if (!peer) return
-    if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.client?.connected) {
+    if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.connected) {
       this.hooks.onLog?.(`P2P 握手超时，切换到 MQTT 中继回退 (${peerId.slice(0, 8)}…)`, 'warn')
       this.restartHandshake(peerId, 'mqtt')
       return
@@ -399,6 +435,7 @@ export class ChatNet {
     if (!peer || !peer.ctx) return
     if (peer.state === 'ready') return // 重复 hs3/hs3ack 幂等
     peer.state = 'ready'
+    peer.suspect = false
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
     if (peer.ctx.peerName) this.peerNames.set(peer.idPubHex, peer.ctx.peerName)
@@ -468,17 +505,67 @@ export class ChatNet {
       this.hooks.onLog?.(`收到未握手对端 ${peerId.slice(0, 8)}… 的消息，已丢弃`, 'warn')
       return
     }
+    // 重复帧（多链路并联/发送端 ACK 重传）按序号识别：静默补 ACK 让对端停止重传
     try {
       const { text, t, mid, conv } = oc.open(peer.ctx, envelope)
       peer.lastSeen = Date.now()
+      this.relay?.markAlive(peerId) // 消息到达 = 存活证据（撤销 SWIM 怀疑）
       if (mid) {
         this.store.addMsg(this.storeKey(conv, peerId), {
           mid, author: peer.idPubHex || oc.hex(peer.ctx.peerIdPub), text, t,
         })
       }
+      this.sendAckBack(peerId, envelope.s, via)
       this.hooks.onMessage?.(peerId, peer, { conv, text, mid, t })
     } catch (e) {
+      if (/序号/.test(String(e?.message))) {
+        this.sendAckBack(peerId, envelope.s, via) // 重复帧：补 ACK，不告警
+        return
+      }
       this.hooks.onLog?.(`解密失败（密文被篡改或密钥不一致）：${e?.message || e}`, 'error')
+    }
+  }
+
+  // ---------- 消息级 ACK（QoS0 之上的应用层送达保证） ----------
+
+  sendAckBack(peerId, seq, via) {
+    const peer = this.peers.get(peerId)
+    if (!peer || peer.state !== 'ready' || !seq) return
+    try {
+      const frame = { op: 'ack', k: seq }
+      if (via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
+      else this.ctlAction?.send(frame, { target: peerId }).catch(() => {})
+    } catch { /* ACK 失败无妨，发送端超时重传 */ }
+  }
+
+  trackAck(peerId, envelope, via) {
+    const key = `${peerId}:${envelope.s}`
+    const entry = { envelope, via, tries: 0, timer: null }
+    const fire = () => {
+      const cur = this.pendingAcks.get(key)
+      if (!cur) return
+      if (cur.tries >= ACK_MAX_RETRIES) {
+        this.pendingAcks.delete(key)
+        this.hooks.onLog?.(`消息未收到确认（已重试 ${ACK_MAX_RETRIES} 次）：可能未送达 ${this.peers.get(peerId)?.name || peerId.slice(0, 8)}…`, 'warn')
+        return
+      }
+      cur.tries++
+      try {
+        if (cur.via === 'mqtt') this.relay.send(peerId, 'msg', cur.envelope)
+        else this.msgAction?.send(cur.envelope, { target: peerId }).catch(() => {})
+      } catch { /* 链路断开：保留簿记，链路恢复后对端上线同步兜底 */ }
+      cur.timer = setTimeout(fire, ACK_TIMEOUT_MS)
+    }
+    entry.timer = setTimeout(fire, ACK_TIMEOUT_MS)
+    this.pendingAcks.set(key, entry)
+  }
+
+  clearAcksFor(peerId) {
+    for (const [key, a] of this.pendingAcks) {
+      if (key.startsWith(`${peerId}:`)) {
+        clearTimeout(a.timer)
+        this.pendingAcks.delete(key)
+      }
     }
   }
 
@@ -500,6 +587,7 @@ export class ChatNet {
       this.hooks.onWireSend?.(peerId, envelope)
       if (peer.via === 'mqtt') this.relay.send(peerId, 'msg', envelope)
       else await this.msgAction.send(envelope, { target: peerId })
+      this.trackAck(peerId, envelope, peer.via) // 未确认则 3s 重传（最多 3 次）
     }
     return { mid, count: targets.length }
   }
@@ -546,8 +634,33 @@ export class ChatNet {
     if (!peer || peer.via !== via || peer.state !== 'ready') return
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
+      this.relay?.markAlive(peerId) // 心跳即存活证据（SWIM：任意消息撤销怀疑）
       this.hooks.onPresence?.(peerId, peer)
       this.absorbDigest(peerId, frame.digest)
+      return
+    }
+    if (frame?.op === 'ping') { // SWIM 直接探测：立即回 pong
+      try {
+        const pong = { op: 'pong', n: frame.n }
+        if (via === 'mqtt') this.relay.send(peerId, 'ctl', pong)
+        else this.ctlAction?.send(pong, { target: peerId }).catch(() => {})
+      } catch { /* 忽略 */ }
+      return
+    }
+    if (frame?.op === 'pong') { // 被怀疑方回声：撤销怀疑
+      peer.suspect = false
+      this.relay?.markAlive(peerId)
+      this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… ping 确认存活`)
+      return
+    }
+    if (frame?.op === 'ack' && frame.k !== undefined) { // 消息送达确认
+      const key = `${peerId}:${frame.k}`
+      const a = this.pendingAcks.get(key)
+      if (a) {
+        clearTimeout(a.timer)
+        this.pendingAcks.delete(key)
+        this.hooks.onAck?.(peerId, frame.k)
+      }
       return
     }
     if (frame?.op === 'rehandshake') { // 对端请求重新握手（其为本房间握手发起方）
@@ -622,7 +735,7 @@ export class ChatNet {
   handleConnectionDrop(peerId, st) {
     const peer = this.peers.get(peerId)
     if (!peer) return
-    if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.client?.connected) {
+    if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.connected) {
       this.hooks.onLog?.(`直连 ${st}，自动切换中继 (${peerId.slice(0, 8)}…)`, 'warn')
       this.restartHandshake(peerId, 'mqtt')
       this.hooks.onConnectionLost?.(peerId, peer, '直连已断开（网络变化？），正在经中继自动重连…')
@@ -630,7 +743,7 @@ export class ChatNet {
     }
     // 中继也不可用（网络拓扑变化会同时切断两者）：主动上线自愈 ——
     // 重建中继连接并恢复所有会话；窗口开着的桌面端此前没有任何触发源
-    if (!this.opts.forceRelay && !this.relay?.client?.connected && !this.goOnlineInflight) {
+    if (!this.opts.forceRelay && !this.relay?.connected && !this.goOnlineInflight) {
       this.goOnlineInflight = true
       this.hooks.onConnectionLost?.(peerId, peer, '网络已变化，正在自动重新上线…')
       this.goOnline(`连接断开（${st}）且中继离线`)
@@ -688,6 +801,9 @@ export class ChatNet {
     for (const entry of digest) {
       const [pid, encName] = String(entry).split('|')
       if (!pid || pid === selfId) continue
+      // SWIM 复活：第三方仍看到他在线 → 撤销我方怀疑（ping-req 的等价实现）
+      const known = this.relay?.peers?.get(pid)
+      if (known?.suspectSince) this.relay.markAlive(pid)
       const name = decodeURIComponent(encName || '')
       const existing = this.peers.get(pid)
       if (!existing) {
@@ -842,6 +958,9 @@ export class ChatNet {
     clearInterval(this.sweepTimer)
     clearInterval(this.heartbeatTimer)
     clearInterval(this.retryFailedTimer)
+    clearInterval(this.antiEntropyTimer)
+    for (const [, a] of this.pendingAcks) clearTimeout(a.timer)
+    this.pendingAcks.clear()
     clearInterval(this.directProbeTimer)
     try { this.room?.leave() } catch { /* 忽略 */ }
     this.relay?.destroy()

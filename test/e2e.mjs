@@ -88,7 +88,7 @@ const timer = setInterval(() => {
       p2pOk = (candObj.host || 0) > 0 || (candObj.srflx || 0) > 0
       okChecks.push(['收集到 P2P 候选（host/srflx）', p2pOk, `candidates=${cand}`])
     } else {
-      okChecks.push(['MQTT 公共中继已连接并转发', all.includes('MQTT 中继已连接'), ''])
+      okChecks.push(['MQTT 公共中继已连接并转发', all.includes('中继链路已连接'), ''])
     }
 
     let pass = true
