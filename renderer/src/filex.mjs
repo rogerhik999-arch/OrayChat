@@ -19,7 +19,7 @@
 
 import * as oc from './crypto.mjs'
 
-export const FX_CHUNK_SIZE = 64 * 1024
+export const FX_CHUNK_SIZE = 32 * 1024 // 32KB：中继帧（b64 后 ~43KB）更小，与心跳/presence 交错更好、重传代价低
 export const FX_MAX_SIZE = 200 * 1024 * 1024
 const WINDOW_P2P = 16
 const WINDOW_MQTT = 4
@@ -28,6 +28,8 @@ const HAVE_INTERVAL_MS = 2000 // 接收方位图广播节奏（兼作重传请�
 const INFLIGHT_TIMEOUT_MS = 1500 // 发送块未确认超时 → 重发
 const OFFER_RETRY_MS = 3000 // offer 未获首个 ACK 前的周期重发（offer 只发一次会因丢帧永久卡死）
 const RELAY_FALLBACK_MS = 12000 // p2p 发送零进展超时 → 后续块改走 MQTT 中继（接收方两路全收）
+const RELAY_REBUILD_MS = 20000 // 任意路径无新 ACK 超时 → 重建中继连接 + 重发 offer（防大块帧把心跳挤死后的死锁）
+const RELAY_REBUILD_COOLDOWN_MS = 30000
 const STALL_TIMEOUT_MS = 120000 // 传输整体无进展超时
 
 // ---------- deflate 助手（CompressionStream 全局可用：Electron/现代 WebView/Node 18+） ----------
@@ -67,12 +69,13 @@ export class FileX {
   // opts: { net, io, compress?, offerRetryMs?, relayFallbackMs?, hooks: {onEvent, onIncoming, onLog} }
   // io 适配器（Electron=主进程文件 / Web=内存）：state/write/finalize/read/abort
   // compress(file) → {bytes, w, h, mime, mode}（图片格式压缩；注入便于测试）
-  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, hooks = {} }) {
+  constructor({ net, io, compress, offerRetryMs, relayFallbackMs, relayRebuildMs, hooks = {} }) {
     this.net = net
     this.io = io
     this.compress = compress
     this.offerRetryMs = offerRetryMs || OFFER_RETRY_MS
     this.relayFallbackMs = relayFallbackMs || RELAY_FALLBACK_MS
+    this.relayRebuildMs = relayRebuildMs || RELAY_REBUILD_MS
     this.hooks = hooks
     this.tx = new Map() // fid -> 传输状态（收发同表）
     // 接收方保活：即使发端停滞也周期广播位图（对端重连后立刻拿到续传起点）
@@ -121,6 +124,7 @@ export class FileX {
       acked: 0, inflight: new Map(), // i -> 发送时刻（1.5s 未确认即重发）
       offers: 0, // offer 发送次数（首个 ACK 前周期重发）
       forceRelay: false, // p2p 零进展自动切换：后续块改走 MQTT 中继
+      lastAckAt: 0, // 最近一次收到对端位图/确认的时刻（自愈 3 判据）
       lastProgressAt: Date.now(), startedAt: Date.now(),
       sentHist: [], // [ts, ackedTotal] 速率采样
       caption: caption || file.name, thumb: file.thumb || '',
@@ -155,7 +159,7 @@ export class FileX {
 
   // 滑动窗口泵：每 200ms 扫一遍 —— 对端缺失的块里，未发过或 1.5s 未确认的
   // （丢块/会话抖动自动重发），补足窗口；接收方 fx-have 位图是唯一确认源。
-  // 附带两条自愈：offer 未获 ACK 周期重发；p2p 零进展 12s 自动切中继兜底。
+  // 附带三条自愈：offer 未获 ACK 周期重发；p2p 零进展切中继；无新 ACK 重建中继。
   startPump(fid) {
     const tx = this.tx.get(fid)
     if (!tx || tx.pumpTimer) return
@@ -164,6 +168,7 @@ export class FileX {
       const peer = this.peer(tx.peerId)
       if (!peer || peer.state !== 'ready') return // 会话断开：等 onSessionReady 恢复
       const now = Date.now()
+      const lastLife = Math.max(tx.startedAt, tx.lastAckAt)
       // 自愈 1：首个 ACK 迟迟不到 → 重发 offer（接收方才能建事务、回位图）
       if (tx.acked === 0 && now - tx.startedAt > this.offerRetryMs && now - tx.startedAt < 600000) {
         if (!tx.lastOfferAt || now - tx.lastOfferAt >= this.offerRetryMs) {
@@ -176,6 +181,16 @@ export class FileX {
       if (!tx.forceRelay && peer.via === 'p2p' && tx.acked === 0 && now - tx.startedAt > this.relayFallbackMs) {
         tx.forceRelay = true
         this.log(`传输 ${tx.name}：直连通道无响应，改经 MQTT 中继`, 'warn')
+      }
+      // 自愈 3：任意路径 20s 无新 ACK → 大概率是文件块把心跳/位图帧挤死（QoS0
+      // 拥堵）或会话被对端回收 → 重建中继连接（限频）+ 重发 offer 唤醒接收方
+      if (tx.acked > 0 && tx.acked < tx.n && now - lastLife > this.relayRebuildMs) {
+        if (!tx.lastRebuildAt || now - tx.lastRebuildAt > RELAY_REBUILD_COOLDOWN_MS) {
+          tx.lastRebuildAt = now
+          this.log(`传输 ${tx.name}：通道无响应，重建中继连接并重发传输请求`, 'warn')
+          try { this.net.relay?.forceReconnect?.() } catch { /* 忽略 */ }
+          setTimeout(() => { if (tx.state === 'active') void this.sendOffer(tx.peerId, tx.offer, tx) }, 2500)
+        }
       }
       const window = (peer.via === 'mqtt' || tx.forceRelay) ? WINDOW_MQTT : WINDOW_P2P
       for (const [i, ts] of tx.inflight) {
@@ -269,6 +284,7 @@ export class FileX {
   onHave(peerId, f) {
     const tx = this.tx.get(f?.fid)
     if (!tx || tx.dir !== 'send' || tx.state !== 'active' || !Array.isArray(f.have)) return
+    tx.lastAckAt = Date.now()
     const bm = Uint8Array.from(f.have)
     for (let k = 0; k < tx.n && k < bm.length * 8; k++) {
       if (bitmapHas(bm, k) && !bitmapHas(tx.have, k)) { bitmapSet(tx.have, k); tx.acked++ }
@@ -320,8 +336,17 @@ export class FileX {
     for (const tx of this.tx.values()) {
       if (tx.peerId !== peerId || tx.state !== 'active') continue
       if (tx.dir === 'recv') this.sendHave(peerId, tx.fid)
-      else this.pump(tx.fid)
+      else this.startPump(tx.fid)
     }
+  }
+
+  // 该对端是否有进行中的传输（net.reapGhosts 用：传输中心跳可能被大帧挤死，
+  // 不能据此判死拆会话 —— 拆了 ACK 断流，发送端会卡在半路）
+  hasActiveTransfer(peerId) {
+    for (const tx of this.tx.values()) {
+      if (tx.peerId === peerId && tx.state === 'active') return true
+    }
+    return false
   }
 
   // 数据块入口（net 层双传输汇入）

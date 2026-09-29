@@ -1179,6 +1179,9 @@ export class ChatNet {
     // 我方中继不在线/刚连上：视野不可信，本轮不回收
     if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) return
     for (const [peerId, peer] of [...this.peers.entries()]) {
+      // 传输保护：文件传输中大块帧会把心跳挤到延迟（QoS0 拥堵），看似"未报告"
+      // 实则忙 —— 此时判死拆会话会让 ACK 断流、传输卡死在半路
+      if (this.filex?.hasActiveTransfer?.(peerId)) continue
       const pcAlive = !!peer.pc && peer.pc.connectionState === 'connected'
       if (pcAlive) continue
       if (this.relay?.peers?.has(peerId)) continue // 仍在广播 presence：真在线（哪怕握手失败）

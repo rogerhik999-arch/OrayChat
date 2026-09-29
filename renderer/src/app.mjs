@@ -541,15 +541,26 @@ function updateComposerPlaceholder() {
 function buildFileBubble(bubble, m, mine) {
   const st = state.filex?.status(m.fid)
   if (m.type === 'image') {
-    const img = document.createElement('img')
-    img.className = 'fx-img'
-    img.alt = m.name || '图片'
     const cached = state.imgUrls.get(m.fid)
-    if (cached) img.src = cached
-    else if (m.thumb) { img.src = m.thumb; img.classList.add('thumb') }
-    img.onclick = () => { if (cached) window.oray.fxOpen?.(m.fid) }
-    bubble.appendChild(img)
-    if (!cached) hydrateFxImage(m, img)
+    // 无本机字节且无缩略图：渲染占位（裸 <img> 无 src 会呈现"损坏文件"观感）
+    if (!cached && !m.thumb) {
+      const ph = document.createElement('div')
+      ph.className = 'fx-img-ph'
+      const active = st?.state === 'active'
+      ph.textContent = active
+        ? `🖼️ ${m.name || '图片'}（${fmtSize(m.size || 0)}）· ${m.author === state.myIdPubHex ? '发送' : '接收'}中 ${Math.round(((st?.done || 0) / Math.max(1, st?.total || 1)) * 100)}%`
+        : `🖼️ ${m.name || '图片'}（${fmtSize(m.size || 0)}）· 未完成接收，重新发送可续传`
+      bubble.appendChild(ph)
+    } else {
+      const img = document.createElement('img')
+      img.className = 'fx-img'
+      img.alt = m.name || '图片'
+      if (cached) img.src = cached
+      else { img.src = m.thumb; img.classList.add('thumb') }
+      img.onclick = () => { if (cached) window.oray.fxOpen?.(m.fid) }
+      bubble.appendChild(img)
+      if (!cached) hydrateFxImage(m, img)
+    }
   } else {
     const card = document.createElement('div')
     card.className = 'fx-card'
