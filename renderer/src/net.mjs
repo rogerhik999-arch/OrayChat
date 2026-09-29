@@ -544,9 +544,10 @@ export class ChatNet {
   onControlFrame(peerId, frame, via) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.via !== via || peer.state !== 'ready') return
-    if (frame?.op === 'presence') { // 在线报告
+    if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       this.hooks.onPresence?.(peerId, peer)
+      this.absorbDigest(peerId, frame.digest)
       return
     }
     if (frame?.op === 'rehandshake') { // 对端请求重新握手（其为本房间握手发起方）
@@ -663,14 +664,44 @@ export class ChatNet {
   sendPresenceHeartbeat() {
     if (this.destroyed) return
     const now = Date.now()
+    // SWIM 风格 gossip：心跳捎带「我看到的在线成员摘要」（selfId+名字），
+    // 接收端 diff 后对缺失成员主动发起连接 —— 解决"部分机器看不到某些人"的
+    // 收敛问题（A、B 都连着 C 却互相不知晓时，由 C 的摘要完成间接介绍）。
+    const digest = [...this.peers.entries()]
+      .filter(([, p]) => p.state === 'ready')
+      .map(([pid, p]) => `${pid}|${encodeURIComponent(p.name || '')}`)
+    digest.push(`${selfId}|${encodeURIComponent(this.myName)}`) // 含自己
     for (const [peerId, peer] of this.peers) {
       if (peer.state !== 'ready') continue
       try {
-        if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', { conv: 'dm', op: 'presence', t: now })
-        else this.ctlAction?.send({ op: 'presence', t: now }, { target: peerId }).catch(() => {})
+        const frame = { conv: 'dm', op: 'presence', t: now, digest }
+        if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
+        else this.ctlAction?.send(frame, { target: peerId }).catch(() => {})
       } catch { /* 心跳失败静默，下轮再报 */ }
     }
     this.hooks.onPresenceSent?.([...this.peers.values()].filter((p) => p.state === 'ready').length)
+  }
+
+  // 收到对端心跳摘要：发现"对方看到在线、我却没有会话"的成员 → 主动握手
+  absorbDigest(fromPeerId, digest) {
+    if (!Array.isArray(digest)) return
+    for (const entry of digest) {
+      const [pid, encName] = String(entry).split('|')
+      if (!pid || pid === selfId) continue
+      const name = decodeURIComponent(encName || '')
+      const existing = this.peers.get(pid)
+      if (!existing) {
+        // 间接发现（第三方的介绍）：与该成员建立中继握手
+        this.hooks.onLog?.(`经 ${this.peers.get(fromPeerId)?.name || fromPeerId.slice(0, 8)}… 的摘要发现 ${name || pid.slice(0, 8)}… 在线，主动连接`)
+        const peer = this.ensurePeer(pid, 'mqtt')
+        if (name) peer.name = name
+        this.startHandshake(pid)
+      } else if (existing.state === 'failed') {
+        existing.retried = false
+        existing.lastError = null
+        this.restartHandshake(pid, 'mqtt')
+      }
+    }
   }
 
   // 失败会话重试：仍在对端 presence 认知里的才值得重试（TTL 30s 内见过）

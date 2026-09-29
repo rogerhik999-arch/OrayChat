@@ -774,6 +774,13 @@ async function main() {
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
     }
+    if (state.args['mute-presence']) {
+      // 测试注入：停发本端 relay presence 广播（模拟广播丢失/不可达），仅剩心跳摘要通道
+      setTimeout(() => {
+        clearInterval(state.net.relay.presenceTimer)
+        window.oray.botLog('[BOT] MUTE-PRESENCE 已停发 presence 广播（仅剩心跳摘要）')
+      }, 8000)
+    }
     if (state.args['topology-change-after-ms']) {
       // 模拟网络拓扑变化：中继与 WebRTC 同时被切断（等价 Wi-Fi 切换）
       setTimeout(() => {
