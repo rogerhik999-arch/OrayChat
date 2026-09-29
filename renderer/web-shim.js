@@ -58,6 +58,56 @@
       return true
     },
 
+    // 文件传输存储层（Web/WebView 内存版：分片存内存，完成后可下载/预览）
+    fxState: async (fid, { n }) => {
+      const s = (window.__orayFx = window.__orayFx || {})
+      if (s[fid]?.have) return { have: [...s[fid].have] }
+      return { have: new Array(Math.ceil(n / 8)).fill(0) }
+    },
+    fxWrite: async (fid, i, cs, bytes) => {
+      const s = (window.__orayFx = window.__orayFx || {})
+      const e = (s[fid] = s[fid] || { chunks: new Map(), have: [] })
+      e.chunks.set(i, bytes)
+      const bi = i >> 3
+      while (e.have.length <= bi) e.have.push(0)
+      e.have[bi] |= 1 << (i & 7)
+      return true
+    },
+    fxFinalize: async (fid, shaHex, name) => {
+      const s = window.__orayFx || {}
+      const e = s[fid]
+      if (!e) return { ok: false, why: 'not-found' }
+      const sorted = [...e.chunks.keys()].sort((a, b) => a - b)
+      const total = sorted.reduce((acc, i) => acc + e.chunks.get(i).length, 0)
+      const all = new Uint8Array(total)
+      let off = 0
+      for (const i of sorted) { all.set(e.chunks.get(i), off); off += e.chunks.get(i).length }
+      const digest = await crypto.subtle.digest('SHA-256', all)
+      const hexs = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+      if (hexs !== shaHex) return { ok: false, why: 'sha-mismatch' }
+      e.bytes = all; e.name = name
+      return { ok: true, path: `mem:${fid}` }
+    },
+    fxRead: async (fid) => {
+      const e = (window.__orayFx || {})[fid]
+      return e?.bytes || null
+    },
+    fxSave: async (fid, name) => {
+      const e = (window.__orayFx || {})[fid]
+      if (!e?.bytes) return { ok: false, why: 'not-found' }
+      try {
+        const url = URL.createObjectURL(new Blob([e.bytes]))
+        const a = document.createElement('a')
+        a.href = url; a.download = name || String(fid)
+        document.body.appendChild(a); a.click(); a.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 30000)
+        return { ok: true, path: a.download }
+      } catch (err) { return { ok: false, why: err.message } }
+    },
+    fxOpen: async (fid) => window.oray.fxSave(fid, (window.__orayFx || {})[fid]?.name),
+    fxAbort: async (fid) => { delete (window.__orayFx || {})[fid]; return true },
+    fxReadPath: async () => null, // WebView 无任意路径读取（bot 注入仅桌面端）
+
     setUnread: () => {},
     notifyMsg: () => { /* Web 版通知走 Notification API 由上层自理 */ },
 

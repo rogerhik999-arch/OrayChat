@@ -165,10 +165,12 @@ export class ChatNet {
       this.msgAction = this.room.makeAction('m')
       this.ctlAction = this.room.makeAction('ctl')
       this.syncAction = this.room.makeAction('sync')
+      this.fxAction = this.room.makeAction('fx') // 文件传输数据块（filex 模块）
       this.hsAction.onMessage = (data, ctx) => this.onHandshakeFrame(ctx.peerId, data, 'p2p')
       this.msgAction.onMessage = (data, ctx) => this.onEnvelope(ctx.peerId, data, 'p2p')
       this.ctlAction.onMessage = (data, ctx) => this.onControlFrame(ctx.peerId, data, 'p2p')
       this.syncAction.onMessage = (data, ctx) => this.onSyncFrame(ctx.peerId, data, 'p2p')
+      this.fxAction.onMessage = (data, ctx) => this.onFxFrame(ctx.peerId, data, 'p2p')
       this.room.onPeerJoin = (peerId) => this.onPeerJoin(peerId)
       this.room.onPeerLeave = (peerId) => this.onPeerLeave(peerId)
       for (const peerId of Object.keys(this.room.getPeers?.() || {})) this.onPeerJoin(peerId)
@@ -385,7 +387,25 @@ export class ChatNet {
     else if (kind === 'msg') this.onEnvelope(from, data, 'mqtt')
     else if (kind === 'ctl') this.onControlFrame(from, data, 'mqtt')
     else if (kind === 'sync') this.onSyncFrame(from, data, 'mqtt')
+    else if (kind === 'fx') this.onFxFrame(from, data, 'mqtt')
   }
+
+  // 文件数据块 → filex 模块（会话就绪才收；发送方法 sendFx）
+  onFxFrame(peerId, data, via) {
+    const peer = this.peers.get(peerId)
+    if (!peer || peer.state !== 'ready' || !this.filex) return
+    void via
+    this.filex.onFrame(peerId, data)
+  }
+
+  async sendFx(peerId, data) {
+    const peer = this.peers.get(peerId)
+    if (!peer || peer.state !== 'ready') throw new Error('会话未就绪')
+    if (peer.via === 'mqtt') this.relay.send(peerId, 'fx', data)
+    else await this.fxAction?.send(data, { target: peerId })
+  }
+
+  attachFilex(filex) { this.filex = filex }
 
   onRelayGone(peerId) {
     const peer = this.peers.get(peerId)
@@ -632,6 +652,7 @@ export class ChatNet {
       peer.candidates = null
     }
     this.hooks.onPeerReady?.(peerId, peer)
+    this.filex?.onSessionReady?.(peerId) // 文件传输：接收方重广播位图（断线自动续传）
     // 上线全局同步：就绪即向对端推送大厅与私聊状态（对端同样推给我，双向合并收敛）
     this.pushSync(peerId, 'lobby')
     this.pushSync(peerId, 'dm')
@@ -825,6 +846,7 @@ export class ChatNet {
   onControlFrame(peerId, frame, via) {
     const peer = this.peers.get(peerId)
     if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
+    if (frame?.op?.startsWith?.('fx-')) { this.filex?.onCtl(peerId, frame); return } // 文件传输控制
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       peer.lastProgress = Date.now()

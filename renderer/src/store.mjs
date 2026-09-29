@@ -59,11 +59,11 @@ export class LogStore {
   // ---------- 变更操作（本地发起或远端同步到达统一走这里） ----------
 
   // 新消息；mid 已存在则忽略（幂等）。返回是否有变更。
-  addMsg(key, { mid, author, text, t }) {
+  addMsg(key, { mid, author, text, t, ...fx }) {
     const c = this.conv(key)
     if (!mid || c.entries.has(mid) || c.dels.has(mid)) return false
     if (t <= c.clearT || (this.now() - t) >= RETENTION_MS) return false // 已被清空覆盖 / 超过保留期
-    c.entries.set(mid, { mid, author, text: String(text), t })
+    c.entries.set(mid, { mid, author, text: String(text), t, ...pickFxFields(fx) })
     this.#changed(key)
     return true
   }
@@ -103,7 +103,7 @@ export class LogStore {
     for (const e of state?.entries || []) {
       if (!e?.mid || c.entries.has(e.mid) || c.dels.has(e.mid)) continue
       if (e.t <= c.clearT || (this.now() - e.t) >= RETENTION_MS) continue
-      c.entries.set(e.mid, { mid: e.mid, author: e.author, text: String(e.text), t: e.t })
+      c.entries.set(e.mid, { mid: e.mid, author: e.author, text: String(e.text), t: e.t, ...pickFxFields(e) })
       changed = true
     }
     // 墓碑/清空生效后剔除可见集
@@ -179,7 +179,7 @@ export class LogStore {
     const c = emptyConv()
     if (!raw) return c
     for (const e of raw.entries || []) {
-      if (e?.mid) c.entries.set(e.mid, { mid: e.mid, author: e.author, text: String(e.text), t: Number(e.t) || 0 })
+      if (e?.mid) c.entries.set(e.mid, { mid: e.mid, author: e.author, text: String(e.text), t: Number(e.t) || 0, ...pickFxFields(e) })
     }
     for (const [mid, t] of Object.entries(raw.dels || {})) c.dels.set(mid, Number(t) || 0)
     c.clearT = Number(raw.clearT) || 0
@@ -188,6 +188,14 @@ export class LogStore {
 }
 
 // 会话键：大厅固定 'lobby'；私聊 = 双方身份公钥的联合哈希（排序后 sha256），
+
+// 文件/图片消息的扩展字段（白名单随条目持久化与同步；thumb 已是 96px 小图）
+const FX_FIELDS = ['type', 'fid', 'name', 'size', 'mime', 'w', 'h', 'thumb', 'mode']
+function pickFxFields(src) {
+  const out = {}
+  for (const k of FX_FIELDS) if (src?.[k] !== undefined) out[k] = src[k]
+  return out
+}
 // 两端一致且对每对身份唯一。此前"取字典序较小者"是错的——当我的公钥比
 // 所有对话方都小时，与每个人的私聊共享同一键，消息全部混入一个桶
 // （v1.12.1 修复；旧键由 net 层按作者身份迁移）。

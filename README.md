@@ -172,7 +172,9 @@ npm run check:services   # 公共服务连通性探测（STUN Binding / TURN All
   实施路径见 [docs/mobile-background.md](docs/mobile-background.md)
 - **网络健壮性增强**（多 broker 并联、周期性反熵、SWIM 完整化、消息 ACK 等）
   的调研与实施路线见 [docs/robust-network-roadmap.md](docs/robust-network-roadmap.md)
-- 文件传输、多设备登录同一身份未支持
+- 文件传输（v1.17.0）已支持私聊 1:1：协议级 deflate 压缩 + 断点续传（分片位图持久化）
+  + 图片默认 WebP 格式压缩（可勾"原图"）；字节不进共享日志（本机保存，日志仅元数据+缩略图）
+- 多设备登录同一身份未支持
 - 大厅/私聊日志合并为 gossip 模型（两两同步），超大群组收敛时间线性增长（小群组无感）
 - 身份密钥未用口令加密（可将 `identity:save` 换成 scrypt+AES-GCM 加密存储）
 - 长期身份无轮换/撤销机制

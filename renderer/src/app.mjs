@@ -4,6 +4,7 @@
 import { ChatNet, DEFAULT_CONFIG, buildRtcConfig, selfId } from './net.mjs'
 import * as oc from './crypto.mjs'
 import { dmConvKey } from './store.mjs'
+import { FileX, fmtSize } from './filex.mjs'
 
 const $ = (id) => document.getElementById(id)
 const state = {
@@ -20,6 +21,49 @@ const state = {
   ignoredIds: new Set(), // 已删除的联系人（本机不再出现在历史名录；对方上线互联即自动恢复）
   logData: null, // 登录时从主进程文件 KV 读入的共享日志
   unread: new Map(), // 会话键(viewKey) -> 未读数
+  filex: null, // 文件/图片传输（dm 会话）
+  pendingFiles: [], // 待发送附件 [{file:File, kind, orig}]
+  imgUrls: new Map(), // fid -> blob URL（本机已有字节的消息图片显示缓存）
+  fxThrottle: 0, // 传输进度 → 消息区重渲染节流
+}
+
+// ---------- 文件/图片：格式压缩与缩略图 ----------
+// 默认（非原图）：WebP 重编码 q0.85、长边 ≤2048 —— "格式的压缩传输"；
+// 压完反而更大（本已高度压缩）或编码失败（HEIC 等）→ 回退原样只走协议级压缩。
+// GIF 含动画，重编码会丢帧 → 一律原样。thumb：96px WebP（日志条目随同步传播）。
+async function compressImageForSend(file) {
+  const src = new Blob([file.bytes], { type: file.mime || 'image/png' })
+  if (/gif$/i.test(file.mime || '')) return null
+  const bmp = await createImageBitmap(src)
+  try {
+    const maxEdge = 2048
+    const scale = Math.min(1, maxEdge / Math.max(bmp.width, bmp.height))
+    const w = Math.max(1, Math.round(bmp.width * scale))
+    const h = Math.max(1, Math.round(bmp.height * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w; canvas.height = h
+    canvas.getContext('2d').drawImage(bmp, 0, 0, w, h)
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/webp', 0.85))
+    if (!blob || blob.size >= file.bytes.length) {
+      return { bytes: file.bytes, w: bmp.width, h: bmp.height, mime: file.mime, mode: 'raw' }
+    }
+    return { bytes: new Uint8Array(await blob.arrayBuffer()), w, h, mime: 'image/webp', mode: 'img' }
+  } finally { bmp.close?.() }
+}
+
+async function makeThumb(bytes, mime) {
+  try {
+    const bmp = await createImageBitmap(new Blob([bytes], { type: mime || 'image/png' }))
+    try {
+      const scale = Math.min(1, 96 / Math.max(bmp.width, bmp.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(bmp.width * scale))
+      canvas.height = Math.max(1, Math.round(bmp.height * scale))
+      canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height)
+      const url = canvas.toDataURL('image/webp', 0.6)
+      return url.length < 6144 ? url : '' // 缩略图超过 6KB 放弃（日志体积优先）
+    } finally { bmp.close?.() }
+  } catch { return '' }
 }
 
 // ---------- 工具 ----------
@@ -407,16 +451,20 @@ function renderMessages() {
     row.className = 'msg' + (mine ? ' me' : '')
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
-    if (!mine && (state.view.conv === 'lobby' || state.view.conv === 'dm-offline')) {
-      const author = document.createElement('span')
-      author.className = 'author'
-      author.textContent = authorName(m.author)
-      bubble.appendChild(author)
+    if (m.type === 'image' || m.type === 'file') {
+      buildFileBubble(bubble, m, mine)
+    } else {
+      if (!mine && (state.view.conv === 'lobby' || state.view.conv === 'dm-offline')) {
+        const author = document.createElement('span')
+        author.className = 'author'
+        author.textContent = authorName(m.author)
+        bubble.appendChild(author)
+      }
+      const text = document.createElement('span')
+      text.className = 'btext'
+      text.textContent = m.text
+      bubble.appendChild(text)
     }
-    const text = document.createElement('span')
-    text.className = 'btext'
-    text.textContent = m.text
-    bubble.appendChild(text)
     const meta = document.createElement('span')
     meta.className = 'meta'
     meta.append(`${mine ? '我' : authorName(m.author)} · ${fmtTime(m.t)} `)
@@ -486,6 +534,99 @@ function updateComposerPlaceholder() {
   if (state.view.conv === 'lobby') el.placeholder = '📢 群发给房间内所有人（大厅）…'
   else if (state.view.conv === 'dm-offline') el.placeholder = '📴 对方离线，仅可查看历史记录…'
   else el.placeholder = `🔒 私密发给 ${currentPeerName() || '对方'}（仅对方可见）…`
+}
+
+// ---------- 文件/图片气泡 ----------
+
+function buildFileBubble(bubble, m, mine) {
+  const st = state.filex?.status(m.fid)
+  if (m.type === 'image') {
+    const img = document.createElement('img')
+    img.className = 'fx-img'
+    img.alt = m.name || '图片'
+    const cached = state.imgUrls.get(m.fid)
+    if (cached) img.src = cached
+    else if (m.thumb) { img.src = m.thumb; img.classList.add('thumb') }
+    img.onclick = () => { if (cached) window.oray.fxOpen?.(m.fid) }
+    bubble.appendChild(img)
+    if (!cached) hydrateFxImage(m, img)
+  } else {
+    const card = document.createElement('div')
+    card.className = 'fx-card'
+    const info = document.createElement('div')
+    info.className = 'fx-info'
+    const nm = document.createElement('div')
+    nm.className = 'fx-name'
+    nm.textContent = m.name || '文件'
+    const sub = document.createElement('div')
+    sub.className = 'fx-sub mono'
+    sub.textContent = `${fmtSize(m.size || 0)}${m.mode === 'img' ? ' · 已压缩' : m.orig ? ' · 原图' : ''}`
+    info.append(nm, sub)
+    const act = document.createElement('a')
+    act.className = 'fx-action'
+    if (mine) { act.textContent = '打开'; act.onclick = () => window.oray.fxOpen?.(m.fid) }
+    else {
+      act.textContent = '下载'
+      act.onclick = async () => {
+        const r = await window.oray.fxSave(m.fid, m.name)
+        if (!r?.ok) appendSys(`保存失败：${r?.why || '未知'}`)
+        else appendSys(`已保存到 ${r.path}`)
+      }
+    }
+    card.append('📄', info, act)
+    bubble.appendChild(card)
+  }
+  // 传输进度 / 异常态
+  if (st && (st.state === 'active' || st.state === 'cancel' || st.state === 'error')) {
+    if (st.state === 'active') {
+      const bar = document.createElement('div')
+      bar.className = 'fx-progress'
+      const fill = document.createElement('div')
+      fill.className = 'fx-fill'
+      fill.style.width = `${Math.round((st.done / Math.max(1, st.total)) * 100)}%`
+      const pct = document.createElement('span')
+      pct.className = 'fx-sub mono'
+      pct.textContent = `${st.dir === 'send' ? '发送' : '接收'} ${Math.round((st.done / Math.max(1, st.total)) * 100)}%${st.speed ? ` · ${fmtSize(st.speed)}/s` : ''} · 断点续传`
+      const cancel = document.createElement('a')
+      cancel.className = 'del'
+      cancel.textContent = '取消'
+      cancel.onclick = () => state.filex.cancel(m.fid)
+      bar.append(fill, pct, cancel)
+      bubble.appendChild(bar)
+    } else {
+      const note = document.createElement('div')
+      note.className = 'fx-sub'
+      note.textContent = st.state === 'cancel' ? '传输已取消（重新发送同一文件将自动续传）' : '传输校验失败'
+      bubble.appendChild(note)
+    }
+  }
+  // 说明文字（caption 与文件名不同才显示，避免重复）
+  if (m.text && m.text !== m.name) {
+    const cap = document.createElement('span')
+    cap.className = 'btext'
+    cap.textContent = m.text
+    bubble.appendChild(cap)
+  }
+}
+
+// 图片字节异步加载（本机有完成的文件才显示原图，否则停留在缩略图/占位）
+async function hydrateFxImage(m, img) {
+  try {
+    const bytes = await window.oray.fxRead(m.fid)
+    if (!bytes) {
+      if (!img.isConnected) return
+      if (!m.thumb) {
+        const ph = document.createElement('div')
+        ph.className = 'fx-img-ph'
+        ph.textContent = `🖼️ ${m.name || '图片'}（${fmtSize(m.size || 0)}）· 文件已不在本机`
+        img.replaceWith(ph)
+      }
+      return
+    }
+    const url = URL.createObjectURL(new Blob([bytes], { type: m.mime || 'image/png' }))
+    state.imgUrls.set(m.fid, url)
+    if (img.isConnected) { img.src = url; img.classList.remove('thumb') }
+  } catch { /* WebView 环境：停留缩略图 */ }
 }
 
 function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages(); updateComposerPlaceholder() }
@@ -621,6 +762,51 @@ async function doLogin(name, room) {
   $('selfRoom').textContent = room
   $('loginView').classList.add('hidden')
   $('mainView').classList.remove('hidden')
+
+  // 文件/图片传输（dm 会话）：字节不进共享日志，日志只存元数据+缩略图
+  state.filex = new FileX({
+    net: state.net,
+    // io 适配器：electron preload / web-shim 均以 fx* 命名暴露
+    io: {
+      state: (fid, meta) => window.oray.fxState(fid, meta),
+      write: (fid, i, cs, bytes) => window.oray.fxWrite(fid, i, cs, bytes),
+      finalize: (fid, sha, name) => window.oray.fxFinalize(fid, sha, name),
+      read: (fid) => window.oray.fxRead(fid),
+      abort: (fid) => window.oray.fxAbort(fid),
+    },
+    compress: compressImageForSend,
+    hooks: {
+      onLog: (msg, level) => {
+        if (state.args.bot) window.oray.botLog(`[BOT] LOG ${level || 'info'} ${msg}`)
+      },
+      onOutgoing: (e) => {
+        state.net.store.addMsg(state.net.storeKey('dm', e.peerId), {
+          mid: e.mid, author: state.myIdPubHex, text: e.text, t: e.t,
+          type: e.type, fid: e.fid, name: e.name, size: e.size, mime: e.mime,
+          w: e.w, h: e.h, thumb: e.thumb, mode: e.mode,
+        })
+      },
+      onIncoming: (e) => {
+        state.net.store.addMsg(state.net.storeKey('dm', e.peerId), {
+          mid: e.mid, author: e.author, text: e.text, t: e.t,
+          type: e.type, fid: e.fid, name: e.name, size: e.size, mime: e.mime,
+          w: e.w, h: e.h, thumb: e.thumb, mode: e.mode,
+        })
+      },
+      onEvent: (e) => {
+        if (state.args.bot && (e.state === 'done' || e.state === 'error' || e.state === 'cancel')) {
+          window.oray.botLog(`[BOT] FILE-${e.state.toUpperCase()} dir=${e.dir} fid=${e.fid} name=${JSON.stringify(e.name || '')} done=${e.done}/${e.total}`)
+        }
+        const now = Date.now()
+        if (now - state.fxThrottle > 300) {
+          state.fxThrottle = now
+          if (!$('mainView').classList.contains('hidden')) renderMessages()
+        }
+      },
+    },
+  })
+  state.net.attachFilex(state.filex)
+
   setTimeout(flushNotices, 600)
   // 默认进入第一个在线成员的私聊（避免误以为输入框是私聊却群发）；无人在线才落大厅
   const firstReady = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
@@ -843,6 +1029,23 @@ function bindUi() {
   $('input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrent() }
   })
+
+  // ---------- 附件（文件/图片，仅私聊） ----------
+  $('attachBtn').onclick = () => {
+    if (state.view.conv !== 'dm') { appendSys('文件/图片仅支持私聊发送（1:1 直传）'); return }
+    const peer = state.net?.peers.get(state.view.peerId)
+    if (peer?.state !== 'ready') { appendSys('对端尚未建立加密会话，无法发送文件'); return }
+    $('fileInput').click()
+  }
+  $('fileInput').addEventListener('change', () => {
+    for (const f of $('fileInput').files || []) {
+      const isImg = /^image\//.test(f.type)
+      state.pendingFiles.push({ file: f, kind: isImg ? 'image' : 'file', orig: false })
+    }
+    $('fileInput').value = ''
+    renderAttachStrip()
+  })
+  renderAttachStrip() // 初始隐藏
   $('input').addEventListener('input', () => {
     const el = $('input')
     el.style.height = 'auto'
@@ -870,13 +1073,58 @@ function bindUi() {
 
 async function sendCurrent() {
   const text = $('input').value.trim()
-  if (!text || !state.net) return
+  const hasFiles = state.pendingFiles.length > 0
+  if ((!text && !hasFiles) || !state.net) return
+  if (hasFiles) await sendPendingFiles()
+  if (!text) return
   $('input').value = ''
   $('input').style.height = 'auto'
   try {
     await state.net.sendMessage(state.view.conv === 'lobby' ? 'all' : state.view.peerId, text, viewWireConv())
   } catch (e) {
     appendSys(`发送失败：${e.message}`)
+  }
+}
+
+// ---------- 附件发送 ----------
+
+function renderAttachStrip() {
+  const strip = $('attachStrip')
+  if (!state.pendingFiles.length) { strip.classList.add('hidden'); strip.innerHTML = ''; return }
+  strip.classList.remove('hidden')
+  strip.innerHTML = state.pendingFiles.map((p, idx) => `
+    <span class="attach-item">
+      ${p.kind === 'image' ? '🖼️' : '📄'} ${esc(p.file.name.slice(0, 24))} <span class="mono">${fmtSize(p.file.size)}</span>
+      <label class="orig-toggle" title="默认传输格式压缩版（WebP）；勾选发送原始文件（仍走协议级压缩）">
+        <input type="checkbox" data-orig-idx="${idx}" ${p.orig ? 'checked' : ''}/> 原图
+      </label>
+      <a class="del" data-rm-idx="${idx}">✕</a>
+    </span>`).join('') + `<span class="attach-hint">将发送给当前私聊对象</span>`
+  for (const el of strip.querySelectorAll('[data-rm-idx]')) {
+    el.onclick = () => { state.pendingFiles.splice(Number(el.dataset.rmIdx), 1); renderAttachStrip() }
+  }
+  for (const el of strip.querySelectorAll('[data-orig-idx]')) {
+    el.onchange = () => { state.pendingFiles[Number(el.dataset.origIdx)].orig = el.checked }
+  }
+}
+
+async function sendPendingFiles() {
+  const peerId = state.view.peerId
+  const items = state.pendingFiles.splice(0)
+  renderAttachStrip()
+  for (const item of items) {
+    try {
+      const f = item.file
+      const bytes = new Uint8Array(await f.arrayBuffer())
+      const isImg = item.kind === 'image'
+      const thumb = isImg ? await makeThumb(bytes, f.type) : ''
+      await state.filex.sendFile(peerId, {
+        bytes, name: f.name, size: f.size, mime: f.type || 'application/octet-stream',
+        lastModified: f.lastModified, thumb,
+      }, { kind: item.kind, orig: item.orig })
+    } catch (e) {
+      appendSys(`发送「${item.file.name}」失败：${e.message}`)
+    }
   }
 }
 
@@ -1014,6 +1262,35 @@ async function main() {
         const target = [...state.names.entries()].find(([, n]) => n === state.args['del-contact'])
         if (!target) { window.oray.botLog(`[BOT] CONTACT-NOTFOUND name=${state.args['del-contact']}`); return }
         doDeleteContact(target[0], target[1])
+      }, delay)
+    }
+    if (state.args['send-file']) {
+      // 注入器：向第一个就绪对端发送文件（实机验证文件传输/续传/图片压缩）
+      const delay = Number(state.args['send-file-after-ms']) || 6000
+      setTimeout(async () => {
+        try {
+          // 轮询等就绪对端（对端可能后启动）
+          let ready = null
+          for (let i = 0; i < 60 && !ready; i++) {
+            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+            if (!ready) await new Promise((r) => setTimeout(r, 2000))
+          }
+          if (!ready) { window.oray.botLog('[BOT] SEND-FILE-NO-PEER'); return }
+          const paths = [state.args['send-file'], state.args['send-file2'], state.args['send-file3']].filter(Boolean)
+          for (const p of paths) {
+            const info = await window.oray.fxReadPath(p)
+            if (!info) { window.oray.botLog(`[BOT] SEND-FILE-NOTFOUND ${p}`); continue }
+            const isImg = /\.(png|jpe?g|webp|gif|bmp)$/i.test(info.name)
+            const bytes = new Uint8Array(info.bytes)
+            const thumb = isImg ? await makeThumb(bytes, info.name) : ''
+            await state.filex.sendFile(ready[0], {
+              bytes, name: info.name, size: info.size,
+              mime: isImg ? (/\.(png)$/i.test(info.name) ? 'image/png' : 'image/jpeg') : 'application/octet-stream',
+              lastModified: info.mtimeMs, thumb,
+            }, { kind: isImg ? 'image' : 'file', orig: !!state.args['send-file-orig'] })
+            window.oray.botLog(`[BOT] SEND-FILE-START name=${JSON.stringify(info.name)} size=${info.size} to=${ready[1].name}`)
+          }
+        } catch (e) { window.oray.botLog(`[BOT] SEND-FILE-ERR ${e?.message || e}`) }
       }, delay)
     }
   } else {

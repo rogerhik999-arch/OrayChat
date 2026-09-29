@@ -259,3 +259,35 @@ button.ghost.warn2:hover { background: #3a2d1c; }
   background: var(--err); color: #fff; font-size: 10.5px; font-weight: 700;
   text-align: center; vertical-align: middle; margin-left: 2px;
 }
+
+/* ---------- 文件/图片传输（v1.17.0） ---------- */
+.attach-btn {
+  flex: none; width: 34px; height: 34px; border-radius: 8px; border: 1px solid #2c3a55;
+  background: transparent; color: var(--fg-dim); font-size: 16px; cursor: pointer;
+}
+.attach-btn:hover { background: #22314d; }
+.attach-strip {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  padding: 6px 10px; border-top: 1px solid #22304a; background: #1a2436; font-size: 12.5px;
+}
+.attach-item {
+  display: inline-flex; gap: 6px; align-items: center; padding: 3px 8px;
+  background: #22314d; border: 1px solid #2c3a55; border-radius: 8px;
+}
+.attach-item .orig-toggle { display: inline-flex; gap: 3px; align-items: center; color: var(--fg-dim); cursor: pointer; }
+.attach-hint { color: var(--fg-dim); font-size: 11.5px; }
+.fx-img {
+  max-width: 320px; max-height: 320px; border-radius: 8px; display: block; cursor: zoom-in;
+}
+.fx-img.thumb { min-width: 96px; min-height: 96px; image-rendering: auto; opacity: .9; }
+.fx-img-ph { padding: 10px 12px; color: var(--fg-dim); font-size: 12.5px; background: #1a2436; border-radius: 8px; }
+.fx-card {
+  display: flex; gap: 8px; align-items: center; min-width: 200px;
+}
+.fx-name { font-size: 13px; font-weight: 600; word-break: break-all; }
+.fx-sub { color: var(--fg-dim); font-size: 11.5px; }
+.fx-action { margin-left: auto; color: #7ab3ff; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+.fx-progress { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.fx-bar { flex: 1; height: 4px; background: #22314d; border-radius: 2px; overflow: hidden; }
+.fx-fill { height: 100%; background: #7ab3ff; border-radius: 2px; transition: width .3s; }
+.fx-caption { display: block; margin-top: 4px; }

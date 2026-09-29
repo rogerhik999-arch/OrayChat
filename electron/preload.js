@@ -17,6 +17,16 @@ contextBridge.exposeInMainWorld('oray', {
   kvGet: (key) => ipcRenderer.invoke('kv:get', key),
   kvSet: (key, val) => ipcRenderer.invoke('kv:set', key, val),
 
+  // 文件传输存储层（filex io 适配器：分片落盘/位图/校验/读取/另存）
+  fxState: (fid, meta) => ipcRenderer.invoke('fx:state', fid, meta),
+  fxWrite: (fid, i, cs, bytes) => ipcRenderer.invoke('fx:write', fid, i, cs, bytes),
+  fxFinalize: (fid, shaHex, name) => ipcRenderer.invoke('fx:finalize', fid, shaHex, name),
+  fxRead: (fid) => ipcRenderer.invoke('fx:read', fid),
+  fxSave: (fid, name) => ipcRenderer.invoke('fx:save', fid, name),
+  fxOpen: (fid) => ipcRenderer.invoke('fx:open', fid),
+  fxAbort: (fid) => ipcRenderer.invoke('fx:abort', fid),
+  fxReadPath: (p) => ipcRenderer.invoke('fx:readPath', p),
+
   // 测试/诊断
   // 未读与通知
   setUnread: (n) => ipcRenderer.send('unread:update', n),

@@ -35,6 +35,7 @@ const HS3ACK_TAG = 'OC-HS3ACK-v1'
 const T1_TAG = 'OC-T1-v1'
 const KDF_INFO = 'oraychat-session-v1'
 const MSG_AAD_PREFIX = 'OC-MSG-v1'
+const BIN_AAD_PREFIX = 'OC-BIN-v1'
 
 // ---------- 编码助手 ----------
 
@@ -398,6 +399,31 @@ export function openRoom(roomKey, wrapped) {
   const raw = unb64(wrapped.e)
   const pt = xchacha20poly1305(roomKey, raw.slice(0, 24)).decrypt(raw.slice(24))
   return JSON.parse(new TextDecoder().decode(pt))
+}
+
+// ---------- 二进制 AEAD（文件传输分片） ----------
+//
+// 与消息同一会话密钥，但不占用消息序号空间（文件块有自己的 AAD 命名空间）。
+// AAD 绑定用途+fid+块号+压缩标志：重放到别的块/别的文件/篡改任何字段都会
+// 认证失败。nonce 每块随机 —— 块可以乱序收、乱序重传，无需收发双方同步计数。
+
+function binAad(purpose, fid, index, flags) {
+  return utf8(`${BIN_AAD_PREFIX}|${purpose}|${fid}|${index}|${flags}`)
+}
+
+// 加密一块二进制；返回 {n: b64(nonce), c: b64(nonce+ct)}（JSON 可承载）
+export function sealBin(ctx, bytes, purpose, fid, index, flags = 0) {
+  const nonce = randomBytes(24)
+  const ct = xchacha20poly1305(ctx.key, nonce, binAad(purpose, fid, index, flags)).encrypt(bytes)
+  return { n: b64(nonce), c: b64(ct) }
+}
+
+// 解密文件块，返回明文 Uint8Array；密钥不一致/字段被篡改时抛错。
+// env 形如 sealBin 的返回值。
+export function openBin(ctx, env, purpose, fid, index, flags = 0) {
+  const nonce = unb64(env.n)
+  const ct = unb64(env.c)
+  return xchacha20poly1305(ctx.key, nonce, binAad(purpose, fid, index, flags)).decrypt(ct)
 }
 
 // 加密一条消息，返回可直接发给对端的信封 {v, c, s}

@@ -5,9 +5,10 @@
 // - bot 模式：--bot 时无窗口自动化登录，日志经 IPC 转发到 stdout，供 e2e 测试驱动
 // - 应用层配置：<userData>/oraychat-config.json 可覆盖 STUN/TURN/默认房间
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron')
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+const crypto2 = require('node:crypto')
 
 const argv = {}
 for (const a of process.argv.slice(2)) {
@@ -133,6 +134,112 @@ function registerIpc() {
         .filter((f) => f.endsWith('.json'))
         .map((f) => f.replace(/\.json$/, ''))
     } catch { return [] }
+  })
+
+  // ---------- 文件传输（filex）存储层 ----------
+  // 分片 pwrite 到 <fid>.part；位图/元信息持久化 <fid>.json（断点续传跨重启）；
+  // 完成时整文件 SHA-256 校验通过才改名为 <fid>（内容寻址，不可信输入不落地）。
+  const filesDir = () => path.join(app.getPath('userData'), 'files')
+  const fxSafe = (fid) => String(fid).replace(/[^0-9a-f]/g, '').slice(0, 24)
+  const fxPart = (fid) => path.join(filesDir(), `${fxSafe(fid)}.part`)
+  const fxMeta = (fid) => path.join(filesDir(), `${fxSafe(fid)}.json`)
+  const fxDone = (fid) => path.join(filesDir(), fxSafe(fid))
+
+  ipcMain.handle('fx:state', (_e, fid, { size, cs, n }) => {
+    fs.mkdirSync(filesDir(), { recursive: true })
+    const id = fxSafe(fid)
+    if (!id) return { have: [] }
+    let meta = null
+    try { meta = JSON.parse(fs.readFileSync(fxMeta(id), 'utf8')) } catch { /* 新传输 */ }
+    if (meta && meta.size === size && meta.cs === cs && meta.n === n && Array.isArray(meta.have)) {
+      return { have: meta.have }
+    }
+    return { have: new Array(Math.ceil(n / 8)).fill(0) }
+  })
+
+  ipcMain.handle('fx:write', (_e, fid, i, cs, bytes) => {
+    const id = fxSafe(fid)
+    if (!id || !Buffer.isBuffer(Buffer.from(bytes))) return false
+    fs.mkdirSync(filesDir(), { recursive: true })
+    const fd = fs.openSync(fxPart(id), fs.existsSync(fxPart(id)) ? 'r+' : 'w')
+    try {
+      fs.writeSync(fd, Buffer.from(bytes), 0, bytes.length, i * cs)
+    } finally { fs.closeSync(fd) }
+    let meta = {}
+    try { meta = JSON.parse(fs.readFileSync(fxMeta(id), 'utf8')) } catch { /* 首 块 */ }
+    const bm = meta.have || []
+    const bi = i >> 3
+    while (bm.length <= bi) bm.push(0)
+    bm[bi] |= 1 << (i & 7)
+    fs.writeFileSync(fxMeta(id), JSON.stringify({ ...meta, have: bm }), { mode: 0o600 })
+    return true
+  })
+
+  ipcMain.handle('fx:finalize', async (_e, fid, shaHex, name) => {
+    const id = fxSafe(fid)
+    const part = fxPart(id)
+    try {
+      const hash = crypto2.createHash('sha256')
+      await new Promise((resolve, reject) => {
+        const rs = fs.createReadStream(part)
+        rs.on('data', (d) => hash.update(d))
+        rs.on('end', resolve)
+        rs.on('error', reject)
+      })
+      if (hash.digest('hex') !== String(shaHex)) return { ok: false, why: 'sha-mismatch' }
+      // 完整性通过：改名为内容寻址文件，附带原始扩展名便于识别
+      const ext = path.extname(String(name || '')).slice(0, 16)
+      fs.renameSync(part, fxDone(id) + ext)
+      try { fs.unlinkSync(fxMeta(id)) } catch { /* 忽略 */ }
+      return { ok: true, path: fxDone(id) + ext }
+    } catch (e) {
+      return { ok: false, why: e?.message || 'io' }
+    }
+  })
+
+  ipcMain.handle('fx:read', (_e, fid) => {
+    try {
+      const id = fxSafe(fid)
+      const dir = filesDir()
+      const hit = fs.existsSync(fxDone(id)) ? fxDone(id)
+        : (fs.readdirSync(dir).find((f) => f.startsWith(id + '.') && !f.endsWith('.part') && !f.endsWith('.json')) || null)
+      const p = hit ? path.join(dir, hit) : fxDone(id)
+      return new Uint8Array(fs.readFileSync(p))
+    } catch { return null }
+  })
+
+  ipcMain.handle('fx:save', async (_e, fid, name) => {
+    try {
+      const id = fxSafe(fid)
+      const src = fxDone(id)
+      if (!fs.existsSync(src)) return { ok: false, why: 'not-found' }
+      const dir = app.getPath('downloads')
+      let dest = path.join(dir, path.basename(String(name || id)))
+      const base = dest
+      let k = 1
+      while (fs.existsSync(dest)) dest = base.replace(/(\.[^.]*)?$/, (m) => ` (${k++})${m}`)
+      fs.copyFileSync(src, dest)
+      return { ok: true, path: dest }
+    } catch (e) { return { ok: false, why: e?.message || 'io' } }
+  })
+
+  ipcMain.handle('fx:open', (_e, fid) => {
+    try { shell.openPath(fxDone(fxSafe(fid))); return true } catch { return false }
+  })
+
+  ipcMain.handle('fx:abort', (_e, fid) => {
+    const id = fxSafe(fid)
+    for (const p of [fxPart(id), fxMeta(id)]) { try { fs.unlinkSync(p) } catch { /* 忽略 */ } }
+    return true
+  })
+
+  // bot 注入：读取任意路径文件（发送方；接收方无需）
+  ipcMain.handle('fx:readPath', (_e, p) => {
+    try {
+      const buf = fs.readFileSync(p)
+      const st = fs.statSync(p)
+      return { bytes: new Uint8Array(buf), name: path.basename(p), size: st.size, mtimeMs: st.mtimeMs }
+    } catch { return null }
   })
 
   ipcMain.on('bot:log', (_e, line) => { process.stdout.write(`${line}\n`) })
