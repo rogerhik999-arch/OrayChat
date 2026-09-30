@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import * as oc from '../renderer/src/crypto.mjs'
 import { FileX, maybeDeflate, inflate, bitmapSet, bitmapHas, bitmapCount, chunkCount, sha256Hex } from '../renderer/src/filex.mjs'
+import { LogStore } from '../renderer/src/store.mjs'
 
 // ---- 会话上下文（两端同密钥，模拟握手后的 ctx）----
 const KEY = oc.hmac ? null : null
@@ -506,5 +507,36 @@ const WINDOW_DEFAULT = 16 // P2P 默认窗口（与 filex WINDOW_P2P 一致）
   assert.equal(await sha256Hex(got), await sha256Hex(realContent), '拉取内容与持有者一致')
 }
 
-console.log('filex.test.mjs ✓ 全部通过（…/流压缩/块哈希/双路径/多源获取）')
+// ---- 18) 语音消息：extra 元数据经 offer/日志 白名单持久化 ----
+{
+  const { wire, netA, netB } = link()
+  const entries = { out: null, in: null }
+  const fxA = mkFileX(netA, { onOutgoing: (e) => { entries.out = e } })
+  const fxB = mkFileX(netB, { onIncoming: (e) => { entries.in = e } })
+  const voice = new Uint8Array(24000) // 0.75s 16kHz 16bit WAV 体量
+  for (let i = 0; i < voice.length; i++) voice[i] = (i * 5) & 0xff
+  const extra = { duration: 1500, waveform: '012345678901234567890123456789012345678901234567' }
+  const fid = await fxA.sendFile('B', { bytes: voice, name: 'voice-1.webm', size: voice.length, mime: 'audio/webm', lastModified: 13 },
+    { kind: 'voice', extra })
+  assert.equal(entries.out.type, 'voice', '发送方日志 type=voice')
+  assert.equal(entries.out.duration, 1500)
+  assert.equal(entries.out.waveform, extra.waveform)
+  await drain(60)
+  const offer = wire.a2b.find((f) => f.op === 'fx-offer')
+  assert.equal(offer.kind, 'voice')
+  assert.equal(offer.waveform, extra.waveform)
+  await fxB.onCtl('A', offer)
+  assert.equal(entries.in.type, 'voice', '接收方日志 type=voice')
+  assert.equal(entries.in.duration, 1500)
+  // 白名单持久化：LogStore 导出→load 钩子反序列化 往返后元数据仍在
+  const st = new LogStore({})
+  st.addMsg('dm:testvoice', { mid: 'v1', author: '11'.repeat(32), text: 'x', t: Date.now(), type: 'voice', duration: 1500, waveform: extra.waveform, hack: 'should-drop' })
+  const exported = st.exportAll()
+  const rt = new LogStore({ load: () => exported })
+  const e = rt.convs.get('dm:testvoice').entries.get('v1')
+  assert.equal(e.duration, 1500, 'duration 经导出/导入保留')
+  assert.equal(e.waveform, extra.waveform, 'waveform 经导出/导入保留')
+  assert.equal(e.hack, undefined, '白名单外字段被丢弃')
+}
+console.log('filex.test.mjs ✓ 全部通过（…/流压缩/块哈希/双路径/多源获取/语音元数据）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

@@ -128,7 +128,7 @@ Chromium 放 aac/mp4 ✅，iOS 放 opus/webm ✅[Safari 14.1+ 起支持 WebM 容
 
 | 级别 | 项 | 借鉴来源 | 说明 | 工作量 |
 |---|---|---|---|---|
-| P0-1 | 语音消息 | WhatsApp/Element/SimpleX | MediaRecorder 双格式（webm/opus 或 mp4/aac）→ filex `kind:'voice'`（typ 200KB/min）+ duration/waveform 元数据 → 气泡播放器（波形/倍速/未读小蓝点可选）。移动端：Android RECORD_AUDIO 权限 + iOS NSMicrophoneUsageDescription | 2-3 天 |
+| ✅ P0-1（v1.21.0） | 语音消息 | WhatsApp/Element/SimpleX | MediaRecorder 双格式（webm/opus 或 mp4/aac，isTypeSupported 探测）→ filex `kind:'voice'` + duration/waveform(48点0-9串)/元数据进 offer 与日志白名单 → 气泡播放器（波形进度/倍速 1x-1.5x-2x/全局互斥/未完成接收提示）。移动端权限：Android RECORD_AUDIO+MODIFY_AUDIO_SETTINGS / iOS NSMicrophoneUsageDescription。实机验证：合成 WAV 双实例全链路（元数据一致/字节 SHA 一致/duration/waveform 保留） | 2-3 天 |
 | P0-2 | 视频消息 | WhatsApp 圆视频 | 限时 60s 录制（480p + 码率上限）→ filex `kind:'video'` + 首帧缩略图（复用 makeThumb）→ 内嵌播放气泡 | 2 天 |
 | P1 | 1:1 实时通话（音频优先，视频同栈） | SimpleX（信令搭消息车）+ Trystero addStream | ctl 信令（offer/answer 经 E2EE ctl 帧）/响铃/挂断；媒体 `room.addStream`；回声消除用 getUserMedia 约束；无 TURN：直连失败时如实提示"当前网络无法建立通话，可发语音消息"（诚实的产品化，不做假兜底） | 4-5 天 |
 | P2 | 音频隧道实验（可选） | Briar/Tox 思路 | 24kbps Opus（WebCodecs 或 MediaRecorder 切片）打包走 fx 数据通道 + MQTT 中继——对称 NAT 下的降级通话。带宽可行（≈240KB/min），延迟/抖动需实测；效果差就砍 | 2-3 天实验 |

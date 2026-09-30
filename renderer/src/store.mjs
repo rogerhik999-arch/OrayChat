@@ -190,7 +190,8 @@ export class LogStore {
 // 会话键：大厅固定 'lobby'；私聊 = 双方身份公钥的联合哈希（排序后 sha256），
 
 // 文件/图片消息的扩展字段（白名单随条目持久化与同步；thumb 已是 96px 小图）
-const FX_FIELDS = ['type', 'fid', 'name', 'size', 'mime', 'w', 'h', 'thumb', 'mode']
+// duration/waveform/rate：语音消息元数据（waveform=48 点 0-9 幅度串，约 50B）
+const FX_FIELDS = ['type', 'fid', 'name', 'size', 'mime', 'w', 'h', 'thumb', 'mode', 'duration', 'waveform', 'rate']
 function pickFxFields(src) {
   const out = {}
   for (const k of FX_FIELDS) if (src?.[k] !== undefined) out[k] = src[k]

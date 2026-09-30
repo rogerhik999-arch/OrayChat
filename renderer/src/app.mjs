@@ -77,6 +77,124 @@ async function makeThumb(bytes, mime) {
   } catch { return '' }
 }
 
+// ---------- 语音消息：录音状态机（点击开始/停止发送；❌取消） ----------
+// 格式探测：Chromium 系 webm/opus，iOS WKWebView 仅 mp4/AAC（voice-video-research §2.3）
+// ——「录什么存什么」，mime 随消息走，播放端原生解码
+function pickVoiceMime() {
+  for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+    try { if (MediaRecorder.isTypeSupported?.(m)) return m } catch { /* ignore */ }
+  }
+  return ''
+}
+
+async function startRecording() {
+  if (state.recording) return
+  if (state.view.conv !== 'dm') { appendSys('语音仅支持私聊发送'); return }
+  const peer = state.net?.peers.get(state.view.peerId)
+  if (peer?.state !== 'ready') { appendSys('对端尚未建立加密会话，无法发送语音'); return }
+  if (!navigator.mediaDevices?.getUserMedia) { appendSys('当前环境不支持录音'); return }
+  let stream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+  } catch (e) {
+    appendSys('无法访问麦克风：请在系统/应用设置中允许录音权限')
+    return
+  }
+  const mime = pickVoiceMime()
+  let recorder
+  try {
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
+  } catch (e) {
+    for (const t of stream.getTracks()) t.stop()
+    appendSys('录音初始化失败：' + (e.message || e))
+    return
+  }
+  const rec = {
+    stream, recorder, mime: recorder.mimeType || mime || 'audio/webm',
+    chunks: [], startTs: Date.now(), waveform: [], meterTimer: null, ac: null, analyser: null,
+  }
+  state.recording = rec
+  recorder.ondataavailable = (e) => { if (e.data?.size) rec.chunks.push(e.data) }
+  // 波形：AnalyserNode 每 100ms 采一次 RMS，映射 0-9（48 点封顶）
+  try {
+    const ac = new AudioContext()
+    const src = ac.createMediaStreamSource(stream)
+    const analyser = ac.createAnalyser()
+    analyser.fftSize = 512
+    src.connect(analyser)
+    rec.ac = ac; rec.analyser = analyser
+    const buf = new Uint8Array(analyser.fftSize)
+    rec.meterTimer = setInterval(() => {
+      analyser.getByteTimeDomainData(buf)
+      let sum = 0
+      for (let i = 0; i < buf.length; i++) { const d = (buf[i] - 128) / 128; sum += d * d }
+      const rms = Math.sqrt(sum / buf.length)
+      rec.waveform.push(Math.max(1, Math.min(9, Math.round(rms * 14))))
+      if (rec.waveform.length >= 96) rec.waveform.shift() // 长录音只留最后 96 个采样窗
+      renderRecordingBar()
+    }, 100)
+  } catch { /* AudioContext 不可用：无波形也能发 */ }
+  recorder.start(250) // 250ms 分片：停止时最多丢最后半秒的尾部
+  renderRecordingBar()
+}
+
+function stopRecording(send) {
+  const rec = state.recording
+  if (!rec) return
+  state.recording = null
+  clearInterval(rec.meterTimer)
+  try { rec.ac?.close?.() } catch { /* ignore */ }
+  const stopped = new Promise((res) => {
+    rec.recorder.onstop = res
+    try { rec.recorder.stop() } catch { res() }
+  })
+  for (const t of rec.stream.getTracks()) t.stop()
+  const duration = Date.now() - rec.startTs
+  stopped.then(async () => {
+    renderRecordingBar()
+    if (!send) return // 取消：丢弃
+    if (duration < 500) { appendSys('录音太短（<0.5s），已丢弃'); return }
+    const blob = new Blob(rec.chunks, { type: rec.mime })
+    const bytes = new Uint8Array(await blob.arrayBuffer())
+    const fid = await state.filex.sendFile(state.view.peerId, {
+      bytes, name: `voice-${Date.now()}.${rec.mime.includes('mp4') ? 'm4a' : 'webm'}`,
+      size: bytes.length, mime: rec.mime.split(';')[0], lastModified: Date.now(),
+    }, { kind: 'voice', extra: { duration, waveform: compressWaveform(rec.waveform) } })
+    void fid
+  }).catch((e) => appendSys(`语音发送失败：${e.message || e}`))
+}
+
+// 波形压缩：固定 48 桶（采样窗平均池化），值域 0-9 → 48 字符串
+function compressWaveform(samples) {
+  const out = []
+  const N = 48
+  for (let i = 0; i < N; i++) {
+    const s = samples.length ? Math.round((i * samples.length) / N) : 0
+    const e = Math.max(s + 1, Math.round(((i + 1) * samples.length) / N))
+    let peak = 0
+    for (let j = s; j < Math.min(e, samples.length); j++) peak = Math.max(peak, samples[j])
+    out.push(String(peak % 10))
+  }
+  return out.join('')
+}
+
+function renderRecordingBar() {
+  const strip = $('recStrip')
+  if (!strip) return
+  const rec = state.recording
+  if (!rec) { strip.classList.add('hidden'); strip.innerHTML = ''; return }
+  strip.classList.remove('hidden')
+  const secs = Math.floor((Date.now() - rec.startTs) / 1000)
+  const bars = rec.waveform.slice(-32).map((v) => `<i style="height:${2 + v * 2}px"></i>`).join('')
+  strip.innerHTML = `<span class="rec-dot"></span><span class="mono">${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}</span>
+    <span class="rec-bars">${bars}</span>
+    <a class="del" id="recCancel">取消</a><span class="attach-hint">点击 🎤 结束并发送</span>`
+  const c = $('recCancel')
+  if (c) c.onclick = () => stopRecording(false)
+}
+
 // ---------- 工具 ----------
 
 function esc(s) {
@@ -551,7 +669,9 @@ function updateComposerPlaceholder() {
 
 function buildFileBubble(bubble, m, mine) {
   const st = state.filex?.status(m.fid)
-  if (m.type === 'image') {
+  if (m.type === 'voice') {
+    buildVoiceBubble(bubble, m, mine)
+  } else if (m.type === 'image') {
     const cached = state.imgUrls.get(m.fid)
     // 无本机字节且无缩略图：渲染占位（裸 <img> 无 src 会呈现"损坏文件"观感）
     if (!cached && !m.thumb) {
@@ -682,9 +802,98 @@ async function hydrateFxImage(m, img) {
   } catch { /* WebView 环境：停留缩略图 */ }
 }
 
+// ---------- 语音气泡播放器 ----------
+// 互斥：全局同时只放一条；进度以波形填充呈现；倍速 1x→1.5x→2x
+function buildVoiceBubble(bubble, m, mine) {
+  const bubbleWrap = document.createElement('div')
+  bubbleWrap.className = 'fx-voice'
+  const play = document.createElement('button')
+  play.className = 'fx-voice-play'
+  play.textContent = '▶'
+  const wave = document.createElement('span')
+  wave.className = 'fx-voice-wave'
+  const wf = String(m.waveform || '')
+  const bars = []
+  for (let i = 0; i < 24; i++) {
+    const v = Number(wf[i] || 5) || 1
+    bars.push(`<i style="height:${3 + v * 2.2}px"></i>`)
+  }
+  wave.innerHTML = bars.join('')
+  const dur = document.createElement('span')
+  dur.className = 'fx-voice-dur mono'
+  dur.textContent = fmtVoiceDur(m.duration)
+  const speed = document.createElement('button')
+  speed.className = 'fx-voice-speed mono'
+  speed.textContent = '1x'
+  speed.title = '倍速'
+  bubbleWrap.append(play, wave, dur, speed)
+  bubble.appendChild(bubbleWrap)
+
+  if (!m.duration && !m.waveform && m.text && m.text !== m.name) {
+    const cap = document.createElement('span')
+    cap.className = 'btext'
+    cap.textContent = m.text
+    bubble.appendChild(cap)
+  }
+
+  const st = state.filex?.status(m.fid)
+  if (st && st.state === 'active') {
+    const note = document.createElement('div')
+    note.className = 'fx-sub'
+    note.textContent = `${mine ? '发送' : '接收'}中 ${Math.round((st.done / Math.max(1, st.total)) * 100)}%`
+    bubble.appendChild(note)
+  }
+
+  const audio = new Audio()
+  let loaded = false
+  const setIcon = (playing) => { play.textContent = playing ? '⏸' : '▶' }
+  play.onclick = async () => {
+    // 互斥：停掉别的
+    if (state.voiceAudio && state.voiceAudio !== audio) {
+      try { state.voiceAudio.pause() } catch { /* ignore */ }
+      state.voicePlaying?.setIcon?.(false)
+    }
+    if (state.voiceAudio === audio && !audio.paused) { audio.pause(); setIcon(false); return }
+    if (!loaded) {
+      const bytes = await window.oray.fxRead(m.fid)
+      if (!bytes) { appendSys('语音字节不在本机：等接收完成后播放，或让对方重发'); return }
+      audio.src = URL.createObjectURL(new Blob([bytes], { type: m.mime || 'audio/webm' }))
+      loaded = true
+    }
+    audio.playbackRate = Number(speed.dataset.rate || 1)
+    audio.play().then(() => {
+      state.voiceAudio = audio
+      state.voicePlaying = { setIcon }
+      setIcon(true)
+    }).catch((e) => appendSys(`播放失败：${e.message || e}`))
+  }
+  audio.onpause = () => setIcon(false)
+  audio.onended = () => { setIcon(false); paint(0) }
+  audio.ontimeupdate = () => {
+    if (audio.duration > 0) paint(audio.currentTime / audio.duration)
+  }
+  const paint = (p) => {
+    const total = wave.children.length
+    const lit = Math.round(p * total)
+    for (let i = 0; i < total; i++) wave.children[i].classList.toggle('on', i < lit)
+  }
+  speed.onclick = () => {
+    const next = { 1: 1.5, 1.5: 2, 2: 1 }[Number(speed.dataset.rate || 1)] || 1
+    speed.dataset.rate = String(next)
+    speed.textContent = `${next}x`
+    audio.playbackRate = next
+  }
+}
+
+function fmtVoiceDur(ms) {
+  const s = Math.max(1, Math.round((Number(ms) || 0) / 1000))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 function renderConv() { renderChatHead(); renderReconnectBar(); renderMessages(); updateComposerPlaceholder() }
 
 function selectView(v) {
+  if (state.recording) stopRecording(false) // 离开会话：丢弃录音
   state.view = v
   document.body.classList.remove('sidebar-open') // 手机上选中即收起侧栏
   clearUnread(viewKey(v))
@@ -840,14 +1049,22 @@ async function doLogin(name, room) {
           mid: e.mid, author: state.myIdPubHex, text: e.text, t: e.t,
           type: e.type, fid: e.fid, name: e.name, size: e.size, mime: e.mime,
           w: e.w, h: e.h, thumb: e.thumb, mode: e.mode,
+          duration: e.duration, waveform: e.waveform, rate: e.rate,
         })
+        if (state.args.bot && e.type === 'voice') {
+          window.oray.botLog(`[BOT] VOICE-OUT fid=${e.fid} size=${e.size} duration=${e.duration} waveform=${JSON.stringify(e.waveform || '')}`)
+        }
       },
       onIncoming: (e) => {
         state.net.store.addMsg(state.net.storeKey('dm', e.peerId), {
           mid: e.mid, author: e.author, text: e.text, t: e.t,
           type: e.type, fid: e.fid, name: e.name, size: e.size, mime: e.mime,
           w: e.w, h: e.h, thumb: e.thumb, mode: e.mode,
+          duration: e.duration, waveform: e.waveform, rate: e.rate,
         })
+        if (state.args.bot && e.type === 'voice') {
+          window.oray.botLog(`[BOT] VOICE-IN fid=${e.fid} size=${e.size} duration=${e.duration} waveform=${JSON.stringify(e.waveform || '')}`)
+        }
       },
       onEvent: (e) => {
         if (state.args.bot && e.state !== 'active') {
@@ -1102,6 +1319,13 @@ function bindUi() {
     renderAttachStrip()
   })
   renderAttachStrip() // 初始隐藏
+
+  // ---------- 语音（仅私聊） ----------
+  $('micBtn').onclick = () => {
+    if (state.recording) { stopRecording(true); return } // 再点 = 结束并发送
+    startRecording()
+  }
+  renderRecordingBar()
   $('input').addEventListener('input', () => {
     const el = $('input')
     el.style.height = 'auto'
@@ -1143,6 +1367,39 @@ async function sendCurrent() {
 }
 
 // ---------- 附件发送 ----------
+
+// 合成 WAV（bot 测试用）：正弦+幅度的语音样形；波形串与采样峰值一致
+function synthVoiceWav(durationMs) {
+  const rate = 16000
+  const n = Math.floor((durationMs / 1000) * rate)
+  const pcm = new Uint8Array(44 + n * 2)
+  const dv = new DataView(pcm.buffer)
+  const wstr = (off, str) => { for (let i = 0; i < str.length; i++) pcm[off + i] = str.charCodeAt(i) }
+  wstr(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); wstr(8, 'WAVE')
+  wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true)
+  dv.setUint16(22, 1, true); dv.setUint32(24, rate, true)
+  dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true)
+  wstr(36, 'data'); dv.setUint32(40, n * 2, true)
+  const samples = []
+  for (let i = 0; i < n; i++) {
+    const t = i / rate
+    const env = 0.4 + 0.6 * Math.abs(Math.sin(t * 2 * Math.PI * 1.7)) // 语音样包络
+    const v = Math.round(Math.sin(t * 2 * Math.PI * 220) * env * 12000)
+    dv.setInt16(44 + i * 2, v, true)
+    samples.push(v)
+  }
+  // 160ms 窗取峰值 → 48 桶 0-9
+  const win = Math.floor(rate * 0.16)
+  const peaks = []
+  for (let b = 0; b < 48; b++) {
+    const s = Math.round((b * n) / 48), e = Math.max(s + 1, Math.round(((b + 1) * n) / 48))
+    let peak = 0
+    for (let j = s; j < Math.min(e, n); j++) peak = Math.max(peak, Math.abs(samples[j]))
+    peaks.push(Math.min(9, Math.round((peak / 12000) * 9)))
+  }
+  return { bytes: pcm, waveform: peaks.join('') }
+}
+
 
 function renderAttachStrip() {
   const strip = $('attachStrip')
@@ -1310,6 +1567,24 @@ async function main() {
           window.oray.botLog(`[BOT] TRY-DIRECT ok=${r.ok} detail=${JSON.stringify(r.detail)} path=${ready[1].path}`)
         } catch (e) { window.oray.botLog(`[BOT] TRY-DIRECT error=${e.message}`) }
       }, Number(state.args['try-direct-after-ms']))
+    }
+    if (state.args['send-voice-after-ms'] !== undefined && state.args['send-voice-after-ms'] !== false) {
+      setTimeout(async () => {
+        try {
+          let ready = null
+          for (let i = 0; i < 60 && !ready; i++) {
+            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+            if (!ready) await new Promise((r) => setTimeout(r, 2000))
+          }
+          if (!ready) { window.oray.botLog('[BOT] SEND-VOICE-NO-PEER'); return }
+          const duration = Number(state.args['voice-duration-ms']) || 1500
+          const { bytes, waveform } = synthVoiceWav(duration)
+          await state.filex.sendFile(ready[0], {
+            bytes, name: `voice-${Date.now()}.wav`, size: bytes.length,
+            mime: 'audio/wav', lastModified: Date.now(),
+          }, { kind: 'voice', extra: { duration, waveform } })
+        } catch (e) { window.oray.botLog(`[BOT] SEND-VOICE-ERR ${e?.message || e}`) }
+      }, Number(state.args['send-voice-after-ms']))
     }
     if (state.args['del-contact']) {
       // 注入器：按昵称删除联系人（实机验证名录抑制/桶清除/上线恢复）

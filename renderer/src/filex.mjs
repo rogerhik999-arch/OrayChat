@@ -48,6 +48,8 @@ const TX_STALL_MS = 5 * 60000
 // 组内任丢 1 块由接收方本地恢复（免一次 RTT 重传）。奇偶块索引 = n + 组号，
 // 旧版接收方按 i>=tx.n 丢弃，天然向后兼容；丢奇偶块只是失去优化，数据重传兜底。
 export const FEC_GROUP = 8
+// 语音/视频消息的随路元数据（进 offer、本地日志、接收方日志；体积以字节计）
+export const FX_EXTRA_KEYS = ['duration', 'waveform', 'rate']
 
 // ---------- deflate 助手（CompressionStream 全局可用：Electron/现代 WebView/Node 18+） ----------
 
@@ -140,11 +142,13 @@ export class FileX {
 
   // file: {bytes:Uint8Array, name, size, mime, lastModified}（bytes 为"实际传输内容"，
   // 图片默认已格式压缩；orig 模式即原始文件字节）
-  async sendFile(peerId, file, { kind = 'file', orig = false, caption = '' } = {}) {
+  async sendFile(peerId, file, { kind = 'file', orig = false, caption = '', extra = {} } = {}) {
     const peer = this.peer(peerId)
     if (!peer || peer.state !== 'ready') throw new Error('对端尚未建立加密会话')
     if (file.size > FX_MAX_SIZE) throw new Error(`文件超过 ${Math.round(FX_MAX_SIZE / 1048576)}MB 上限`)
     if (this.tx.size > 8) throw new Error('传输任务过多，请稍后再试')
+    const extraClean = {}
+    for (const k of FX_EXTRA_KEYS) if (extra[k] !== undefined) extraClean[k] = extra[k]
 
     const rawSha = await sha256Hex(file.bytes) // 原始内容指纹（兼探测 id 与流压缩终检）
     let bytes = file.bytes, w, h, mime = file.mime || 'application/octet-stream', mode = 'raw', alg = ''
@@ -198,6 +202,7 @@ export class FileX {
       lastProgressAt: Date.now(), startedAt: Date.now(),
       sentHist: [], // [ts, ackedTotal] 速率采样
       caption: caption || file.name, thumb: file.thumb || '',
+      ...extraClean,
     }
     this.tx.set(fid, tx)
 
@@ -205,19 +210,21 @@ export class FileX {
     this.hooks.onOutgoing?.({
       mid: oc.newMid(), text: tx.caption, t: Date.now(),
       type: kind, fid, name: file.name, size: bytes.length, mime, w, h, thumb: tx.thumb, mode,
+      ...extraClean,
       peerId,
     })
 
     const offer = {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
+      ...extraClean,
       fec: 1, // P1-1：8+1 XOR 奇偶块广播（旧版接收方按 i>=n 丢弃，向后兼容）
       hashes, // P2-2：逐块哈希清单（n>8192 时为 null 跳过）
     }
     if (stream) { offer.alg = 'deflate'; offer.raw = file.bytes.length; offer.rsha = rawSha }
     tx.offer = offer
     await this.sendOffer(peerId, offer, tx)
-    this.log(`发送${kind === 'image' ? '图片' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}${stream ? '，流压缩' : ''}）`)
+    this.log(`发送${kind === 'image' ? '图片' : kind === 'voice' ? '语音' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}${stream ? '，流压缩' : ''}）`)
     this.emit({ fid, dir: 'send', state: 'active', done: 0, total: n, name: tx.name })
     this.startPump(fid)
     return fid
@@ -476,7 +483,7 @@ export class FileX {
       tx = {
         fid: o.fid, dir: 'recv', peerId, state: 'active', cs: o.cs, n: o.n, size: o.size,
         name: String(o.name || o.fid), mime: o.mime || 'application/octet-stream',
-        kind: o.kind === 'image' ? 'image' : 'file', sha: o.sha, mode: o.mode,
+        kind: o.kind === 'image' || o.kind === 'voice' ? o.kind : 'file', sha: o.sha, mode: o.mode,
         w: o.w, h: o.h, orig: !!o.orig, thumb: o.thumb || '',
         hashes: Array.isArray(o.hashes) ? o.hashes : null, // P2-2 逐块哈希清单
         alg: o.alg === 'deflate' ? 'deflate' : '', rawSha: o.rsha || '', rawSize: o.raw || 0, // P2-1 流压缩
@@ -489,9 +496,11 @@ export class FileX {
       this.hooks.onIncoming?.({
         mid: oc.newMid(), text: tx.caption, t: Date.now(), author: peer.idPubHex,
         type: tx.kind, fid: o.fid, name: tx.name, size: o.size, mime: tx.mime,
-        w: o.w, h: o.h, thumb: tx.thumb, mode: o.mode, peerId,
+        w: o.w, h: o.h, thumb: tx.thumb, mode: o.mode,
+        duration: o.duration, waveform: o.waveform, rate: o.rate,
+        peerId,
       })
-      this.log(`接收${tx.kind === 'image' ? '图片' : '文件'} ${tx.name}（${fmtSize(o.size)}${bitmapCount(st.have) ? `，续传 ${bitmapCount(st.have)}/${o.n}` : ''}）`)
+      this.log(`接收${tx.kind === 'image' ? '图片' : tx.kind === 'voice' ? '语音' : '文件'} ${tx.name}（${fmtSize(o.size)}${bitmapCount(st.have) ? `，续传 ${bitmapCount(st.have)}/${o.n}` : ''}）`)
     }
     tx.state = 'active'
     await this.sendHave(peerId, o.fid) // 告知已有位图（断点续传起点）
