@@ -538,5 +538,32 @@ const WINDOW_DEFAULT = 16 // P2P 默认窗口（与 filex WINDOW_P2P 一致）
   assert.equal(e.waveform, extra.waveform, 'waveform 经导出/导入保留')
   assert.equal(e.hack, undefined, '白名单外字段被丢弃')
 }
-console.log('filex.test.mjs ✓ 全部通过（…/流压缩/块哈希/双路径/多源获取/语音元数据）')
+// ---- 19) 发送方落盘自己的字节（可回放/持有） + 重复 offer 对完成事务回 fx-done ----
+{
+  const { wire, netA, netB } = link()
+  const doneReplies = []
+  netB.sendCtl = async (pid, fr) => { if (fr.op === 'fx-done') doneReplies.push(fr) }
+  const fxA = mkFileX(netA)
+  const fxB = mkFileX(netB)
+  const content = new Uint8Array(40000)
+  for (let i = 0; i < content.length; i++) content[i] = crypto.getRandomValues(new Uint8Array(1))[0]
+  const fid = await fxA.sendFile('B', { bytes: content, name: 'own.bin', size: content.length, mime: 'application/octet-stream', lastModified: 14 })
+  // 发送方落盘：io.read 能拿到自己的字节（回放/多源持有）
+  const own = await fxA.io.read(fid)
+  assert.ok(own && own.length === content.length, '发送方应落盘自己的字节')
+  assert.equal(await sha256Hex(own), await sha256Hex(content), '落盘内容与原文件一致')
+  // 对端回放已收完的 offer（bob 已 done）→ 应回 fx-done 而非重激活
+  for (let r = 0; r < 100 && !(fxB.tx.get(fid)?.state === 'done'); r++) {
+    for (const f of wire.a2b.splice(0)) { f.__fx ? await fxB.onFrame('A', f.__fx) : fxB.onCtl('A', f) }
+    for (const f of wire.b2a.splice(0)) { f.__fx ? await fxA.onFrame('B', f.__fx) : fxA.onCtl('B', f) }
+    await drain(20)
+  }
+  assert.equal(fxB.tx.get(fid)?.state, 'done')
+  const offer2 = { op: 'fx-offer', fid, kind: 'file', name: 'own.bin', size: content.length, mime: 'application/octet-stream', sha: await sha256Hex(content), cs: 32768, n: 2, mode: 'raw' }
+  await fxB.onCtl('A', offer2) // 重复 offer（模拟最终 ACK 丢失后发送方重发）
+  assert.equal(fxB.tx.get(fid)?.state, 'done', '完成事务不得被重复 offer 重激活')
+  assert.equal(doneReplies.at(-1).sha, await sha256Hex(content), '重复 offer 应再回 fx-done（治愈发送端 0% 死锁）')
+}
+
+console.log('filex.test.mjs ✓ 全部通过（…/语音元数据/发送方落盘/完成事务fx-done）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

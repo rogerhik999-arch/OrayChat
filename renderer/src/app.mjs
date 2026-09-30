@@ -76,7 +76,10 @@ async function makeThumb(bytes, mime) {
 // 格式探测：Chromium 系 webm/opus，iOS WKWebView 仅 mp4/AAC（voice-video-research §2.3）
 // ——「录什么存什么」，mime 随消息走，播放端原生解码
 function pickVoiceMime() {
-  for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+  // audio/mp4(AAC) 优先：桌面 Chromium/Android WebView/iOS WKWebView 三端
+  // MediaRecorder 都支持且都能解码（webm/opus 在 iOS 无法解码——用户实测
+  // "no supported source"）；webm/opus 仅作 mp4 不可用时的兜底
+  for (const m of ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']) {
     try { if (MediaRecorder.isTypeSupported?.(m)) return m } catch { /* ignore */ }
   }
   return ''
@@ -100,7 +103,7 @@ async function startRecording() {
   const mime = pickVoiceMime()
   let recorder
   try {
-    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : undefined)
   } catch (e) {
     for (const t of stream.getTracks()) t.stop()
     appendSys('录音初始化失败：' + (e.message || e))

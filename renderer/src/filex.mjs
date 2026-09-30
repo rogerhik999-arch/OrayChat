@@ -224,6 +224,15 @@ export class FileX {
     }
     if (stream) { offer.alg = 'deflate'; offer.raw = file.bytes.length; offer.rsha = rawSha }
     tx.offer = offer
+    // 发送方同样落盘：自己可回放/另存、成为多源持有者、重启后可续发。
+    // 流压缩时存原始字节（finalize 按原始 sha 校验，fxRead 得到可播放内容）
+    try {
+      const own = stream ? file.bytes : bytes
+      for (let i = 0; i < n; i++) {
+        await this.io.write(fid, i, cs, own.subarray(i * cs, Math.min((i + 1) * cs, own.length)))
+      }
+      await this.io.finalize(fid, stream ? rawSha : sha, file.name)
+    } catch { /* 落盘失败不影响发送（仅失去本地回放/持有） */ }
     await this.sendOffer(peerId, offer, tx)
     this.log(`发送${kind === 'image' ? '图片' : kind === 'voice' ? '语音' : '文件'} ${file.name}（${fmtSize(bytes.length)}${mode === 'img' ? '，已压缩' : ''}${orig ? '，原图' : ''}${stream ? '，流压缩' : ''}）`)
     this.emit({ fid, dir: 'send', state: 'active', done: 0, total: n, name: tx.name })
@@ -503,6 +512,11 @@ export class FileX {
       })
       this.log(`接收${tx.kind === 'image' ? '图片' : tx.kind === 'voice' ? '语音' : '文件'} ${tx.name}（${fmtSize(o.size)}${bitmapCount(st.have) ? `，续传 ${bitmapCount(st.have)}/${o.n}` : ''}）`)
     }
+    // 已完成的事务收到重复 offer（发送方丢了最终 ACK）：直接回 fx-done，不重激活
+    if (tx.state === 'done') {
+      this.net.sendCtl(peerId, { op: 'fx-done', fid: o.fid, sha: tx.sha }).catch(() => {})
+      return
+    }
     tx.state = 'active'
     await this.sendHave(peerId, o.fid) // 告知已有位图（断点续传起点）
   }
@@ -613,7 +627,13 @@ export class FileX {
   // 停滞中的传输一并复活
   onSessionReady(peerId) {
     for (const tx of this.tx.values()) {
-      if (tx.peerId !== peerId || (tx.state !== 'active' && tx.state !== 'stalled')) continue
+      if (tx.peerId !== peerId) continue
+      // 已完成的接收事务：补发 fx-done——若最终 ACK 丢失，发送方会卡在"发送中 0%"
+      if (tx.dir === 'recv' && tx.state === 'done') {
+        this.net.sendCtl(peerId, { op: 'fx-done', fid: tx.fid, sha: tx.sha }).catch(() => {})
+        continue
+      }
+      if (tx.state !== 'active' && tx.state !== 'stalled') continue
       tx.state = 'active'
       tx.lastLifeAt = Date.now()
       if (tx.dir === 'recv') this.sendHave(peerId, tx.fid)
