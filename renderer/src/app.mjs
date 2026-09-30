@@ -1072,6 +1072,18 @@ async function doLogin(name, room) {
         })
         if (state.args.bot && e.type === 'voice') {
           window.oray.botLog(`[BOT] VOICE-IN fid=${e.fid} size=${e.size} duration=${e.duration} waveform=${JSON.stringify(e.waveform || '')}`)
+          // 播放验证（解码级）：轮询等落盘，再用 <Audio> 真实解码，canplay 即成功
+          ;(async () => {
+            let bytes = null
+            for (let i = 0; i < 30 && !bytes; i++) { bytes = await window.oray.fxRead(e.fid); if (!bytes) await new Promise((r) => setTimeout(r, 2000)) }
+            if (!bytes) { window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} no-bytes`); return }
+            const audio = new Audio()
+            audio.src = URL.createObjectURL(new Blob([bytes], { type: e.mime || 'audio/webm' }))
+            audio.oncanplay = () => window.oray.botLog(`[BOT] PLAYBACK-OK fid=${e.fid} dur=${audio.duration ? audio.duration.toFixed(1) : '?'}`)
+            audio.onerror = () => window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} decode code=${audio.error?.code} msg=${audio.error?.message || ''} bytes=${bytes.length} ctor=${bytes.constructor?.name} mime=${e.mime}`)
+            audio.load()
+            setTimeout(() => { if (!audio.duration) window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} timeout`) }, 10000)
+          })()
         }
       },
       onEvent: (e) => {
@@ -1584,12 +1596,77 @@ async function main() {
         if (hit) { clearInterval(t); selectView({ conv: 'dm', peerId: hit[0] }) }
       }, 1000)
     }
+    if (state.args['roster-log']) {
+      // 在线状态观测：每 5s 采样，仅名单变化时打点（状态变更即事件，断言不漏）
+      let last = ''
+      setInterval(() => {
+        if (!state.net) return
+        const online = [...state.net.peers.values()].filter((p) => p.state === 'ready').map((p) => p.name).sort()
+        const hist = buildRoster().filter((r) => !r.online).map((r) => r.name).sort()
+        const line = `online=[${online.join(',')}] history=[${hist.join(',')}]`
+        if (line !== last) { last = line; window.oray.botLog(`[BOT] ROSTER ${line}`) }
+      }, 5000)
+    }
+    if (state.args['save-latest'] !== undefined && state.args['save-latest'] !== false) {
+      // 下载验证：轮询收到的 file/image/voice 条目，逐个 fxSave；未完成（not-found）
+      // 时下轮重试（≤10 次），成功才标记——传输完成先后不定
+      const savedOk = new Set()
+      const attempts = new Map()
+      const poll = setInterval(() => {
+        if (!state.net) return
+        if (savedOk.size >= 3) { clearInterval(poll); return }
+        for (const c of Object.values(state.net.store.exportAll())) {
+          for (const e of c.entries || []) {
+            if (!e.fid || savedOk.has(e.fid)) continue
+            if (e.type !== 'file' && e.type !== 'image' && e.type !== 'voice') continue
+            if (e.author === state.myIdPubHex) continue // 只保存收到的
+            const n = (attempts.get(e.fid) || 0) + 1
+            attempts.set(e.fid, n)
+            if (n > 10) continue
+            window.oray.fxSave(e.fid, e.name).then((r) => {
+              if (r && r.ok) { savedOk.add(e.fid); window.oray.botLog(`[BOT] SAVED fid=${e.fid} name=${JSON.stringify(e.name)} path=${JSON.stringify(r.path)}`) }
+            }).catch(() => { /* 下轮重试 */ })
+          }
+        }
+      }, 3000)
+    }
+
+    if (state.args['dump-store-alone']) {
+      // 独立存储转储（switch-seq 之外）：dump-after-ms 后打印全部会话条目
+      setTimeout(() => {
+        for (const [key, c] of Object.entries(state.net.store.exportAll())) {
+          const texts = (c.entries || []).map((e) => `${(e.author || '').slice(0, 6)}:${e.text}`).join(' | ')
+          window.oray.botLog(`[BOT] STORE conv=${key} n=${(c.entries || []).length} [${texts}]`)
+        }
+        window.oray.botLog('[BOT] STORE-DONE')
+        if (state.args['exit-after-dump']) window.oray.botExit(0)
+      }, Number(state.args['dump-after-ms']) || 8000)
+    }
+    if (state.args['send-lobby-when-absent']) {
+      // 离线信息：指定昵称持续缺席 15s（吸收对端重启的秒级间隙）后，才发大厅消息
+      const absent = String(state.args['send-lobby-when-absent'])
+      const text = String(state.args['lobby-text'] || 'offline-msg')
+      let absentSince = 0
+      const t = setInterval(async () => {
+        const still = [...(state.net?.peers?.values() || [])].some((p) => p.state === 'ready' && p.name === absent)
+        if (still) { absentSince = 0; return }
+        if (!absentSince) { absentSince = Date.now(); return }
+        if (Date.now() - absentSince < 15000) return
+        clearInterval(t)
+        try {
+          const r = await state.net.sendMessage('all', text, 'lobby')
+          window.oray.botLog(`[BOT] LOBBY-SENT-ABSENT text=${JSON.stringify(text)} peers=${r.count}`)
+        } catch (e) { window.oray.botLog(`[BOT] LOBBY-ABSENT-ERR ${e?.message || e}`) }
+      }, 2000)
+    }
     if (state.args['send-voice-after-ms'] !== undefined && state.args['send-voice-after-ms'] !== false) {
       setTimeout(async () => {
         try {
           let ready = null
+          const wantPeerV = state.args['send-to'] ? String(state.args['send-to']) : ''
           for (let i = 0; i < 60 && !ready; i++) {
-            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && (!wantPeerV || p.name === wantPeerV))
+              || [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && !wantPeerV)
             if (!ready) await new Promise((r) => setTimeout(r, 2000))
           }
           if (!ready) { window.oray.botLog('[BOT] SEND-VOICE-NO-PEER'); return }
@@ -1618,8 +1695,10 @@ async function main() {
         try {
           // 轮询等就绪对端（对端可能后启动）
           let ready = null
+          const wantPeer = state.args['send-to'] ? String(state.args['send-to']) : ''
           for (let i = 0; i < 60 && !ready; i++) {
-            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')
+            ready = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && (!wantPeer || p.name === wantPeer))
+              || [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && !wantPeer)
             if (!ready) await new Promise((r) => setTimeout(r, 2000))
           }
           if (!ready) { window.oray.botLog('[BOT] SEND-FILE-NO-PEER'); return }

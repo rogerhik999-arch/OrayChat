@@ -136,30 +136,23 @@ function fakePeer(over = {}) {
   assert.equal(net.digestTries.get('freshZ'), 1)
 }
 
-// ---- 7) 握手连败冷却：3 次失败 → 回收+冷却；presence/摘要不复种；对端主动 hs1 接受 ----
+// ---- 7) 握手失败簿记：只计数告警，不拦截自动建联（v1.21.3 冷却曾在抖动网络
+// 下致双方互等死锁——presence 活跃的对端必须保持可恢复）；条目回收由 30s
+// 快速 reaper 兜住；对端主动 hs1 无条目也接受 ----
 {
   const { net } = bareNet()
-  net.dropGhost = ChatNet.prototype.dropGhost.bind(net, ) // 用真实现（触发 recentlyReaped）
-  net.dropGhost = (pid, peer, why) => ChatNet.prototype.dropGhost.call(net, pid, peer, why)
-  net.startHandshake = ChatNet.prototype.startHandshake.bind(net)
-  const P = 'zz' + 'a'.repeat(18) // 确保.peerId（iAmInitiator 需 selfId < peerId 才接受 hs1——见下）
   const mk = (over = {}) => fakePeer({ name: 'ghosty', state: 'failed', lastError: '握手超时', lastProgress: NOW - 100000, ...over })
-  // 三次握手失败（真实路径中 restartHandshake 保留同一 peer 对象，hsFails 累计）
   const p1 = mk()
   net.peers.set('g1', p1)
   net.failHandshake('g1', p1, '握手超时')
   net.failHandshake('g1', p1, '握手超时')
   net.failHandshake('g1', p1, '握手超时')
-  assert.ok(!net.peers.has('g1'), '连续 3 次失败后条目应被回收')
-  assert.ok((net.hsCooldown.get('g1') || 0) > Date.now(), '进入冷却期')
-  // 冷却期内：presence 不再自动建联
+  assert.equal(p1.hsFails, 3, '失败计数累计')
+  assert.ok(net.peers.has('g1'), '条目保留（由 30s reaper 回收，不做建联冷却）')
+  // presence 再到：允许重新建联（对端在线必须可恢复）
   net.onRelayAnnounce('g1', { name: 'ghosty' })
-  assert.ok(!net.peers.has('g1'), '冷却期内 presence 不得自动建联')
-  // 冷却期内：摘要也不复种
-  net.peers.set('seed', fakePeer({ name: 'seed', state: 'ready' }))
-  net.absorbDigest('seed', ['g1|ghosty'])
-  assert.ok(!net.peers.has('g1'), '冷却期内摘要不得复种')
-  // 对端主动 hs1：无条目也接受（绕过冷却）——对端发起 = 对端排序在我之前 = pid < selfId
+  assert.ok(net.peers.has('g1'), 'presence 活跃的对端始终可自动建联')
+  // 对端主动 hs1：无条目也接受 —— 对端发起 = 对端排序在我之前 = pid < selfId
   const { selfId } = await import('../renderer/src/net.mjs')
   let pid = null
   for (let i = 0; i < 500 && !pid; i++) {
@@ -167,12 +160,11 @@ function fakePeer(over = {}) {
     if (cand < selfId) pid = cand
   }
   assert.ok(pid, '应能生成 < selfId 的 peerId')
-  const { makeHs1 } = await import('../renderer/src/crypto.mjs')
-  const ident = (await import('../renderer/src/crypto.mjs')).createIdentity()
+  const { makeHs1, createIdentity } = await import('../renderer/src/crypto.mjs')
+  const ident = createIdentity()
   const { msg } = makeHs1(ident, 'ghosty', 'room-x', null)
   net.onHandshakeFrame(pid, msg, 'mqtt')
-  assert.ok(net.peers.has(pid), '对端主动 hs1 应无条件接受（绕过冷却）')
-  assert.ok(!net.hsCooldown.has(pid), '接受主动握手应解除冷却')
+  assert.ok(net.peers.has(pid), '对端主动 hs1 无条目也接受')
 }
 
-console.log('ghosts.test.mjs ✓ 全部通过（身份去重 / 残身回收 / 视野门控 / 摘要复种防护 / 握手连败冷却）')
+console.log('ghosts.test.mjs ✓ 全部通过（身份去重 / 残身回收 / 视野门控 / 摘要复种防护 / 握手失败簿记）')

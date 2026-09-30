@@ -382,8 +382,9 @@ export class ChatNet {
       }
       return // 其余已有会话不动（P2P 优先）
     }
-    const cd = this.hsCooldown.get(peerId)
-    if (cd && cd > Date.now()) return // 连续握手失败冷却期：不再自动建联（对方主动 hs1 仍接受）
+    // 注：连续握手失败不再拦截自动建联（v1.21.3 冷却曾致抖动网络下双方互等、
+    // 传输死锁）——presence 活跃 = 对端在线，必须保持可恢复；离线残身由
+    // reapGhosts 的 30s 快速回收兜住
     const peer = this.ensurePeer(peerId, 'mqtt')
     peer.name = info.name
     this.startHandshake(peerId)
@@ -532,18 +533,14 @@ export class ChatNet {
     this.failHandshake(peerId, peer, '握手超时')
   }
 
-  // 握手失败簿记：连续 HS_FAIL_MAX 次失败 → 该 peerId 进入冷却期（不再因
-  // presence/摘要自动建联，防"在线成员"被建联中残身循环刷屏）；对端主动
-  // 发起的握手（hs1）不受冷却限制——那是明确的在线意图。
+  // 握手失败簿记：仅计数与诊断日志。不设自动建联冷却——presence 活跃的对端
+  // 必须保持可恢复（v1.21.3 的冷却在抖动网络下致双方互等、传输死锁）
   failHandshake(peerId, peer, why) {
     peer.state = 'failed'
     peer.lastError = why
     peer.hsFails = (peer.hsFails || 0) + 1
-    if (peer.hsFails >= HS_FAIL_MAX) {
-      this.hsCooldown.set(peerId, Date.now() + HS_FAIL_COOLDOWN_MS)
-      this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… 连续 ${peer.hsFails} 次握手失败，暂停自动建联 10 分钟（对方主动连接仍会接受）`, 'warn')
-      this.dropGhost(peerId, peer, `连续握手失败（${why}）`)
-      return
+    if (peer.hsFails === HS_FAIL_MAX) {
+      this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… 已连续 ${peer.hsFails} 次握手失败（对端在线时仍会持续重试）`, 'warn')
     }
     this.hooks.onPeerFailed?.(peerId, peer)
   }
@@ -564,7 +561,6 @@ export class ChatNet {
       // 否则冷却期会连"对方真正想连"的请求一起挡掉
       if (msg?.t !== 'OC-HS1-v1' || this.iAmInitiator(peerId)) return
       peer = this.ensurePeer(peerId, via)
-      this.hsCooldown.delete(peerId)
     }
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
     if (!this.acceptsVia(peer, via)) return
@@ -645,7 +641,6 @@ export class ChatNet {
     peer.suspect = false
     peer.suspectAt = 0
     peer.hsFails = 0
-    this.hsCooldown.delete(peerId)
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
     peer.lastProgress = Date.now()
@@ -1065,8 +1060,6 @@ export class ChatNet {
       const known = this.relay?.peers?.get(pid)
       if (known?.suspectSince) this.relay.markAlive(pid)
       if (this.recentlyReaped.has(pid)) continue // 刚回收的残身：冷却期内不被摘要复种
-      const hcd = this.hsCooldown.get(pid)
-      if (hcd && hcd > Date.now()) continue // 连续握手失败冷却期：摘要也不复种
       const name = decodeURIComponent(encName || '')
       const existing = this.peers.get(pid)
       if (!existing) {
@@ -1209,7 +1202,6 @@ export class ChatNet {
     if (!conn) this.relayStableSince = 0
     this._relayWasConn = conn
     for (const [pid, ts] of this.recentlyReaped) if (now - ts > REAP_COOLDOWN_MS) this.recentlyReaped.delete(pid)
-    for (const [pid, until] of this.hsCooldown) if (until <= now) this.hsCooldown.delete(pid)
     // 我方中继不在线/刚连上：视野不可信，本轮不回收
     if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) return
     for (const [peerId, peer] of [...this.peers.entries()]) {
