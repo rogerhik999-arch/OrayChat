@@ -209,7 +209,7 @@ export class FileX {
     // 落本地日志（type/fid/缩略图随条目同步给对端）
     this.hooks.onOutgoing?.({
       mid: oc.newMid(), text: tx.caption, t: Date.now(),
-      type: kind, fid, name: file.name, size: bytes.length, mime, w, h, thumb: tx.thumb, mode,
+      type: kind, fid, name: file.name, size: stream ? file.bytes.length : bytes.length, mime, w, h, thumb: tx.thumb, mode,
       ...extraClean,
       peerId,
     })
@@ -217,6 +217,7 @@ export class FileX {
     const offer = {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
+      osize: stream ? file.bytes.length : bytes.length, // UX 尺寸（流压缩时=原始大小）
       ...extraClean,
       fec: 1, // P1-1：8+1 XOR 奇偶块广播（旧版接收方按 i>=n 丢弃，向后兼容）
       hashes, // P2-2：逐块哈希清单（n>8192 时为 null 跳过）
@@ -495,7 +496,7 @@ export class FileX {
       // 落本地日志（含缩略图，随共享日志同步；字节不进日志）
       this.hooks.onIncoming?.({
         mid: oc.newMid(), text: tx.caption, t: Date.now(), author: peer.idPubHex,
-        type: tx.kind, fid: o.fid, name: tx.name, size: o.size, mime: tx.mime,
+        type: tx.kind, fid: o.fid, name: tx.name, size: o.osize || o.size, mime: tx.mime,
         w: o.w, h: o.h, thumb: tx.thumb, mode: o.mode,
         duration: o.duration, waveform: o.waveform, rate: o.rate,
         peerId,

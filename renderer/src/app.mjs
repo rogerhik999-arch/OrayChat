@@ -6,16 +6,11 @@ import * as oc from './crypto.mjs'
 import { dmConvKey } from './store.mjs'
 import { FileX, fmtSize } from './filex.mjs'
 
-// P1-3 unordered 通道（file-transfer-research P1-3）：DataChannel 默认 ordered=true
-// 存在队头阻塞——丢一帧，后面所有帧（包括心跳 ctl）都要等它重传。文件块语义
-// 乱序安全（每块独立 AEAD + 位图收账），协议层全量容忍乱序（seq/txid/AAD 去重
-// + 各控制帧自带重发），故全局切 unordered。msg 的 seq 乱序由 3s×3 重传兜底。
-try {
-  const origCreate = RTCPeerConnection.prototype.createDataChannel
-  RTCPeerConnection.prototype.createDataChannel = function (label, opts) {
-    return origCreate.call(this, label, { ...opts, ordered: false })
-  }
-} catch { /* 非 WebRTC 环境（node 单测） */ }
+// P1-3 unordered 通道：已回退（v1.21.1）。Trystero 把 >16KB 的载荷切成 wire 分片
+// 并按「到达序」重组（无片序号排序）——ordered:false 下乱序到达即拼接错乱，
+// 大图片/语音（32KB 块 × 2-3 分片）在丢帧抖动下会被 AEAD 拒收、退化为反复重传
+// （用户实测"图片碎片"）。HOL 阻塞已由 32KB 块 + pacing + 速率预算缓解；
+// 恢复 unordered 需上游支持分片排序（file-transfer-research.md P1-3 已标注）。
 
 const $ = (id) => document.getElementById(id)
 const state = {
@@ -580,7 +575,13 @@ function renderMessages() {
     row.className = 'msg' + (mine ? ' me' : '')
     const bubble = document.createElement('div')
     bubble.className = 'bubble'
-    if (m.type === 'image' || m.type === 'file') {
+    // 版本偏差自愈：旧版接收端曾把 voice/image 的 offer 降级存成 type:'file'——
+    // 渲染时按 mime 矫正（不改持久化数据），升级后历史记录也恢复正常显示
+    const fxType = m.type === 'file' && /^audio\//.test(m.mime || '') ? 'voice'
+      : m.type === 'file' && /^image\//.test(m.mime || '') ? 'image' : m.type
+    if (fxType === 'voice') {
+      buildVoiceBubble(bubble, m, mine)
+    } else if (fxType === 'image' || fxType === 'file') {
       buildFileBubble(bubble, m, mine)
     } else {
       if (!mine && (state.view.conv === 'lobby' || state.view.conv === 'dm-offline')) {
@@ -669,9 +670,7 @@ function updateComposerPlaceholder() {
 
 function buildFileBubble(bubble, m, mine) {
   const st = state.filex?.status(m.fid)
-  if (m.type === 'voice') {
-    buildVoiceBubble(bubble, m, mine)
-  } else if (m.type === 'image') {
+  if (m.type === 'image') {
     const cached = state.imgUrls.get(m.fid)
     // 无本机字节且无缩略图：渲染占位（裸 <img> 无 src 会呈现"损坏文件"观感）
     if (!cached && !m.thumb) {
@@ -786,6 +785,7 @@ function buildFileBubble(bubble, m, mine) {
 async function hydrateFxImage(m, img) {
   try {
     const bytes = await window.oray.fxRead(m.fid)
+    if (state.args?.bot) window.oray.botLog(`[BOT] HYDRATE fid=${m.fid} bytes=${bytes ? bytes.length : 'null'} mime=${m.mime}`)
     if (!bytes) {
       if (!img.isConnected) return
       if (!m.thumb) {
@@ -846,6 +846,11 @@ function buildVoiceBubble(bubble, m, mine) {
 
   const audio = new Audio()
   let loaded = false
+  audio.onloadedmetadata = () => {
+    if (!m.duration && audio.duration && isFinite(audio.duration)) {
+      dur.textContent = fmtVoiceDur(audio.duration * 1000)
+    }
+  }
   const setIcon = (playing) => { play.textContent = playing ? '⏸' : '▶' }
   play.onclick = async () => {
     // 互斥：停掉别的
@@ -1567,6 +1572,14 @@ async function main() {
           window.oray.botLog(`[BOT] TRY-DIRECT ok=${r.ok} detail=${JSON.stringify(r.detail)} path=${ready[1].path}`)
         } catch (e) { window.oray.botLog(`[BOT] TRY-DIRECT error=${e.message}`) }
       }, Number(state.args['try-direct-after-ms']))
+    }
+    if (state.args['open-dm']) {
+      // 注入器：等指定昵称的就绪会话并切到该私聊（UI 截图验证用）
+      const want = String(state.args['open-dm'])
+      const t = setInterval(() => {
+        const hit = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready' && p.name === want)
+        if (hit) { clearInterval(t); selectView({ conv: 'dm', peerId: hit[0] }) }
+      }, 1000)
     }
     if (state.args['send-voice-after-ms'] !== undefined && state.args['send-voice-after-ms'] !== false) {
       setTimeout(async () => {

@@ -415,6 +415,12 @@ function createWindow() {
     win.webContents.once('did-finish-load', () => {
       setTimeout(async () => {
         try {
+          if (argv['dom-dump']) {
+            const info = await win.webContents.executeJavaScript(
+              `JSON.stringify([...document.querySelectorAll('img.fx-img')].map(i => ({src: (i.currentSrc || i.src || '').slice(0, 40), complete: i.complete, nw: i.naturalWidth, broken: i.complete && i.naturalWidth === 0})))`
+            ).catch((e) => 'eval-err: ' + e.message)
+            process.stdout.write(`[dom-dump] ${info}\n`)
+          }
           const img = await win.webContents.capturePage()
           fs.writeFileSync(String(argv.shot), img.toPNG())
           process.stdout.write(`[shot] saved ${argv.shot}\n`)
