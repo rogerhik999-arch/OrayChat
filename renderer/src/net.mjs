@@ -28,7 +28,10 @@ const PRESENCE_HEARTBEAT_MS = 15000
 // peerId 回来，旧条目若死亡路径未触发（崩溃时 WebRTC 没有 leave 事件、
 // p2p 会话不走 onRelayGone）会永远挂在在线列表里。回收判据见 reapGhosts。
 const REAP_INTERVAL_MS = 15000
-const GHOST_GRACE_MS = 90000 // 视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
+const GHOST_GRACE_MS = 90000 // 已建立会话：视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
+const GHOST_FAST_MS = 30000 // 未就绪条目（建联中/握手失败）：无进展 30s 即回收——握手超时才 15s，两倍足矣
+const HS_FAIL_MAX = 3 // 连续握手失败次数上限：达到后进入冷却，不再自动建联（防在线列表被建联中残身刷屏）
+const HS_FAIL_COOLDOWN_MS = 10 * 60000
 const RELAY_VIEW_WARMUP_MS = 75000 // 我方中继刚连上时视野不完整：预热期内不回收
 const REAP_COOLDOWN_MS = 5 * 60 * 1000 // 刚回收的 peerId 期间不再被摘要复种
 
@@ -134,6 +137,7 @@ export class ChatNet {
     this.sessionResume = opts.sessionResume !== false // 默认启用（设置页可关）
     // 残身回收簿记：peerId -> ts（冷却期内不被摘要复种）；digestTries：间接介绍次数上限
     this.recentlyReaped = new Map()
+    this.hsCooldown = new Map() // peerId -> 冷却截止 ts（连续握手失败）
     this.digestTries = new Map()
     this.relayStableSince = 0
     this._relayWasConn = false
@@ -378,6 +382,8 @@ export class ChatNet {
       }
       return // 其余已有会话不动（P2P 优先）
     }
+    const cd = this.hsCooldown.get(peerId)
+    if (cd && cd > Date.now()) return // 连续握手失败冷却期：不再自动建联（对方主动 hs1 仍接受）
     const peer = this.ensurePeer(peerId, 'mqtt')
     peer.name = info.name
     this.startHandshake(peerId)
@@ -523,8 +529,22 @@ export class ChatNet {
       return
     }
     this.clearRetransmit(peer)
+    this.failHandshake(peerId, peer, '握手超时')
+  }
+
+  // 握手失败簿记：连续 HS_FAIL_MAX 次失败 → 该 peerId 进入冷却期（不再因
+  // presence/摘要自动建联，防"在线成员"被建联中残身循环刷屏）；对端主动
+  // 发起的握手（hs1）不受冷却限制——那是明确的在线意图。
+  failHandshake(peerId, peer, why) {
     peer.state = 'failed'
-    peer.lastError = '握手超时'
+    peer.lastError = why
+    peer.hsFails = (peer.hsFails || 0) + 1
+    if (peer.hsFails >= HS_FAIL_MAX) {
+      this.hsCooldown.set(peerId, Date.now() + HS_FAIL_COOLDOWN_MS)
+      this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… 连续 ${peer.hsFails} 次握手失败，暂停自动建联 10 分钟（对方主动连接仍会接受）`, 'warn')
+      this.dropGhost(peerId, peer, `连续握手失败（${why}）`)
+      return
+    }
     this.hooks.onPeerFailed?.(peerId, peer)
   }
 
@@ -538,8 +558,14 @@ export class ChatNet {
   }
 
   onHandshakeFrame(peerId, msg, via) {
-    const peer = this.peers.get(peerId)
-    if (!peer) return
+    let peer = this.peers.get(peerId)
+    if (!peer) {
+      // 对端主动发起握手（hs1）= 明确的在线意图：无条目也接受（并解除冷却）——
+      // 否则冷却期会连"对方真正想连"的请求一起挡掉
+      if (msg?.t !== 'OC-HS1-v1' || this.iAmInitiator(peerId)) return
+      peer = this.ensurePeer(peerId, via)
+      this.hsCooldown.delete(peerId)
+    }
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
     if (!this.acceptsVia(peer, via)) return
     peer.lastProgress = Date.now() // 握手有来有回 = 双方都活着（reapGhosts 不回收）
@@ -606,10 +632,8 @@ export class ChatNet {
         throw new Error(`未知握手帧 ${msg?.t}`)
       }
     } catch (e) {
-      peer.state = 'failed'
-      peer.lastError = e?.message || String(e)
-      this.hooks.onLog?.(`握手失败 (${peerId.slice(0, 8)}…): ${peer.lastError}`, 'error')
-      this.hooks.onPeerFailed?.(peerId, peer)
+      this.hooks.onLog?.(`握手失败 (${peerId.slice(0, 8)}…): ${e?.message || e}`, 'error')
+      this.failHandshake(peerId, peer, e?.message || String(e))
     }
   }
 
@@ -620,6 +644,8 @@ export class ChatNet {
     peer.state = 'ready'
     peer.suspect = false
     peer.suspectAt = 0
+    peer.hsFails = 0
+    this.hsCooldown.delete(peerId)
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     peer.lastSeen = Date.now()
     peer.lastProgress = Date.now()
@@ -1039,6 +1065,8 @@ export class ChatNet {
       const known = this.relay?.peers?.get(pid)
       if (known?.suspectSince) this.relay.markAlive(pid)
       if (this.recentlyReaped.has(pid)) continue // 刚回收的残身：冷却期内不被摘要复种
+      const hcd = this.hsCooldown.get(pid)
+      if (hcd && hcd > Date.now()) continue // 连续握手失败冷却期：摘要也不复种
       const name = decodeURIComponent(encName || '')
       const existing = this.peers.get(pid)
       if (!existing) {
@@ -1062,9 +1090,10 @@ export class ChatNet {
     if (this.destroyed) return
     for (const [peerId, peer] of this.peers) {
       if (peer.state !== 'failed') continue
-      const stillAround = this.relay?.peers?.has(peerId)
-        || this.room?.getPeers?.()?.[peerId]
-      if (!stillAround) continue
+      // presence（TTL 过期即清除）是在线权威证据；Trystero 的 room 条目在对端
+      // 崩溃/断网后长期滞留，若据此重试会把 lastProgress 无限刷新——回收器
+      // 永不触发（"建联中"残身的根源）
+      if (!this.relay?.peers?.has(peerId)) continue
       peer.retried = false
       peer.lastError = null
       this.hooks.onLog?.(`周期重试失败会话 (${peer.name || peerId.slice(0, 8)}…)`)
@@ -1180,6 +1209,7 @@ export class ChatNet {
     if (!conn) this.relayStableSince = 0
     this._relayWasConn = conn
     for (const [pid, ts] of this.recentlyReaped) if (now - ts > REAP_COOLDOWN_MS) this.recentlyReaped.delete(pid)
+    for (const [pid, until] of this.hsCooldown) if (until <= now) this.hsCooldown.delete(pid)
     // 我方中继不在线/刚连上：视野不可信，本轮不回收
     if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) return
     for (const [peerId, peer] of [...this.peers.entries()]) {
@@ -1190,6 +1220,8 @@ export class ChatNet {
       if (pcAlive) continue
       if (this.relay?.peers?.has(peerId)) continue // 仍在广播 presence：真在线（哪怕握手失败）
       if (peer.state === 'ready') {
+        // 已建立会话：我方中继视野需稳定（预热门）+ 怀疑宽限期，才判死
+        if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) continue
         const since = peer.suspectAt || 0
         if (since) {
           if (now - since > GHOST_GRACE_MS) this.dropGhost(peerId, peer, '对端已下线（中继视野消失且直连断开）')
@@ -1197,7 +1229,9 @@ export class ChatNet {
           peer.suspect = true // 未经过怀疑流程（如纯 p2p 会话）：观察一个宽限期，UI 同步显示怀疑态
           peer.suspectAt = now
         }
-      } else if (now - (peer.lastProgress || peer.bornAt || now) > GHOST_GRACE_MS) {
+      } else if (now - (peer.lastProgress || peer.bornAt || now) > GHOST_FAST_MS) {
+        // 未就绪条目（建联中/握手失败）：本就无数据流动，30s 无进展即回收——
+        // presence 过期与否都不影响（presence 过期另有 onRelayGone 快速路径）
         this.dropGhost(peerId, peer, peer.state === 'failed' ? '会话失败且对端已离线' : '握手无进展且对端已离线')
       }
     }
