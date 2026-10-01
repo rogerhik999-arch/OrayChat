@@ -114,6 +114,22 @@ function fakePeer(over = {}) {
   assert.ok(net.peers.has('k5'), 'ready 会话的 pcAlive 保护不变')
 }
 
+// ---- 3b2) 非就绪条目总寿命硬上限 90s：内部续命（重启自刷 lastProgress）也必死 ----
+// （v1.22.2 后用户实测 xfold6 依旧：超时→重启循环里 startHandshake 自刷
+// lastProgress，30s 判据被本方行为无限续命——硬上限 bornAt 起封顶）
+{
+  const { net } = bareNet([])
+  // bornAt 10 分钟前；lastProgress 模拟"刚被重启刷新过"（30s 判据不满足）
+  net.peers.set('z3', fakePeer({ state: 'handshaking', lastProgress: NOW - 5000, bornAt: NOW - 600000 }))
+  net.reapGhosts()
+  assert.ok(!net.peers.has('z3'), 'bornAt 超 90s 的非就绪条目必须回收（总寿命硬上限）')
+  // 真在线（presence 在）不受硬上限影响
+  net.peers.set('z4', fakePeer({ state: 'handshaking', lastProgress: NOW - 5000, bornAt: NOW - 600000 }))
+  net.relay.peers.set('z4', { lastSeen: NOW })
+  net.reapGhosts()
+  assert.ok(net.peers.has('z4'), 'presence 仍在的真在线条目不受硬上限影响')
+}
+
 // ---- 3c) dedupeIdentity 同名接管：不再被 presence 残留 TTL 挡住 ----
 // （用户实测 3070 重启后双条目：旧条目 failed 无身份公钥，sameIdentity 失效；
 // sameName 又被「中继视野还有它」的保守条件挡住）

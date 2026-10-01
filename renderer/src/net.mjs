@@ -30,6 +30,7 @@ const PRESENCE_HEARTBEAT_MS = 15000
 const REAP_INTERVAL_MS = 15000
 const GHOST_GRACE_MS = 90000 // 已建立会话：视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
 const GHOST_FAST_MS = 30000 // 未就绪条目（建联中/握手失败）：无进展 30s 即回收——握手超时才 15s，两倍足矣
+const GHOST_MAX_LIFETIME_MS = 90000 // 未就绪条目总寿命硬上限：无论任何内部续命，bornAt 起 90s 必回收
 const HS_FAIL_MAX = 3 // 连续握手失败次数上限：达到后进入冷却，不再自动建联（防在线列表被建联中残身刷屏）
 const HS_FAIL_COOLDOWN_MS = 10 * 60000
 const RELAY_VIEW_WARMUP_MS = 75000 // 我方中继刚连上时视野不完整：预热期内不回收
@@ -475,7 +476,11 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer) return
     peer.state = 'handshaking'
-    peer.lastProgress = Date.now()
+    // ⚠️ 此处不得刷新 lastProgress：重启握手是本方行为，不是对端活性证据。
+    // 若刷新，超时→重启的循环会一直给回收判据（30s 无进展）续命——非就绪
+    // 条目永生为「协商中（第 N 次尝试）」（v1.22.2 用户实测 xfold6 依旧）。
+    // 对端活性只由对端真实到达的帧（onHandshakeFrame/presence）证明。
+    if (!peer.lastProgress) peer.lastProgress = Date.now()
     if (this.iAmInitiator(peerId)) {
       // 会话恢复：对该身份持有票据且启用时，hs1 附带 epoch 证明（对端不认则自动回退全握手）
       const ticket = this.sessionResume && peer.idPubHex ? this.resumable.get(peer.idPubHex) : null
@@ -1278,9 +1283,13 @@ export class ChatNet {
           peer.suspect = true // 未经过怀疑流程（如纯 p2p 会话）：观察一个宽限期，UI 同步显示怀疑态
           peer.suspectAt = now
         }
-      } else if (now - (peer.lastProgress || peer.bornAt || now) > GHOST_FAST_MS) {
+      } else if (now - (peer.lastProgress || peer.bornAt || now) > GHOST_FAST_MS
+        || now - (peer.bornAt || now) > GHOST_MAX_LIFETIME_MS) {
         // 未就绪条目（建联中/握手失败）：本就无数据流动，30s 无进展即回收——
-        // presence 过期与否都不影响（presence 过期另有 onRelayGone 快速路径）
+        // presence 过期与否都不影响（presence 过期另有 onRelayGone 快速路径）。
+        // 硬上限兜底：bornAt 起 90s 内必须 ready 或消失——lastProgress 只该由
+        // 对端真实到达的帧刷新，但万一有任何内部路径续命（v1.22.2 的重启自刷
+        // 教训），总寿命封顶保证「协商中」条目终有一死
         this.dropGhost(peerId, peer, peer.state === 'failed' ? '会话失败且对端已离线' : '握手无进展且对端已离线')
       }
     }
