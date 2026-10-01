@@ -564,6 +564,30 @@ const WINDOW_DEFAULT = 16 // P2P 默认窗口（与 filex WINDOW_P2P 一致）
   assert.equal(fxB.tx.get(fid)?.state, 'done', '完成事务不得被重复 offer 重激活')
   assert.equal(doneReplies.at(-1).sha, await sha256Hex(content), '重复 offer 应再回 fx-done（治愈发送端 0% 死锁）')
 }
+// ---- 20) mid 幂等贯穿：offer 携带发送方日志 mid，接收方复用（防反熵同步重复）----
+{
+  const { wire, netA, netB } = link()
+  const entries = { out: null, in: null }
+  const fxA = mkFileX(netA, { onOutgoing: (e) => { entries.out = e } })
+  const fxB = mkFileX(netB, { onIncoming: (e) => { entries.in = e } })
+  const content = new Uint8Array(5000).fill(9)
+  await fxA.sendFile('B', { bytes: content, name: 'same.bin', size: content.length, mime: 'application/octet-stream', lastModified: 15 })
+  const offer = wire.a2b.find((f) => f.op === 'fx-offer')
+  assert.ok(typeof offer.mid === 'string' && offer.mid.length >= 8, 'offer 应携带发送方日志 mid')
+  assert.equal(entries.out.mid, offer.mid, '发送方日志 mid 与 offer 一致')
+  await fxB.onCtl('A', offer)
+  assert.equal(entries.in.mid, offer.mid, '接收方日志必须复用同一 mid（否则反熵同步一对账，同一条消息以两个 mid 各落一次库，双方显示重复）')
+  // LogStore 按 mid 幂等：两端同 mid 合并为一条
+  const st = new LogStore({})
+  assert.equal(st.addMsg('dm:m', { mid: offer.mid, author: 'a', text: 'x', t: Date.now() }), true)
+  assert.equal(st.addMsg('dm:m', { mid: offer.mid, author: 'a', text: 'x', t: Date.now() }), false, '同 mid 不得重复入库')
+  // 旧版发送方不带 mid（或非法）：接收方退回新生成，不炸
+  const entries2 = { in: null }
+  const fxC = mkFileX(netB, { onIncoming: (e) => { entries2.in = e } })
+  const legacy = { ...offer, mid: 12345 }
+  await fxC.onCtl('A', { ...legacy, fid: offer.fid + 'x' })
+  assert.ok(typeof entries2.in.mid === 'string' && entries2.in.mid !== 12345, '非法 mid 应退回新生成')
+}
 
-console.log('filex.test.mjs ✓ 全部通过（…/语音元数据/发送方落盘/完成事务fx-done）')
+console.log('filex.test.mjs ✓ 全部通过（…/语音元数据/发送方落盘/完成事务fx-done/mid幂等）')
 process.exit(0) // pump 定时器会挂住事件循环，显式退出

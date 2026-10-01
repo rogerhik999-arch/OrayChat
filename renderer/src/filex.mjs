@@ -206,9 +206,12 @@ export class FileX {
     }
     this.tx.set(fid, tx)
 
-    // 落本地日志（type/fid/缩略图随条目同步给对端）
+    // 落本地日志（type/fid/缩略图随条目同步给对端）。mid 同时放进 offer：
+    // 接收方落库复用同一 mid——否则同一条图片/语音在两端是两个 mid，反熵
+    // 同步一对账就以两条不同 mid 各落一次库，双方都显示重复（v1.21.8 用户实测）
+    const msgMid = oc.newMid()
     this.hooks.onOutgoing?.({
-      mid: oc.newMid(), text: tx.caption, t: Date.now(),
+      mid: msgMid, text: tx.caption, t: Date.now(),
       type: kind, fid, name: file.name, size: stream ? file.bytes.length : bytes.length, mime, w, h, thumb: tx.thumb, mode,
       ...extraClean,
       peerId,
@@ -217,6 +220,7 @@ export class FileX {
     const offer = {
       op: 'fx-offer', fid, kind, name: file.name, size: bytes.length, mime, sha,
       cs, n, mode, w: w || 0, h: h || 0, orig: orig ? 1 : 0, thumb: tx.thumb,
+      mid: msgMid, // 幂等键：接收方日志与发送方日志同一条目
       osize: stream ? file.bytes.length : bytes.length, // UX 尺寸（流压缩时=原始大小）
       ...extraClean,
       fec: 1, // P1-1：8+1 XOR 奇偶块广播（旧版接收方按 i>=n 丢弃，向后兼容）
@@ -503,9 +507,12 @@ export class FileX {
         lastHaveAt: 0, lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
       }
       this.tx.set(o.fid, tx)
-      // 落本地日志（含缩略图，随共享日志同步；字节不进日志）
+      // 落本地日志（含缩略图，随共享日志同步；字节不进日志）。
+      // mid 复用发送方的（offer.mid）：两端日志同一条目，反熵同步按 mid 幂等；
+      // 旧版发送方不带 mid 时退回新生成（行为同前版，同步后会重复——升级即愈）
       this.hooks.onIncoming?.({
-        mid: oc.newMid(), text: tx.caption, t: Date.now(), author: peer.idPubHex,
+        mid: (typeof o.mid === 'string' && o.mid.length >= 8 && o.mid.length <= 64) ? o.mid : oc.newMid(),
+        text: tx.caption, t: Date.now(), author: peer.idPubHex,
         type: tx.kind, fid: o.fid, name: tx.name, size: o.osize || o.size, mime: tx.mime,
         w: o.w, h: o.h, thumb: tx.thumb, mode: o.mode,
         duration: o.duration, waveform: o.waveform, rate: o.rate,
