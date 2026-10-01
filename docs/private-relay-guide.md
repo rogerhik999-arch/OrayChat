@@ -63,16 +63,73 @@
 
 > 也可以用 launchd / systemd / 计划任务把第 4 步设为开机自启，之后完全不用管。
 
-## 四、安装 cloudflared
+## 四、安装 cloudflared（详细指导）
 
-| 平台 | 方法 |
+cloudflared 是 Cloudflare 官方的隧道客户端（单个可执行文件，约 40MB，无其他依赖）。OrayChat 会按以下顺序自动查找它：
+
+1. 系统 PATH（用包管理器装的都在这里）
+2. OrayChat 数据目录下的 `cloudflared/` 文件夹（手动放置的位置，见下表）
+
+| 平台 | OrayChat 数据目录（手动放置位置） |
 |---|---|
-| macOS (Apple Silicon) | `brew install cloudflared`；或下载 [cloudflared-darwin-arm64.tgz](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz)，解压出的二进制放入 `~/Library/Application Support/OrayChat/cloudflared/`（去扩展属性 `chmod +x`） |
-| macOS (Intel) | 同上，下载 `cloudflared-darwin-amd64.tgz` |
-| Windows | 下载 [cloudflared-windows-amd64.exe](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe)，改名为 `cloudflared.exe` 放入 `%APPDATA%\OrayChat\cloudflared\` |
-| Linux | 下载 [cloudflared-linux-amd64](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64)，放入 `~/.config/OrayChat/cloudflared/` 并 `chmod +x` |
+| macOS | `~/Library/Application Support/OrayChat/cloudflared/` |
+| Windows | `%APPDATA%\OrayChat\cloudflared\`（资源管理器地址栏直接粘贴 `%APPDATA%\OrayChat` 回车） |
+| Linux | `~/.config/OrayChat/cloudflared/` |
 
-放在这些目录即可被自动识别；也可以装到系统 PATH（`brew install` 就是这种方式）。
+三种方式任选其一，装完重启 OrayChat 即可被识别。
+
+### 方式 1：包管理器安装（最省事，推荐）
+
+```bash
+# macOS（Homebrew）
+brew install cloudflared
+
+# Windows（winget，或 scoop install cloudflared）
+winget install --id Cloudflare.cloudflared
+
+# Linux（Debian/Ubuntu，amd64）
+curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+sudo dpkg -i cloudflared.deb
+
+# Linux（RHEL/Fedora/CentOS）
+sudo rpm -i https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm
+
+# Arch
+sudo pacman -S cloudflared
+```
+
+### 方式 2：macOS 手动下载（无 Homebrew 时）
+
+```bash
+# 1. 下载并解压（Apple Silicon；Intel 把 arm64 换成 amd64）
+curl -L --output /tmp/cloudflared.tgz \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+tar -xzf /tmp/cloudflared.tgz -C /tmp
+
+# 2. 放入 OrayChat 数据目录并赋予执行权限
+mkdir -p ~/Library/Application\ Support/OrayChat/cloudflared
+mv /tmp/cloudflared ~/Library/Application\ Support/OrayChat/cloudflared/
+chmod +x ~/Library/Application\ Support/OrayChat/cloudflared/cloudflared
+
+# 3. 若下载自浏览器（非 curl），macOS 可能拦执行，去掉隔离标记
+xattr -d com.apple.quarantine ~/Library/Application\ Support/OrayChat/cloudflared/cloudflared 2>/dev/null || true
+```
+
+### 方式 3：Windows 手动下载
+
+1. 下载 <https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe>
+2. 把文件改名为 **`cloudflared.exe`**，放入 `%APPDATA%\OrayChat\cloudflared\`（目录不存在就新建）
+3. 若 Windows Defender / SmartScreen 拦截，选「仍要保留」
+
+### 验证安装
+
+终端执行 `cloudflared --version`（或带完整路径执行）能打印版本号即可。之后**重启 OrayChat**，在设置 → 中继服务点「启动 Cloudflare 快速隧道」，日志区出现 `隧道就绪 wss://...` 即成功。
+
+### 网络受限环境
+
+- GitHub 直连慢/失败时，可用镜像：把上面 URL 中的 `github.com/cloudflare/cloudflared/releases/latest/download` 换成 `ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download` 等加速前缀（第三方镜像，注意甄别）
+- 下载后建议核对官方校验和：发布页 `cloudflared-checksums.txt` 与本地 `shasum -a 256 <文件>` 对比
+- 实在装不上也不影响聊天：私有中继的本机功能照常，只是没有公网暴露（本机客户端仍会走私有链）；或让房间里能装的用户当主机
 
 ## 五、成员端：接入私有中继（2 分钟）
 
