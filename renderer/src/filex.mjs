@@ -188,7 +188,7 @@ export class FileX {
       for (let i = 0; i < n; i++) hashes.push((await sha256Hex(bytes.subarray(i * cs, Math.min((i + 1) * cs, bytes.length)))).slice(0, 8))
     }
     const tx = {
-      fid, dir: 'send', peerId, state: 'active', bytes, sha, cs, n, hashes,
+      fid, dir: 'send', peerId, peerPub: peer.idPubHex, state: 'active', bytes, sha, cs, n, hashes,
       name: file.name, size: bytes.length, mime, kind, w, h, mode, orig, alg,
       rawSha, rawSize: file.bytes.length,
       have: new Uint8Array(Math.ceil(n / 8)), // 对端确认位图
@@ -560,7 +560,26 @@ export class FileX {
     // 能力位学习（P2-1）：任何 have 都携带 caps，接收方升级后即时生效
     if (f?.caps && this.peerCaps.get(peerId)?.s !== f.caps.s) this.peerCaps.set(peerId, f.caps)
     const tx = this.tx.get(f?.fid)
-    if (!tx || tx.dir !== 'send' || tx.state !== 'active' || !Array.isArray(f.have)) return
+    if (!tx || tx.dir !== 'send' || !Array.isArray(f.have)) return
+    // done 的事务收到缺失报告（对端重启后位图不完整）→ 重新激活续传：
+    // 字节仍在内存（tx.bytes），重发缺失块即可，无需重传整文件
+    if (tx.state === 'done') {
+      const bm = Uint8Array.from(f.have)
+      const missing = []
+      for (let k = 0; k < tx.n && missing.length < 8; k++) if (!bitmapHas(bm, k)) missing.push(k)
+      if (missing.length === 0) return // 对端确有完整文件：忽略
+      // 对端缺块（重启后位图不完整）：重新激活，并以对端报告**重建**确认位图
+      //（本地 have 是"我曾经发完"的旧账，不能继续用——否则泵认为无事可做）
+      tx.have = bm
+      tx.acked = bitmapCount(bm)
+      tx.state = 'active'
+      tx.startedAt = Date.now()
+      tx.lastProgressAt = Date.now()
+      this.log(`传输 ${tx.name}：对端重启后缺失 ${missing.length} 块，重新激活续传`, 'warn')
+      this.startPump(tx.fid)
+    } else if (tx.state !== 'active') {
+      return
+    }
     tx.lastAckAt = Date.now()
     tx.lastLifeAt = tx.lastAckAt
     const bm = Uint8Array.from(f.have)

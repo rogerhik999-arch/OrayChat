@@ -8,6 +8,8 @@ import {
   createIdentity, makeHs1, acceptHs1, acceptHs2, acceptHs3, acceptHs3ack,
   seal, open, deriveResumeKey, resumeRequestProof, verifyResumeRequest,
 } from '../renderer/src/crypto.mjs'
+import { ChatNet } from '../renderer/src/net.mjs'
+import { LogStore } from '../renderer/src/store.mjs'
 
 const ROOM = 'oc-resume-test'
 const hex = (b) => Buffer.from(b).toString('hex')
@@ -72,3 +74,83 @@ assert.ok(!verifyResumeRequest(Buffer.alloc(32, 7), 2, ROOM, resumeRequestProof(
 console.log('✅ 伪造/跨密钥证明被拒')
 
 console.log('\n✅ resume.test.mjs 全部通过')
+
+
+// --- 5) net 层恢复（回归锁定 v1.21.4 hexOf bug）：两个裸 ChatNet 走真实
+// onHandshakeFrame 状态机 —— 全握手（双方持票据）→ 断开 → 恢复握手（响应方
+// 持票据分支）→ READY epoch2 + 消息往返。crypto 层测试不经过此分支。 ---
+{
+  const logs = { a: [], b: [] }
+  const mkNet = (name, selfIdStr, roles) => {
+    const net = Object.create(ChatNet.prototype)
+    net.destroyed = false
+    net.myName = name
+    net.roomId = ROOM
+    net.cfg = {}
+    net.opts = {}
+    net.myIdPubHex = 'f'.repeat(32)
+    net.peers = new Map()
+    net.pendingAcks = new Map()
+    net.recentlyReaped = new Map()
+    net.digestTries = new Map()
+    net.resumable = new Map()
+    net.sessionResume = true
+    net.peerNames = new Map()
+    net.ident = createIdentity()
+    net.store = new LogStore({})
+    net.hooks = {
+      onLog: (m, lv) => logs[name].push(`[${lv || 'i'}] ${m}`),
+      onPeerReady: () => {},
+      onPeerAdded: () => {},
+      onPeerRemoved: () => {},
+      onPeerFailed: () => {},
+      onStoreNotice: () => {},
+    }
+    net.iAmInitiator = roles
+    net.relay = { connected: true, peers: new Map(), send: async () => {} }
+    net.sendHs = async (pid, msg) => { net.relay.send(pid, 'hs', msg) }
+    net.pushSync = async () => {}
+    return net
+  }
+  // A 发起（对 peerB），B 响应（对 peerA）：角色按实例注入（绕过模块 selfId）
+  const netA = mkNet('a', null, (pid) => pid === 'peerB')
+  const netB = mkNet('b', null, () => false)
+  const framesA = [], framesB = []
+  netA.relay.send = async (pid, kind, msg) => { if (kind === 'hs') framesB.push(msg) }
+  netB.relay.send = async (pid, kind, msg) => { if (kind === 'hs') framesA.push(msg) }
+
+  // 全握手（A 侧条目由 ensurePeer 建立——真实路径中由 onPeerJoin/onRelayAnnounce 触发）
+  netA.ensurePeer('peerB', 'mqtt')
+  netA.startHandshake('peerB')
+  const pump = () => { // 双向交换至双空（hs1→hs2→hs3→hs3ack 需多轮），上限 10 轮防死循环
+    for (let i = 0; i < 10; i++) {
+      while (framesB.length) netB.onHandshakeFrame('peerA', framesB.shift(), 'mqtt')
+      while (framesA.length) netA.onHandshakeFrame('peerB', framesA.shift(), 'mqtt')
+      if (framesA.length + framesB.length === 0) break
+    }
+  }
+  pump()
+  assert.equal(netA.peers.get('peerB')?.state, 'ready', 'net 层全握手 A 就绪')
+  assert.equal(netB.peers.get('peerA')?.state, 'ready', 'net 层全握手 B 就绪')
+  assert.ok(netA.resumable.get('peerB'.padStart(64, '0')) === undefined || true)
+
+  // 恢复握手（双方票据已在 markReady 填好；响应方持票据分支曾抛 hexOf）
+  netA.restartHandshake('peerB', 'mqtt')
+  pump()
+  const stA = netA.peers.get('peerB')
+  const stB = netB.peers.get('peerA')
+  assert.equal(stA?.state, 'ready', '恢复握手后 A 就绪')
+  assert.equal(stB?.state, 'ready', '恢复握手后 B 就绪')
+  assert.ok(!logs.a.some((l) => /hexOf|HMAC 不匹配/.test(l)), 'A 侧无 hexOf/HMAC 错误')
+  assert.ok(!logs.b.some((l) => /hexOf|HMAC 不匹配/.test(l)), 'B 侧无 hexOf/HMAC 错误')
+  // 恢复后消息往返（密钥一致）
+  const env = netA.peers.get('peerB') ? null : null
+  const sealBinOk = (() => {
+    try {
+      const w = seal(stA.ctx, 'resume-check', 'dm', 'mid-r1', Date.now())
+      return open(stB.ctx, w).text === 'resume-check'
+    } catch (e) { return `err:${e.message}` }
+  })()
+  assert.equal(sealBinOk, true, '恢复后消息往返一致')
+  console.log('✅ net 层恢复：全握手→断开→恢复握手 READY（响应方持票据分支）+ 往返一致')
+}

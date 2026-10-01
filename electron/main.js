@@ -165,7 +165,11 @@ function registerIpc() {
     if (meta && meta.size === size && meta.cs === cs && meta.n === n && Array.isArray(meta.have)) {
       return { have: meta.have }
     }
-    return { have: new Array(Math.ceil(n / 8)).fill(0) }
+    // 新事务：落一份元数据（size/cs/n + 空位图）——fx:write 只合并位图，
+    // 元数据必须在此写入，否则重启后校验永远失败、断点续传形同虚设
+    const fresh = { size, cs, n, have: new Array(Math.ceil(n / 8)).fill(0) }
+    fs.writeFileSync(fxMeta(id), JSON.stringify(fresh), { mode: 0o600 })
+    return { have: fresh.have }
   })
 
   ipcMain.handle('fx:write', (_e, fid, i, cs, bytes) => {

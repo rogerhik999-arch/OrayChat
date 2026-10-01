@@ -580,8 +580,8 @@ export class ChatNet {
         peer.cachedHs2 = hs2
         peer.ctx = ctx
         peer.name = ctx.peerName
-        if (resumed && this.resumable.get(hexOf(ctx.peerIdPub))) {
-          const tk = this.resumable.get(hexOf(ctx.peerIdPub))
+        if (resumed && this.resumable.get(oc.hex(ctx.peerIdPub))) {
+          const tk = this.resumable.get(oc.hex(ctx.peerIdPub))
           ctx.sendSeq = tk.sendSeq || 0
           ctx.recvSeqMax = tk.recvSeqMax || 0 // 序号续接：ACK/去重窗口无缝
           peer.resumed = true
@@ -642,6 +642,17 @@ export class ChatNet {
     peer.suspectAt = 0
     peer.hsFails = 0
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
+    // 传输改绑：发送中的事务绑定的是旧 peerId——对端重启后以同身份、新 peerId
+    // 回来，事务若不改绑就成了孤儿（块发给死会话、offer 走死通道被静默丢弃）
+    if (this.filex?.tx?.size) {
+      for (const tx of this.filex.tx.values()) {
+        if (tx.state === 'active' && tx.peerPub && tx.peerPub === peer.idPubHex && tx.peerId !== peerId) {
+          this.hooks.onLog?.(`传输 ${tx.name}：对端以同身份重连，改绑到新会话继续`, 'warn')
+          tx.peerId = peerId
+          tx.inflight?.clear()
+        }
+      }
+    }
     peer.lastSeen = Date.now()
     peer.lastProgress = Date.now()
     this.digestTries.delete(peerId) // 会话已建立：间接介绍计数清零
@@ -831,12 +842,17 @@ export class ChatNet {
     else await this.ctlAction?.send(frame, { target: peerId })
   }
 
-  // wireConv='lobby' → 广播给所有就绪成员；'dm' → 仅发给该对端
+  // wireConv='lobby' → 广播给所有就绪成员；'dm' → 仅发给该对端。
+  // del/clear 幂等且必须送达：三重发送（QoS0 丢帧兜底，间隔 400ms）
   async propagateCtl(wireConv, frame, onlyPeer) {
     const targets = wireConv === 'lobby' ? this.readyPeerIds() : [onlyPeer]
+    const important = frame?.op === 'del' || frame?.op === 'clear'
     for (const peerId of targets) {
-      try { await this.sendCtl(peerId, frame) } catch (e) {
-        this.hooks.onLog?.(`删除指令发送失败: ${e?.message || e}`, 'warn')
+      for (let i = 0; i < (important ? 3 : 1); i++) {
+        try { await this.sendCtl(peerId, frame) } catch (e) {
+          this.hooks.onLog?.(`删除指令发送失败: ${e?.message || e}`, 'warn')
+        }
+        if (important && i < 2) await new Promise((r) => setTimeout(r, 400))
       }
       // 状态兜底推送（ctl 丢失也能靠同步收敛）
       this.pushSync(peerId, wireConv)

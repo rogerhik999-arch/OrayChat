@@ -1090,6 +1090,20 @@ async function doLogin(name, room) {
         if (state.args.bot && e.state !== 'active') {
           window.oray.botLog(`[BOT] FILE-${e.state.toUpperCase()} dir=${e.dir} fid=${e.fid} name=${JSON.stringify(e.name || '')} done=${e.done}/${e.total}`)
         }
+        if (state.args.bot && e.dir === 'recv' && e.state === 'active') {
+          bot.lastRecvProgress = bot.lastRecvProgress || {}
+          if (e.done >= (bot.lastRecvProgress[e.fid] || 0) + 50) {
+            bot.lastRecvProgress[e.fid] = e.done
+            window.oray.botLog(`[BOT] RPROGRESS fid=${e.fid} done=${e.done}/${e.total}`)
+          }
+        }
+        if (state.args.bot && e.dir === 'send' && e.state === 'active') {
+          bot.lastProgress = bot.lastProgress || {}
+          if (e.done >= (bot.lastProgress[e.fid] || 0) + 50) {
+            bot.lastProgress[e.fid] = e.done
+            window.oray.botLog(`[BOT] PROGRESS fid=${e.fid} done=${e.done}/${e.total}`)
+          }
+        }
         const now = Date.now()
         if (now - state.fxThrottle > 300) {
           state.fxThrottle = now
@@ -1219,6 +1233,7 @@ function netHooks() {
       if (state.args.bot) window.oray.botLog(`[BOT] NAME name=${JSON.stringify(name)} id=${idPubHex.slice(0, 8)}…`)
     },
     onControl: (peerId, p, ctl) => {
+      if (state.args.bot && state.args['ctl-log']) window.oray.botLog(`[BOT] CTL from=${p.name} op=${ctl?.op} conv=${ctl?.wireConv || ctl?.conv || '-'}`)
       if (state.args.bot && ctl.wireConv === 'lobby') {
         window.oray.botLog(`[BOT] LOBBY-DEL-APPLIED op=${ctl.op} applied=${ctl.applied} visible=${state.net.store.visibleCount('lobby')} by=${p.name}`)
       }
@@ -1273,21 +1288,25 @@ async function botOnReady(peerId, p) {
   if (state.args['lobby-text'] && !state.args['lobby-alone']) {
     setTimeout(botSendLobby, Number(state.args['lobby-delay-ms'] || 1200))
   }
-  // 大厅删除（--del-lobby=<文本子串>）
+  // 大厅删除（--del-lobby=<文本子串>）：轮询等消息同步到本店（≤60s）后删除
   if (state.args['del-lobby'] && !bot.delInit) {
     bot.delInit = true
-    setTimeout(async () => {
-      const entry = state.net.store.findByText('lobby', state.args['del-lobby'])
-      if (!entry) { window.oray.botLog(`[BOT] LOBBY-DEL-NOTFOUND substr=${JSON.stringify(state.args['del-lobby'])}`); return }
+    const t0 = Date.now()
+    const t = setInterval(async () => {
+      const entry = state.net.store.findByText('lobby', String(state.args['del-lobby']))
+      if (!entry) { if (Date.now() - t0 > 60000) { clearInterval(t); window.oray.botLog(`[BOT] LOBBY-DEL-NOTFOUND substr=${JSON.stringify(state.args['del-lobby'])}`) } return }
+      clearInterval(t)
       await state.net.deleteMessage('lobby', entry.mid)
       window.oray.botLog(`[BOT] LOBBY-DEL-INIT mid=${entry.mid}`)
-    }, 3000)
+    }, 2000)
   }
 }
 
 async function botOnMessage(peerId, p, msg) {
   if (!state.args.bot) return
-  if (state.args['auto-reply'] && msg.conv === 'dm') {
+  // 防回声风暴：两个 auto-reply 实例同房间时，echo 的 echo 会无限循环刷爆
+  // 有序数据通道（文件块被饿死）——echo 的 echo 不再回显
+  if (state.args['auto-reply'] && msg.conv === 'dm' && !String(msg.text).startsWith('echo: ')) {
     setTimeout(() => state.net.send(peerId, `echo: ${msg.text}`)
       .catch((e) => window.oray.botLog(`[BOT] REPLY-ERR ${e?.message || e}`)), 80)
   }

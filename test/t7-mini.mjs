@@ -18,7 +18,7 @@ import { killTrees } from './proc-kill.mjs'
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const ELECTRON = createRequire(import.meta.url)('electron')
 const ROOM = `oc-comp-${Date.now().toString(36)}`
-const lines = { alice: [], bob: [], carol: [] }
+const lines = { alice: [], bob: [] }
 const procs = []
 const userData = (p) => path.join(os.homedir(), 'Library', 'Application Support', 'OrayChat', `${p}-comp`)
 const results = []
@@ -60,7 +60,7 @@ const killProfile = (profile) => {
 }
 
 console.log(`== comprehensive：房间 ${ROOM} ==`)
-for (const p of ['alice', 'bob', 'carol']) { try { fs.rmSync(userData(p), { recursive: true, force: true }) } catch {} }
+for (const p of ['alice', 'bob']) { try { fs.rmSync(userData(p), { recursive: true, force: true }) } catch {} }
 const srcTxt = path.join(os.tmpdir(), `oc-comp-${Date.now()}.txt`)
 fs.writeFileSync(srcTxt, 'OrayChat 完备性测试文件内容。\n'.repeat(40))
 const srcTxtSha = sha256(srcTxt)
@@ -70,52 +70,10 @@ fs.writeFileSync(srcBig, crypto2.randomBytes(30 * 1024 * 1024)) // 随机：不�
 const srcBigSha = sha256(srcBig)
 
 // ---------- T1 在线状态 ----------
-console.log('\n[T1] 在线状态')
-launch('alice', ['--roster-log', '--save-latest', '--auto-reply', '--ctl-log'])
-await sleep(3000)
-launch('bob', ['--roster-log', '--auto-reply'])
-ok('T1.1 bob 上线后双向 READY（握手/在线）', await waitFor(() => /\[BOT\] READY peer=bob/.test(L('alice')) && /\[BOT\] READY peer=alice/.test(L('bob')), 90000, '双向握手'))
-await sleep(7000)
-let r = latestRoster('alice')
-ok('T1.2 alice 在线名单含 bob', !!r && r.online.includes('bob'), JSON.stringify(r))
-ok('T1.3 bob 上线时不在历史联系人', !!r && !r.history.includes('bob'), JSON.stringify(r))
-launch('carol', ['--roster-log', '--auto-reply'])
-ok('T1.4 carol 上线进入双向 READY', await waitFor(() => /\[BOT\] READY peer=carol/.test(L('alice')) && /\[BOT\] READY peer=alice/.test(L('carol')), 90000, 'carol 握手'))
-await killProfile('carol') // 异常退出（SIGKILL：无 leave、无优雅清理——最苛刻路径）
-ok('T1.5 carol 异常退出后 alice 在线名单移除', await waitFor(() => { const x = latestRoster('alice'); return !!x && !x.online.includes('carol') }, 180000, 'presence TTL+回收'))
-ok('T1.6 carol 落入 alice 历史联系人', await waitFor(() => { const x = latestRoster('alice'); return !!x && x.history.includes('carol') }, 60000, '历史联系人'))
-launch('carol', ['--roster-log', '--auto-reply'])
-ok('T1.7 carol 重上线恢复 READY 且历史名录不分裂（同身份归并）', await waitFor(() => {
-  if (!/\[BOT\] READY peer=carol/.test(L('alice'))) return false
-  const x = latestRoster('alice')
-  return !!x && x.online.includes('carol') && x.history.filter((n) => n === 'carol').length <= 1
-}, 90000, 'carol 重上线'))
-
-// ---------- T2 发信息 ----------
-console.log('\n[T2] 发信息')
-await killProfile('bob')
-launch('bob', ['--auto-reply', '--send-to=alice', '--text=你好', '--count=3'])
-ok('T2.1 双向文本 3 条 + 回显（ECHO）+ ACK', await waitFor(() => (L('bob').match(/\[BOT\] ECHO \d\/3/g) || []).length >= 3 && (L('bob').match(/\[BOT\] ACK/g) || []).length >= 3, 120000, '3 条往返'))
-ok('T2.2 未读计数（alice 侧）', await waitFor(() => /UNREAD total=3/.test(L('alice')), 60000, 'UNREAD total=3'), '')
-await killProfile('bob')
-
-// ---------- T3 离线信息 ----------
-console.log('\n[T3] 离线信息')
-// carol 承担发送（send-lobby-when-absent=bob：bob 持续缺席 15s 后自动发大厅消息）
-// ⚠️ 单实例锁：T1.7 的 carol 实例还在跑，必须先杀再重启（否则新参数被弹退）
-await killProfile('carol')
-launch('carol', ['--auto-reply', '--send-lobby-when-absent=bob', '--lobby-text=离线期间的大厅消息'])
-ok('T3.1 bob 离线（持续缺席）后 carol 的大厅消息发出', await waitFor(() => /LOBBY-SENT-ABSENT.*离线期间的大厅消息/.test(L('carol')), 60000, 'carol 检测缺席并发送'))
-launch('bob', ['--auto-reply', '--dump-store-alone', '--dump-after-ms=20000', '--exit-after-dump'])
-ok('T3.2 bob 重上线经同步收到离线期间的大厅消息', await waitFor(() => /离线期间的大厅消息/.test(L('bob')), 90000, '同步到达'))
-ok('T3.3 离线前 DM 记录持久化（你好-1/2 在 bob 本地日志）', /你好-1/.test(L('bob')) && /你好-2/.test(L('bob')), (latest('bob', /\[BOT\] STORE conv=dm:[^\n]*/) || [''])[0].slice(0, 120))
-
-// ---------- T4 文件+下载 / T5 图片+下载 / T6 语音+播放 ----------
 console.log('\n[T4-T6] 文件/图片/语音 + 下载 + 播放')
 await killProfile('bob')
 // --no-exit：本阶段 bob 同时带 sendTo（路由）与 auto-reply，若不禁用会在
 // hello 回显计数到 3 时自退（e2e 文本机制），文件传输被进程退出杀死
-launch('bob', ['--auto-reply', '--no-exit', '--send-to=alice', `--send-file=${srcTxt}`, '--send-file2=' + srcPng, '--send-voice-after-ms=6000', '--voice-duration-ms=2000'])
 ok('T4.1 三类传输全部完成（FILE-DONE ×3 双端）', await waitFor(() => (L('alice').match(/FILE-DONE dir=recv/g) || []).length >= 3 && (L('bob').match(/FILE-DONE dir=send/g) || []).length >= 3, 240000, '三类各一块'))
 await sleep(9000) // 等 SAVED/PLAYBACK 轮询
 const savedAlice = [...L('alice').matchAll(/\[BOT\] SAVED fid=(\w+) name=("[^"]*") path=("[^"]*")/g)].map((m) => ({ fid: m[1], name: JSON.parse(m[2]), path: JSON.parse(m[3]) }))
@@ -145,6 +103,8 @@ ok('T5.2 接收图片元数据含缩略图（thumb 随日志）', /thumb=data:im
 
 // ---------- T7 断点续传 ----------
 console.log('\n[T7] 断点续传：传输中途杀死接收方 → 重启 → 同 fid 恢复（位图持久化）')
+launch('alice', ['--auto-reply'])
+await sleep(3000)
 await killProfile('bob')
 launch('bob', ['--auto-reply', '--no-exit', '--send-to=alice', `--send-file=${srcBig}`, '--send-file-after-ms=3000', '--progress-log'])
 // 确定性截断：等发送进度 ≥100 块（≈3.2MB）后立刻杀接收方——保证死在传输中途
@@ -154,54 +114,30 @@ ok('T7.0 接收已过半（alice RPROGRESS ≥50 块=位图已持久化）', awa
 }, 120000, '接收进度'), '')
 await killProfile('alice') // 中途杀死接收方
 launch('alice', ['--auto-reply', '--save-latest'])
-// 续传断言在 T7.2 的完成等待中一并校验（offer 重发周期 3s+，窗口与完成合并）
-const resumeDone = await waitFor(() => {
+ok('T7.1 alice 重启后从持久化位图续传（日志含 续传 X/Y，X>0）', await waitFor(() => {
+  const m = latest('alice', /接收 [^（]*（[\d.]+[KMG]?B，续传 (\d+)\/(\d+)）/)
+  return !!m && Number(m[1]) > 0
+}, 120000, '续传起点 > 0'), '')
+ok('T7.2 续传后完成且 SHA-256 与源一致', await waitFor(() => {
   const done = (L('alice').match(/FILE-DONE dir=recv fid=(\w+)[^\n]*\.bin/) || [])[1]
   if (!done) return false
   const f = findReceived('alice', done)
   return !!f && sha256(f) === srcBigSha
-}, 240000, '断点续传完成')
-const resumeLog = latest('alice', /接收[^（]*（[\d.]+[KMG]?B，续传 (\d+)\/(\d+)）/)
-ok('T7.1 alice 重启后从持久化位图续传（日志含 续传 X/Y，X>0）', !!resumeLog && Number(resumeLog[1]) > 0, resumeLog ? `续传 ${resumeLog[1]}/${resumeLog[2]}` : '未见续传日志')
-ok('T7.2 续传后完成且 SHA-256 与源一致', resumeDone, '')
+}, 180000, '断点续传完成'), '')
 await killProfile('bob')
 
 // ---------- T8 删除传播 ----------
-console.log('\n[T8] 删除传播：carol 发大厅消息 → bob 删除 → 全体生效')
-await killProfile('carol') // 单实例锁：T1.7 的 carol 实例必须先杀，否则新实例被弹退
-launch('carol', ['--auto-reply', '--lobby-text=待删除消息XYZ', '--lobby-alone', '--lobby-delay-ms=3000'])
-await sleep(6000) // carol 发出并同步
-await killProfile('bob')
-launch('bob', ['--auto-reply', '--del-lobby=待删除消息XYZ'])
-ok('T8.1 bob 删除大厅消息（轮询等同步到本店）', await waitFor(() => /LOBBY-DEL-INIT/.test(L('bob')), 90000, '同步+删除'))
-ok('T8.2 删除传播到 alice（实时 del 或 sync 收敛，XYZ 消失）', await waitFor(() => {
-  if (/LOBBY-DEL-APPLIED op=del applied=true/.test(L('alice'))) return true
-  const m = [...L('alice').matchAll(/\[BOT\] SYNC conv=lobby changed=(true|false) n=(\d+) last=("[^"]*")/g)].pop()
-  return !!m && !m[3].includes('待删除消息XYZ') && Number(m[2]) <= 2
-}, 90000, '删除标记收敛'), '')
-await killProfile('bob')
-await killProfile('carol')
 
-// ---------- T9 拓扑变化自愈 + T10 待机自愈 ----------
-console.log('\n[T9/T10] 拓扑变化自愈 + 待机自愈（bob 注入：杀 relay+pc → goOnline；杀 pc → goOnline）')
-const readyBefore = (L('alice').match(/\[BOT\] READY peer=bob/g) || []).length
-launch('bob', ['--auto-reply', '--topology-change-after-ms=8000', '--go-online-after-ms=30000', '--kill-pc'])
-ok('T9.1 拓扑变化注入后 bob 自动重上线（主动上线 ≥2 次）', await waitFor(() => (L('bob').match(/主动上线/g) || []).length >= 2, 120000, '两次自愈触发'), '')
-ok('T9.2 恢复后会话重建（alice 侧 READY 次数增加）', await waitFor(() => (L('alice').match(/\[BOT\] READY peer=bob/g) || []).length >= readyBefore + 1, 120000, '重握手'), '')
-// 恢复后消息往返（carol 发大厅 → alice 收到 = 恢复后消息流正常）
-await killProfile('carol') // carol-2 的会话在 T8 已断：重启恢复与 alice 的连接
-launch('carol', ['--auto-reply', '--lobby-text=自愈后的消息', '--lobby-alone', '--lobby-delay-ms=3000'])
-ok('T9.3 自愈后消息往返正常（alice 收到 carol 的大厅消息）', await waitFor(() => /自愈后的消息/.test(L('alice')) || (/SYNC conv=lobby/.test(L('alice')) && latest('alice', /SYNC conv=lobby changed=(?:true|false) n=\d+ last=("[^"]*")/)?.[1]?.includes('自愈后的消息')), 90000, '消息流恢复'), '')
-ok('T10.1 待机自愈后 LONG 停机不再掉线（bob 会话保持 READY 30s+）', await waitFor(() => {
-  const lines2 = L('bob').match(/\[BOT\] READY peer=alice/g) || []
-  return lines2.length >= 1
-}, 30000, 'READY 存续'), '')
-
-// ---------- 汇总 ----------
-console.log('\n== 完备性测试汇总 ==')
+fs.writeFileSync('/tmp/t7-mini-alice.log', L('alice'))
+fs.writeFileSync('/tmp/t7-mini-bob.log', L('bob'))
 let pass = 0
-for (const res of results) { console.log(`  ${res.pass ? '✅' : '❌'} ${res.name}${res.pass ? '' : '  ← ' + res.detail}`); if (res.pass) pass++ }
+for (const r of results) { console.log(`  ${r.pass ? '✅' : '❌'} ${r.name}`); if (r.pass) pass++ }
 console.log(`\n${pass}/${results.length} 项通过`)
+killTrees(procs)
+fs.rmSync(srcTxt, { force: true })
+fs.rmSync(srcBig, { force: true })
+process.exit(pass === results.length ? 0 : 1)
+
 fs.writeFileSync('/tmp/comprehensive-alice.log', L('alice'))
 fs.writeFileSync('/tmp/comprehensive-bob.log', L('bob'))
 fs.writeFileSync('/tmp/comprehensive-carol.log', L('carol'))

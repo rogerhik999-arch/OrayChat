@@ -59,10 +59,13 @@
     },
 
     // 文件传输存储层（Web/WebView 内存版：分片存内存，完成后可下载/预览）
-    fxState: async (fid, { n }) => {
+    fxState: async (fid, { size, cs, n }) => {
       const s = (window.__orayFx = window.__orayFx || {})
-      if (s[fid]?.have) return { have: [...s[fid].have] }
-      return { have: new Array(Math.ceil(n / 8)).fill(0) }
+      const e = s[fid]
+      if (e?.have && e.size === size && e.cs === cs && e.n === n) return { have: [...e.have] }
+      const fresh = { chunks: new Map(), have: new Array(Math.ceil(n / 8)).fill(0), size, cs, n }
+      s[fid] = { ...fresh, chunks: new Map() }
+      return { have: [...fresh.have] }
     },
     fxWrite: async (fid, i, cs, bytes) => {
       const s = (window.__orayFx = window.__orayFx || {})
