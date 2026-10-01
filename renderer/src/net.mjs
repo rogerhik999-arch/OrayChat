@@ -378,9 +378,13 @@ export class ChatNet {
     if (existing) {
       // 对端仍在线但其会话曾失败（单向可见的根因之一）：借 presence 时机重新握手
       existing.lastProgress = Date.now() // presence 即存活证据（reapGhosts 不回收）
-      if (existing.state === 'failed' && existing.via !== 'p2p') {
+      // 对端仍在线但其会话曾失败（单向可见的根因之一）：借 presence 时机重新握手。
+      // ⚠️ 限频 30s：否则 presence 每 10-30s 到达一次就重启一轮握手，条目在
+      // 「协商中/握手失败」间永久震荡（v1.21.7 用户实测 xtx2 残身的成形机制）
+      if (existing.state === 'failed' && existing.via !== 'p2p' && Date.now() - (existing.lastHsRetryAt || 0) > 30000) {
         existing.retried = false
         existing.lastError = null
+        existing.lastHsRetryAt = Date.now()
         this.hooks.onLog?.(`对端 ${info.name || peerId.slice(0, 8)}… 仍在线，重试握手`)
         this.restartHandshake(peerId, 'mqtt')
       }
@@ -496,9 +500,13 @@ export class ChatNet {
       this.hooks.onLog?.(`← 等待 ${peerId.slice(0, 8)}…（${peer.via}）发起 E2EE 握手`)
     }
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
+    // 超时退避：连续失败的循环里若对端 RTT ≈ 超时值，迟到的 hs2 永远落在
+    // 超时之后（帧被忽略→白等满超时→再重启）形成共振死循环——逐轮放大超时
+    // 窗口（≤60s），让慢链路的 hs2 有机会落进窗口内完成握手
+    const hsTimeout = Math.min(HANDSHAKE_TIMEOUT_MS * Math.pow(1.5, Math.max(0, (peer.hsCycles || 1) - 1)), 60000)
     peer.hsTimer = setTimeout(() => {
       if (peer.state !== 'ready') this.handleHandshakeTimeout(peerId)
-    }, HANDSHAKE_TIMEOUT_MS)
+    }, hsTimeout)
   }
 
   clearRetransmit(peer) {
@@ -518,6 +526,10 @@ export class ChatNet {
     peer.via = via
     peer.ctx = null
     peer.pending = null
+    // 连续失败轮次计数（markReady 归零）：驱动超时退避与 UI 诚实显示——
+    // 对端 presence 仍在广播而握手始终不成时，条目会在「协商中/握手失败」
+    // 间永久震荡（v1.21.7 用户实测 xtx2 残身），必须可见、可数、有退避
+    peer.hsCycles = (peer.hsCycles || 0) + 1
     this.startHandshake(peerId)
   }
 
@@ -653,6 +665,8 @@ export class ChatNet {
     peer.suspect = false
     peer.suspectAt = 0
     peer.hsFails = 0
+    peer.hsCycles = 0 // 握手完成：连续失败轮次与退避一并归零
+    peer.lastHsRetryAt = 0
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     // 传输改绑：发送中的事务绑定的是旧 peerId——对端重启后以同身份、新 peerId
     // 回来，事务若不改绑就成了孤儿（块发给死会话、offer 走死通道被静默丢弃）
@@ -1098,9 +1112,14 @@ export class ChatNet {
         if (name) peer.name = name
         this.startHandshake(pid)
       } else if (existing.state === 'failed') {
-        existing.retried = false
-        existing.lastError = null
-        this.restartHandshake(pid, 'mqtt')
+        // 与 presence 触发同款限频：第三方摘要只证明对端对别人 ready，不证明
+        // 握手能成——不设限频会 15s 一轮永久重启（震荡残身）
+        if (Date.now() - (existing.lastHsRetryAt || 0) > 30000) {
+          existing.retried = false
+          existing.lastError = null
+          existing.lastHsRetryAt = Date.now()
+          this.restartHandshake(pid, 'mqtt')
+        }
       }
     }
   }

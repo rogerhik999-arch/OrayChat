@@ -6,6 +6,8 @@
 //   4) 非就绪时无效帧不进入 failed——握手成败只由 hsTimer 超时裁决
 import assert from 'node:assert/strict'
 import { ChatNet } from '../renderer/src/net.mjs'
+import { selfId } from '@trystero-p2p/mqtt'
+import { createIdentity } from '../renderer/src/crypto.mjs'
 
 const NOW = Date.now()
 
@@ -28,7 +30,8 @@ function bareNet() {
   net.relay = { connected: false, peers: new Map() }
   net._relayWasConn = false
   net.relayStableSince = 0
-  net.startHandshake = () => {} // 摘要/重启路径不真发起握手（那会走加密与网络）
+  net.store = { exportConv: () => ({ entries: [], dels: [], clearT: 0 }), storeKey: () => '' } // markReady→pushSync 桩
+  net.startHandshake = (pid) => { const p = net.peers.get(pid); if (p) { p.state = 'handshaking'; p.lastProgress = Date.now() } }
   return net
 }
 
@@ -92,6 +95,72 @@ function fakePeer(over = {}) {
   assert.equal(peer.state, 'handshaking', '校验失败不等于握手失败')
   assert.equal(net.failedHooks, 0)
   console.log('✅ 非就绪时无效帧仅警告，成败由 hsTimer 超时裁决')
+}
+
+// ---- 5) presence 触发的失败重启限频 30s（"协商中残身"震荡根治）----
+{
+  const net = bareNet()
+  net.relay.peers.set('pX', { name: 'xtx2', lastSeen: Date.now(), suspectSince: null })
+  const peer = fakePeer({ via: 'mqtt', state: 'failed' })
+  net.peers.set('pX', peer)
+  net.onRelayAnnounce('pX', { name: 'xtx2' }) // 第 1 次：重启（state→handshaking）
+  assert.equal(peer.state, 'handshaking', '首次 presence 到达应触发重试')
+  peer.state = 'failed'
+  net.onRelayAnnounce('pX', { name: 'xtx2' }) // 30s 内第 2 次：不得重启
+  assert.equal(peer.state, 'failed', '30s 内的重复 presence 不得再重启握手')
+  peer.lastHsRetryAt = Date.now() - 31000
+  net.onRelayAnnounce('pX', { name: 'xtx2' }) // 过限频窗口：允许重试
+  assert.equal(peer.state, 'handshaking', '限频窗口后应恢复重试')
+  // 摘要触发的失败重启同款限频
+  const peer2 = fakePeer({ via: 'mqtt', state: 'failed' })
+  net.peers.set('pY', peer2)
+  const fromPid = 'pReady'
+  const readyPeer = fakePeer({ state: 'ready', name: 'readyP' })
+  net.peers.set(fromPid, readyPeer)
+  net.absorbDigest(fromPid, ['pY|xtx2'])
+  assert.equal(peer2.state, 'handshaking', '摘要首次发现失败会话应重试')
+  peer2.state = 'failed'
+  net.absorbDigest(fromPid, ['pY|xtx2'])
+  assert.equal(peer2.state, 'failed', '30s 内摘要不得再重启')
+  console.log('✅ presence/digest 触发的失败重启限频 30s（震荡残身根治）')
+}
+
+// ---- 6) 握手超时退避（打破 RTT≈超时 的共振死循环）----
+{
+  const net = bareNet()
+  delete net.startHandshake // 用回原型真实现（peerId=selfId → responder 分支，不发帧）
+  const peer = fakePeer({ via: 'mqtt', state: 'handshaking' })
+  net.peers.set(selfId, peer)
+  net.startHandshake(selfId)
+  assert.equal(peer.hsTimer._idleTimeout, 15000, '首轮超时 15s')
+  peer.hsCycles = 3 // 第 3 轮重启：15000 × 1.5² = 33750
+  net.startHandshake(selfId)
+  assert.equal(peer.hsTimer._idleTimeout, 33750, '连续失败应逐轮退避')
+  peer.hsCycles = 99 // 封顶 60s
+  net.startHandshake(selfId)
+  assert.equal(peer.hsTimer._idleTimeout, 60000, '退避封顶 60s')
+  clearTimeout(peer.hsTimer) // 真 hsTimer 会挂住进程（filex 教训）
+  console.log('✅ 握手超时逐轮退避 15s→≤60s（慢链路 hs2 有窗可落）')
+}
+
+// ---- 7) markReady 归零 hsCycles / lastHsRetryAt ----
+{
+  const net = bareNet()
+  net.ident = createIdentity()
+  const peer = fakePeer({ via: 'mqtt', state: 'handshaking', ctx: { key: Buffer.alloc(32, 1), peerIdPub: Buffer.alloc(32, 2), peerName: 'x' } })
+  peer.hsCycles = 5
+  peer.lastHsRetryAt = Date.now()
+  net.peers.set('pW', peer)
+  net.resumable = new Map()
+  net.filex = null
+  net.dedupeIdentity = () => {}
+  net.mergeOldIdentities = () => {}
+  net.candidateSummary = () => null
+  net.detectPath = () => {}
+  net.markReady('pW')
+  assert.equal(peer.hsCycles, 0, '握手完成后退避计数归零')
+  assert.equal(peer.lastHsRetryAt, 0, '重启限频窗口解除')
+  console.log('✅ markReady 归零 hsCycles/lastHsRetryAt（恢复正常节奏）')
 }
 
 console.log('✅ hsframe.test.mjs 全部通过')

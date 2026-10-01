@@ -411,11 +411,20 @@ function renderPeers() {
     const name = p.name || `${peerId.slice(0, 8)}…`
     let stateText = {
       connecting: '建立 P2P 连接…',
-      handshaking: '协商端到端加密…',
+      handshaking: (p.hsCycles || 0) >= 2 ? `协商端到端加密…（第 ${(p.hsCycles || 0) + 1} 次尝试）` : '协商端到端加密…',
       ready: p.via === 'mqtt' ? '已加密 · 公共MQTT中继'
         : p.path === 'relay' ? '已加密 · TURN中继' : '已加密 · P2P直连',
-      failed: `握手失败：${p.lastError || '未知'}`,
+      failed: `握手失败：${p.lastError || '未知'}${(p.hsCycles || 0) >= 2 ? `（已重试 ${p.hsCycles} 轮，持续自动重试）` : ''}`,
     }[p.state] || p.state
+    // 非就绪条目附带对端 presence 新鲜度：有信号=对端活着、是握手受阻；
+    // 无信号=对端已消失，回收器 30s 内清理——用户可自查"残身"真伪
+    if (p.state !== 'ready') {
+      const seen = state.net.relay?.peers?.get?.(peerId)?.lastSeen
+      if (seen) {
+        const ago = Math.max(0, Math.round((Date.now() - seen) / 1000))
+        stateText += ago <= 90 ? ` · 对端 ${ago}s 前有在线信号` : ' · 对端无在线信号，即将清理'
+      }
+    }
     if (p.state === 'ready' && p.suspect) stateText += ' · 疑似离线，确认中…'
     if (p.state === 'ready' && p.lastSeen) {
       const ago = Math.max(0, Math.round((Date.now() - p.lastSeen) / 1000))
