@@ -287,8 +287,9 @@ button.ghost.warn2:hover { background: #3a2d1c; }
 .fx-name { font-size: 13px; font-weight: 600; word-break: break-all; }
 .fx-sub { color: var(--fg-dim); font-size: 11.5px; }
 .fx-action { margin-left: auto; color: #7ab3ff; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+.fx-action.disabled { color: #566b8d; pointer-events: none; }
 .fx-progress { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
-.fx-bar { flex: 1; height: 4px; background: #22314d; border-radius: 2px; overflow: hidden; }
+.fx-bar { flex: 1; min-width: 70px; height: 4px; background: #22314d; border-radius: 2px; overflow: hidden; }
 .fx-fill { height: 100%; background: #7ab3ff; border-radius: 2px; transition: width .3s; }
 .fx-caption { display: block; margin-top: 4px; }
 

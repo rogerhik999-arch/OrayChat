@@ -415,25 +415,47 @@ function createWindow() {
   })
 
   // --shot=<路径>：渲染完成后自动截窗口 PNG（用于无头验证 UI）
-  if (argv.shot) {
-    win.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
-        try {
-          if (argv['dom-dump']) {
-            const info = await win.webContents.executeJavaScript(
-              `JSON.stringify([...document.querySelectorAll('img.fx-img')].map(i => ({src: (i.currentSrc || i.src || '').slice(0, 40), complete: i.complete, nw: i.naturalWidth, broken: i.complete && i.naturalWidth === 0})))`
-            ).catch((e) => 'eval-err: ' + e.message)
-            process.stdout.write(`[dom-dump] ${info}\n`)
-          }
-          const img = await win.webContents.capturePage()
-          fs.writeFileSync(String(argv.shot), img.toPNG())
-          process.stdout.write(`[shot] saved ${argv.shot}\n`)
-          if (argv['exit-after-shot']) app.exit(0)
-        } catch (e) {
-          process.stderr.write(`[shot] failed: ${e.message}\n`)
-          app.exit(1)
+  // --shot-when=<JS 条件>：条件为真才截（如 !!document.querySelector('.fx-progress')），
+  // 配 --shot-when-timeout-ms 兜底（超时也截，用于看"到没到该到的状态"）
+  if (argv.shot || argv['shot-when']) {
+    const captureAndDump = async () => {
+      try {
+        if (argv['dom-dump']) {
+          const info = await win.webContents.executeJavaScript(
+            `JSON.stringify({
+              imgs: [...document.querySelectorAll('img.fx-img')].map(i => ({src: (i.currentSrc || i.src || '').slice(0, 40), complete: i.complete, nw: i.naturalWidth, broken: i.complete && i.naturalWidth === 0})),
+              cards: [...document.querySelectorAll('.fx-card')].map(c => c.textContent.trim().slice(0, 80)),
+              progress: [...document.querySelectorAll('.fx-progress')].map(p => ({ pct: p.querySelector('.fx-fill')?.style.width, text: p.textContent.trim().slice(0, 80) })),
+              imgPh: [...document.querySelectorAll('.fx-img-ph')].map(p => p.textContent.trim().slice(0, 80))
+            })`
+          ).catch((e) => 'eval-err: ' + e.message)
+          process.stdout.write(`[dom-dump] ${info}\n`)
         }
-      }, Number(argv['shot-delay-ms'] || 3500))
+        const img = await win.webContents.capturePage()
+        fs.writeFileSync(String(argv.shot), img.toPNG())
+        process.stdout.write(`[shot] saved ${argv.shot}\n`)
+        if (argv['exit-after-shot']) app.exit(0)
+      } catch (e) {
+        process.stderr.write(`[shot] failed: ${e.message}\n`)
+        app.exit(1)
+      }
+    }
+    win.webContents.once('did-finish-load', () => {
+      if (argv['shot-when']) {
+        const cond = String(argv['shot-when'])
+        const t0 = Date.now()
+        const poll = async () => {
+          let hit = false
+          try { hit = await win.webContents.executeJavaScript(cond) } catch { hit = false }
+          if (hit || Date.now() - t0 > Number(argv['shot-when-timeout-ms'] || 120000)) {
+            if (!hit) process.stdout.write(`[shot-when] timeout, capturing anyway\n`)
+            await captureAndDump()
+          } else setTimeout(poll, 700)
+        }
+        setTimeout(poll, 1500)
+      } else {
+        setTimeout(captureAndDump, Number(argv['shot-delay-ms'] || 3500))
+      }
     })
   }
   return win

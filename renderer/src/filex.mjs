@@ -498,6 +498,7 @@ export class FileX {
         hashes: Array.isArray(o.hashes) ? o.hashes : null, // P2-2 逐块哈希清单
         alg: o.alg === 'deflate' ? 'deflate' : '', rawSha: o.rsha || '', rawSize: o.raw || 0, // P2-1 流压缩
         have: st.have, caption: o.thumb ? (o.name || '图片') : (o.name || o.fid),
+        sentHist: [], // 接收速率采样 [ts, doneBlocks]（与发送侧 recentSpeed 共用）
         parity: new Map(), // FEC：组号 -> 奇偶块（内存态，丢失只失去优化）
         lastHaveAt: 0, lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),
       }
@@ -720,6 +721,16 @@ export class FileX {
       bitmapSet(tx.have, i)
       tx.lastProgressAt = Date.now()
       tx.lastLifeAt = tx.lastProgressAt // 收到块 = 活性
+      // 接收速率采样（500ms 节流）：UI 显示 "接收 N% · X/s"。
+      // pull 事务不经 onOffer 创建，sentHist 可能缺省——就地初始化
+      {
+        const now = Date.now()
+        if (!tx.sentHist) tx.sentHist = []
+        if (!tx.sentHist.length || now - tx.sentHist[tx.sentHist.length - 1][0] >= 500) {
+          tx.sentHist.push([now, bitmapCount(tx.have)])
+          if (tx.sentHist.length > 30) tx.sentHist.shift()
+        }
+      }
       // 组内有奇偶块且现在只剩唯一缺失 → 本地恢复
       const g = Math.floor(i / FEC_GROUP)
       if (tx.parity?.has(g)) void this.recoverWithParity(tx, g)
@@ -818,6 +829,7 @@ export class FileX {
       kind: meta.type === 'image' ? 'image' : 'file', mode: meta.mode || '',
       w: meta.w, h: meta.h, thumb: meta.thumb || '',
       have: (await this.io.state(fid, { size: h.size, cs: h.cs, n: h.n })).have,
+      sentHist: [], // 接收速率采样（与 recv 事务共用 onFrame 处理路径）
       parity: new Map(), // 与 recv 事务共用 onFrame 处理路径
       holders: holders.map((x) => x.peerId), // 备选持有者（主选停滞可切换）
       lastLifeAt: Date.now(), lastProgressAt: Date.now(), startedAt: Date.now(),

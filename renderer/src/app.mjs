@@ -574,6 +574,9 @@ function renderMessages() {
   const frag = document.createDocumentFragment()
   let lastDay = ''
   for (const m of msgs) {
+    // 单条渲染失败只跳过该条，绝不清空整个会话（此前一处气泡异常会让
+    // box.innerHTML='' 后循环中断——界面全黑且异常被 filex.emit 吞掉，极难排查）
+    try {
     const day = new Date(m.t).toLocaleDateString('zh-CN')
     if (day !== lastDay) {
       lastDay = day
@@ -618,6 +621,7 @@ function renderMessages() {
     bubble.appendChild(meta)
     row.appendChild(bubble)
     frag.appendChild(row)
+    } catch (e) { console.warn(`[render] 消息渲染失败已跳过 mid=${m.mid}: ${e?.message || e}`) }
   }
   box.appendChild(frag)
   box.scrollTop = box.scrollHeight
@@ -682,6 +686,7 @@ function updateComposerPlaceholder() {
 
 function buildFileBubble(bubble, m, mine) {
   const st = state.filex?.status(m.fid)
+  let act = null // 文件卡片的下载/打开按钮（图片气泡没有；进度块里按需禁用）
   if (m.type === 'image') {
     const cached = state.imgUrls.get(m.fid)
     // 无本机字节且无缩略图：渲染占位（裸 <img> 无 src 会呈现"损坏文件"观感）
@@ -728,7 +733,7 @@ function buildFileBubble(bubble, m, mine) {
     sub.className = 'fx-sub mono'
     sub.textContent = `${fmtSize(m.size || 0)}${m.mode === 'img' ? ' · 已压缩' : m.orig ? ' · 原图' : ''}`
     info.append(nm, sub)
-    const act = document.createElement('a')
+    act = document.createElement('a')
     act.className = 'fx-action'
     if (mine) { act.textContent = '打开'; act.onclick = () => window.oray.fxOpen?.(m.fid) }
     else {
@@ -753,20 +758,32 @@ function buildFileBubble(bubble, m, mine) {
   // 传输进度 / 异常态
   if (st) {
     if (st.state === 'active') {
+      const pct = Math.round((st.done / Math.max(1, st.total)) * 100)
       const bar = document.createElement('div')
       bar.className = 'fx-progress'
+      // 轨道 .fx-bar 必须包裹填充 .fx-fill：直接把 fill 放进 flex 行时
+      // height:100% 对自动高度行算出 0px，进度条隐形（只剩小字，v1.21.8 实测）
+      const track = document.createElement('div')
+      track.className = 'fx-bar'
       const fill = document.createElement('div')
       fill.className = 'fx-fill'
-      fill.style.width = `${Math.round((st.done / Math.max(1, st.total)) * 100)}%`
-      const pct = document.createElement('span')
-      pct.className = 'fx-sub mono'
-      pct.textContent = `${st.dir === 'send' ? '发送' : '接收'} ${Math.round((st.done / Math.max(1, st.total)) * 100)}%${st.speed ? ` · ${fmtSize(st.speed)}/s` : ''} · 断点续传`
+      fill.style.width = `${pct}%`
+      track.appendChild(fill)
+      const label = document.createElement('span')
+      label.className = 'fx-sub mono'
+      label.textContent = `${st.dir === 'send' ? '发送' : '接收'} ${pct}%${st.speed ? ` · ${fmtSize(st.speed)}/s` : ''} · 断点续传`
       const cancel = document.createElement('a')
       cancel.className = 'del'
       cancel.textContent = '取消'
       cancel.onclick = () => state.filex.cancel(m.fid)
-      bar.append(fill, pct, cancel)
+      bar.append(track, label, cancel)
       bubble.appendChild(bar)
+      // 接收中"下载"不可用：禁用显示，避免点了落空（本机字节尚未完整）。
+      // act 仅文件卡片分支赋值（图片气泡无此按钮）
+      if (act && st.dir !== 'send') {
+        act.textContent = '接收中…'
+        act.classList.add('disabled')
+      }
     } else if (st.state === 'stalled') {
       const note = document.createElement('div')
       note.className = 'fx-sub'
