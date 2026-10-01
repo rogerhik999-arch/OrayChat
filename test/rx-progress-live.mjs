@@ -43,10 +43,11 @@ try { fs.rmSync(shot, { force: true }) } catch {}
 
 launch('alice', 'alice', ['--send-file=' + testFile, '--send-file-after-ms=3000'])
 await sleep(3000)
-// 条件截图：进度条填充 ≥12% 时（真实传输中段，验证轨道/百分比/速率渲染）
+// 相位条件截图：__p1 锁存「进度条 ≥12%」（传输中段），之后等进度条**消失**
+// （done 完成态已渲染——期间无任何下一条消息，专测节流吞事件的回归）
 launch('bob', 'bob', ['--open-dm=alice', `--shot=${shot}`,
-  '--shot-when=(() => { const f = document.querySelector(".fx-fill"); return !!f && parseInt(f.style.width) >= 12 })()',
-  '--shot-when-timeout-ms=180000', '--exit-after-shot', '--dom-dump'])
+  '--shot-when=(window.__p1 = window.__p1 || (!!document.querySelector(".fx-fill") && parseInt(document.querySelector(".fx-fill").style.width) >= 12), window.__p1 === true && !document.querySelector(".fx-progress"))',
+  '--shot-when-timeout-ms=240000', '--exit-after-shot', '--dom-dump'])
 
 // 等截图生成（进度条出现时）
 {
@@ -61,16 +62,16 @@ try { dump = JSON.parse(dumpLine.slice(dumpLine.indexOf('{'))) } catch {}
 killTrees(procs)
 fs.rmSync(testFile, { force: true })
 
-const rxBar = dump?.progress?.find((p) => p.text.includes('接收'))
-const rxBarPct = rxBar ? parseInt(rxBar.pct) : 0
 const sent = /SEND-FILE-START/.test(lines.alice.join('\n'))
+const doneRecv = /FILE-DONE dir=recv/.test(B())
 console.log('\n== 结果 ==')
 console.log(`  截图生成:            ${fs.existsSync(shot) ? '✓' : '✗'} ${shot}`)
 console.log(`  alice 已开始发送:    ${sent ? '✓' : '✗'}`)
-console.log(`  bob 收到 RPROGRESS:  ${(B().match(/RPROGRESS/g) || []).length} 次`)
-console.log(`  接收进度条 DOM:      ${rxBar ? `✓ ${rxBar.pct} «${rxBar.text}»` : '✗ 无'}${dump?.progress?.length ? '' : `（dump: ${dumpLine?.slice(0, 200) || '无'}）`}`)
+console.log(`  bob 接收完成:        ${doneRecv ? '✓' : '✗'}（RPROGRESS ${(B().match(/RPROGRESS/g) || []).length} 次）`)
+console.log(`  完成态已渲染:        ${doneRecv && dump && !dump.progress?.length && dump.cards?.length ? '✓ 卡片在、进度条消失（无需下一条消息）' : `✗ dump=${dumpLine?.slice(0, 160) || '无'}`}`)
 
-const ok = fs.existsSync(shot) && !!rxBar && rxBarPct >= 12 && sent
+// 中段快照（本运行只截完成态）；完成态断言：接收完成 + 卡片存在 + 进度条已消失
+const ok = fs.existsSync(shot) && sent && doneRecv && !!dump && !dump.progress?.length && !!dump.cards?.length
 if (!ok) {
   console.log('\n== 失败诊断：alice 尾部 ==')
   console.log(lines.alice.slice(-25).join('\n'))

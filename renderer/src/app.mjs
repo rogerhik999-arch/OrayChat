@@ -30,7 +30,7 @@ const state = {
   filex: null, // 文件/图片传输（dm 会话）
   pendingFiles: [], // 待发送附件 [{file:File, kind, orig}]
   imgUrls: new Map(), // fid -> blob URL（本机已有字节的消息图片显示缓存）
-  fxThrottle: 0, // 传输进度 → 消息区重渲染节流
+  fxRenderTimer: null, // 传输进度 → 消息区重渲染节流（leading+trailing，窗口尾必补一次）
 }
 
 // ---------- 文件/图片：格式压缩与缩略图 ----------
@@ -1135,10 +1135,15 @@ async function doLogin(name, room) {
             window.oray.botLog(`[BOT] PROGRESS fid=${e.fid} done=${e.done}/${e.total}`)
           }
         }
-        const now = Date.now()
-        if (now - state.fxThrottle > 300) {
-          state.fxThrottle = now
+        // 进度渲染节流（leading + trailing）。原实现直接丢弃窗口内事件：
+        // 小文件（语音/压缩图）整个传输 <300ms，连 done 一起被吞——气泡永远
+        // 停在「接收中 0%」、图片不变清晰，直到下一条消息触发重绘（用户实测）
+        if (!state.fxRenderTimer) {
           if (!$('mainView').classList.contains('hidden')) renderMessages()
+          state.fxRenderTimer = setTimeout(() => {
+            state.fxRenderTimer = null
+            if (!$('mainView').classList.contains('hidden')) renderMessages()
+          }, 300)
         }
       },
     },
