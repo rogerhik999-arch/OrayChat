@@ -356,12 +356,16 @@ export class ChatNet {
     this.dropPeer(peerId, peer)
   }
 
+  clearHsRetries(peer) {
+    if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
+    if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
+  }
+
   dropPeer(peerId, peer) {
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearAcksFor(peerId)
     this.clearRetransmit(peer)
-    if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
-    if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
+    this.clearHsRetries(peer)
     this.peers.delete(peerId)
     this.hooks.onPeerRemoved?.(peerId, peer)
   }
@@ -506,6 +510,9 @@ export class ChatNet {
     if (!peer) return
     this.clearAcksFor(peerId) // 旧会话 seq 作废，簿记一并清除
     this.clearRetransmit(peer)
+    // 旧一轮握手的重发定时器必须随旧 ctx 一起作废：否则闭包里的旧 hs3/hs3ack
+    // 会持续砸向已换新密钥的对端，HMAC 必然失配（v1.21.5 实测曾连杀三轮会话）
+    this.clearHsRetries(peer)
     peer.lastHs1Key = null
     peer.cachedHs2 = null
     peer.via = via
@@ -538,6 +545,7 @@ export class ChatNet {
   failHandshake(peerId, peer, why) {
     peer.state = 'failed'
     peer.lastError = why
+    this.clearHsRetries(peer)
     peer.hsFails = (peer.hsFails || 0) + 1
     if (peer.hsFails === HS_FAIL_MAX) {
       this.hooks.onLog?.(`${peer.name || peerId.slice(0, 8)}… 已连续 ${peer.hsFails} 次握手失败（对端在线时仍会持续重试）`, 'warn')
@@ -628,8 +636,12 @@ export class ChatNet {
         throw new Error(`未知握手帧 ${msg?.t}`)
       }
     } catch (e) {
-      this.hooks.onLog?.(`握手失败 (${peerId.slice(0, 8)}…): ${e?.message || e}`, 'error')
-      this.failHandshake(peerId, peer, e?.message || String(e))
+      // 握手帧校验失败 ≠ 会话失败：帧可能来自已被 restartHandshake 作废的旧轮次
+      // （传输抖动换路时必有在途旧帧），也可能只是重复帧。failHandshake 在这里会
+      // 误杀已经 ready 的活会话（v1.21.5 实测：DM 发送循环被炸、删除传播停摆）。
+      // 握手成败只由 hsTimer 超时裁决，这里一律警告并保持现状。
+      const st = peer.state === 'ready' ? '会话保持' : '等待超时裁决'
+      this.hooks.onLog?.(`忽略无效握手帧 (${peerId.slice(0, 8)}…, ${st}): ${e?.message || e}`, 'warn')
     }
   }
 
@@ -678,8 +690,7 @@ export class ChatNet {
     peer.safety = oc.safetyNumber(this.ident.edPub, peer.ctx.peerIdPub)
     if (peer.hsTimer) clearTimeout(peer.hsTimer)
     this.clearRetransmit(peer)
-    if (peer.hs3Retry) { clearInterval(peer.hs3Retry); peer.hs3Retry = null }
-    if (peer.hs3ackRetry) { clearInterval(peer.hs3ackRetry); peer.hs3ackRetry = null }
+    this.clearHsRetries(peer)
     peer.lockVia = null
     if (peer.via === 'p2p') {
       peer.candidates = this.candidateSummary(peer)

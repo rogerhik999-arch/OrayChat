@@ -1274,11 +1274,18 @@ async function botSendLobby() {
 
 async function botOnReady(peerId, p) {
   if (!state.args.bot) return
-  // 私聊回声测试（既有 e2e）
-  if (bot.sendTo && p.name === bot.sendTo && bot.sent === 0) {
+  // 私聊回声测试（既有 e2e）。文件/语音传输场景不跑文本回环（纯干扰流量）；
+  // 单条失败不终止整轮：会话抖动（换路重建窗口）下 send 可能瞬时抛
+  // "对端尚未建立加密会话"，重试即可，绝不能让未捕获异常炸掉整个注入器
+  const fileMode = state.args['send-file'] || state.args['send-file2'] || state.args['send-file3'] || state.args['send-voice-after-ms']
+  if (bot.sendTo && !fileMode && p.name === bot.sendTo && bot.sent === 0) {
     for (let i = 1; i <= bot.count; i++) {
       const text = `${bot.textPrefix}-${i}`
-      await state.net.send(peerId, text)
+      let err = null
+      for (let a = 0; a < 4; a++) {
+        try { await state.net.send(peerId, text); err = null; break } catch (e) { err = e; await new Promise((r) => setTimeout(r, 1500)) }
+      }
+      if (err) { window.oray.botLog(`[BOT] SEND-ERR n=${i} ${err?.message || err}`); continue }
       bot.sent++
       window.oray.botLog(`[BOT] SENT n=${bot.sent} text=${JSON.stringify(text)}`)
       await new Promise((r) => setTimeout(r, 300))
