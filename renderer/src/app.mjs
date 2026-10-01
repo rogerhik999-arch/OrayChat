@@ -338,12 +338,17 @@ window.addEventListener('focus', () => { if (state.net) clearUnread(viewKey()) }
 // 来源：oc-names 映射（握手 + 同步帧学习）∪ 共享日志里的作者公钥。
 // 在线状态：有就绪会话 = 在线；否则离线（仍可点开查看历史）。
 
-// 身份公钥 → 就绪会话的 peerId（在线判定）
+// 身份公钥 → 会话条目的 peerId。ready 优先；**任何状态**（握手失败/协商中）
+// 都算"会话中"——否则该身份会同时出现在在线成员（会话条目）与历史联系人
+// （无 ready 会话 → 判离线）两个分组里，同名两条造成"残身"观感（用户实测 Ace）
 function onlinePeerIdByPub(idPubHex) {
+  let any = null
   for (const [peerId, p] of state.net?.peers || []) {
-    if (p.state === 'ready' && p.idPubHex === idPubHex) return peerId
+    if (p.idPubHex !== idPubHex) continue
+    if (p.state === 'ready') return peerId
+    if (!any) any = peerId
   }
-  return null
+  return any
 }
 
 function buildRoster() {

@@ -600,6 +600,9 @@ export class ChatNet {
         peer.cachedHs2 = hs2
         peer.ctx = ctx
         peer.name = ctx.peerName
+        // 身份公钥在握手验证通过（acceptHs1）时即学到，不必等 markReady：
+        // 失败/超时的会话也要能按身份归组（UI 名录、去重、别名都以身份为键）
+        peer.idPubHex = oc.hex(ctx.peerIdPub)
         if (resumed && this.resumable.get(oc.hex(ctx.peerIdPub))) {
           const tk = this.resumable.get(oc.hex(ctx.peerIdPub))
           ctx.sendSeq = tk.sendSeq || 0
@@ -616,6 +619,7 @@ export class ChatNet {
         peer.pending = null
         peer.ctx = ctx
         peer.name = ctx.peerName
+        peer.idPubHex = oc.hex(ctx.peerIdPub) // 同上：握手验证通过即学到身份
         if (resumed && pendTicket) {
           ctx.sendSeq = pendTicket.sendSeq || 0
           ctx.recvSeqMax = pendTicket.recvSeqMax || 0
