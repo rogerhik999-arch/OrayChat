@@ -1150,6 +1150,18 @@ async function doLogin(name, room) {
   })
   state.net.attachFilex(state.filex)
 
+  // 中继服务模式（v1.23.0）：本机 hub 运行中 → 把 ws://127.0.0.1:port 并入为
+  // 私有链（主机自己走本地回环，零外网依赖）；hub 中途启停同样跟随
+  const hubAdopt = (st) => {
+    if (!st?.running || !state.net?.relay) return
+    const url = `ws://127.0.0.1:${st.port}/mqtt`
+    if (state.net.relay.addBroker(url)) appendSys('中继服务：已并入本机私有中继链路（127.0.0.1 回环）')
+  }
+  if (window.oray.hubStatus) {
+    window.oray.hubStatus().then(hubAdopt).catch(() => {})
+    window.oray.onHubEvent?.((ev) => { if (ev.type === 'started' || ev.type === 'stopped') window.oray.hubStatus().then(hubAdopt).catch(() => {}) })
+  }
+
   setTimeout(flushNotices, 600)
   // 默认进入第一个在线成员的私聊（避免误以为输入框是私聊却群发）；无人在线才落大厅
   const firstReady = [...state.net.peers.entries()].find(([, p]) => p.state === 'ready')

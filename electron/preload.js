@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld('oray', {
   getLaunchArgs: () => ipcRenderer.invoke('launch-args:get'),
   appInfo: () => ipcRenderer.invoke('app:info'),
   openSettings: () => ipcRenderer.invoke('settings:open'),
+  // 中继服务模式（v1.23.0）：主窗口查询状态/监听变化 → 运行中自动并入本地私有链
+  hubStatus: () => ipcRenderer.invoke('hub:status'),
+  onHubEvent: (fn) => { ipcRenderer.on('hub:event', (_e, ev) => fn(ev)) },
 
   // 身份密钥持久化
   loadIdentity: (username) => ipcRenderer.invoke('identity:load', username),

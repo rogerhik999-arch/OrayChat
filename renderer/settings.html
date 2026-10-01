@@ -68,6 +68,38 @@
     <div class="hint">保存后重启应用生效。留空 = 恢复默认公共配置。</div>
   </div>
 
+  <div class="set-card" id="hubCard" style="display:none">
+    <h2>中继服务模式（把本机作为房间的私有中继）</h2>
+    <div class="hint" style="margin-bottom:8px">
+      本机内嵌 MQTT 中继（仅绑定 127.0.0.1），经 Cloudflare 隧道向房间成员开放。中继只转发密文
+      （端到端加密不受影响）；本机离线时成员自动回落公共中继。成员接入：把下方地址粘贴到
+      「网络 → MQTT broker」列表。
+    </div>
+    <div class="row">
+      <input type="checkbox" id="hubEnabled" style="width:auto" />
+      <label for="hubEnabled" style="margin:0; color:var(--tx); font-size:13px; cursor:pointer">启用中继服务（重启后自动恢复）</label>
+    </div>
+    <label>本地端口</label>
+    <input type="text" id="hubPort" placeholder="48883" style="max-width:140px" />
+    <div class="row">
+      <button class="primary" id="hubStartBtn">立即启动</button>
+      <button class="ghost" id="hubStopBtn">停止</button>
+      <button class="ghost" id="hubTunnelBtn">启动 Cloudflare 快速隧道</button>
+    </div>
+    <div class="hint">快速隧道零配置，但地址每次启动会变化；需要稳定地址：安装 cloudflared 后
+      执行一次 <span class="mono">cloudflared tunnel login</span> → <span class="mono">cloudflared tunnel create &lt;名字&gt;</span>
+      → <span class="mono">cloudflared tunnel route dns &lt;名字&gt; &lt;你的域名&gt;</span>，
+      然后运行 <span class="mono">cloudflared tunnel run --url http://127.0.0.1:&lt;端口&gt; &lt;名字&gt;</span>，并把
+      wss://&lt;你的域名&gt; 填入下方"对外公布地址"。</div>
+    <label>对外公布地址（成员接入用；外部隧道模式手动填写）</label>
+    <input type="text" id="hubPublicUrl" placeholder="wss://mqtt.example.com" />
+    <div class="row" style="margin-top:10px">
+      <span id="hubState" style="flex:1; font-size:12.5px; color:var(--tx2)">状态：未知</span>
+      <button class="ghost" id="hubCopyBtn">复制接入地址</button>
+    </div>
+    <pre id="hubLog" class="mono" style="font-size:10.5px; color:var(--tx2); max-height:120px; overflow:auto; white-space:pre-wrap; margin-top:8px"></pre>
+  </div>
+
   <div class="set-card danger-zone">
     <h2>清空本地数据（不影响其他设备）</h2>
     <div class="row">

@@ -1,6 +1,6 @@
 {
   "name": "oraychat",
-  "version": "1.22.3",
+  "version": "1.23.0",
   "description": "Private P2P encrypted chat desktop app",
   "main": "electron/main.js",
   "scripts": {
@@ -26,6 +26,7 @@
     "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@trystero-p2p/mqtt": "^0.25.4",
+    "aedes": "^1.2.0",
     "trystero": "^0.25.4"
   },
   "devDependencies": {

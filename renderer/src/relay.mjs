@@ -200,6 +200,17 @@ export class RelayTransport {
     for (let i = 0; i < this.parallelN; i++) this.spawnLink(this.brokerUrls[i], 500)
   }
 
+  // 运行时并入新的 broker 链（v1.23.0 私有中继服务：主机接入本地 hub、或成员
+  // 中途采纳房间内分享的私有链）。去重；并联数随链数增长（本地链零成本）
+  addBroker(url) {
+    if (!url || this.closed || this.brokerUrls.includes(url)) return false
+    this.brokerUrls.push(url)
+    this.parallelN = Math.min(this.parallelN + 1, this.brokerUrls.length)
+    this.spawnLink(url)
+    this.onLog(`并入中继链路 ${url}（并联 ${this.parallelN} 条）`)
+    return true
+  }
+
   get connected() { return this.aliveLinks().length > 0 }
 
   send(peerId, kind, data, opts = {}) {

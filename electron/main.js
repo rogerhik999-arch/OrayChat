@@ -10,6 +10,7 @@ const path = require('node:path')
 const fs = require('node:fs')
 const crypto2 = require('node:crypto')
 const zlib = require('node:zlib')
+const hub = require('./hub')
 
 const argv = {}
 for (const a of process.argv.slice(2)) {
@@ -319,6 +320,20 @@ function registerIpc() {
     fs.writeFileSync(statePath(), JSON.stringify(s2), { mode: 0o600 })
     return true
   })
+  // ---------- 中继服务模式 ----------
+  ipcMain.handle('hub:start', (_e, opts = {}) => hub.start({ ...opts, userDataDir: app.getPath('userData') }))
+  ipcMain.handle('hub:stop', () => hub.stop())
+  ipcMain.handle('hub:status', () => hub.snapshot())
+  ipcMain.handle('hub:persist', (_e, hubCfg) => {
+    try {
+      const sp = path.join(app.getPath('userData'), 'local-state.json')
+      const st = JSON.parse(fs.readFileSync(sp, 'utf8'))
+      st['oc-config'] = { ...(st['oc-config'] || {}), hub: hubCfg }
+      fs.writeFileSync(sp, JSON.stringify(st), { mode: 0o600 })
+      return true
+    } catch (err) { return { err: err.message } }
+  })
+
   ipcMain.handle('settings:set-tray-enabled', (_e, enabled) => {
     const s3 = loadLocalState()
     s3['oc-tray-enabled'] = !!enabled
@@ -526,6 +541,15 @@ if (!gotTheLock) {
   app.on('second-instance', () => showMainWindow())
 }
 
+// hub 事件扇出到设置窗口与主窗口（状态灯/URL/连接数/日志）
+function broadcastHubEvent(ev) {
+  for (const w of [settingsWin, mainWindow()].filter(Boolean)) {
+    try { w.webContents.send('hub:event', ev) } catch { /* 窗口未就绪 */ }
+  }
+  process.stdout.write(`${JSON.stringify(ev)}\n`) // bot 断言用（[HUB] 行在 hub.js 日志里，经 hub:log 也打 stdout）
+}
+function mainWindow() { return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.webContents.getURL().includes('index.html')) }
+
 app.whenReady().then(() => {
   registerIpc()
   createWindow()
@@ -537,6 +561,22 @@ app.whenReady().then(() => {
     } else if (!IS_BOT) createTray()
   } catch { if (!IS_BOT) createTray() }
   app.on('activate', () => showMainWindow()) // macOS 点 Dock 图标恢复
+
+  // 中继服务模式：bot 参数直启，或设置页曾启用则自动恢复（重启自愈）
+  hub.emitter = { emit: (_t, ev) => broadcastHubEvent(ev) }
+  const hubAuto = argv['relay-hub'] ? { port: Number(argv['hub-port']) || 48883, tunnel: argv['hub-tunnel'] ? 'quick' : 'off' } : null
+  if (!hubAuto) {
+    try {
+      const st = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'local-state.json'), 'utf8'))
+      const cfg = st['oc-config'] || {}
+      if (cfg.hub?.enabled) hubAuto0(cfg.hub)
+    } catch { /* 无配置 */ }
+  } else { hubAuto0(hubAuto) }
+  function hubAuto0(o) {
+    hub.start({ ...o, userDataDir: app.getPath('userData') }).then((r) => {
+      process.stdout.write(`[HUB] autostart ${JSON.stringify(r)}\n`)
+    })
+  }
 })
 
 // 关窗即隐藏，通常不会走到这里；bot 模式靠 botExit 退出

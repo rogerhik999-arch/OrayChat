@@ -99,4 +99,54 @@ $('clearRoom').onclick = async () => {
 
 $('openMain').onclick = () => window.settings.openMainWindow()
 
+// ---------- 中继服务模式（desktop 专用；无 hub 预加载即隐藏整卡） ----------
+function hubRender(st) {
+  const state = st?.running ? '运行中' : '未运行'
+  const tunnel = st?.tunnelUrl ? ` · 隧道 ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
+  $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
+  $('hubLog').textContent = (st?.log || []).join('\n')
+  $('hubTunnelBtn').disabled = !st?.running
+  $('hubStopBtn').disabled = !st?.running
+}
+function hubCopyText() {
+  const pub = $('hubPublicUrl').value.trim()
+  const st = window.__hubSnap
+  if (pub) return pub
+  if (st?.tunnelUrl) return st.tunnelUrl
+  if (st?.running) return `ws://127.0.0.1:${st.port}/mqtt`
+  return ''
+}
+if (window.settings.hubStart) {
+  $('hubCard').style.display = ''
+  window.__hubSnap = null
+  const persist = () => window.settings.hubPersist({ enabled: $('hubEnabled').checked, port: Number($('hubPort').value) || 48883 })
+  window.settings.hubStatus().then((st) => {
+    hubRender(st)
+    if (st.running) $('hubEnabled').checked = true
+  })
+  window.settings.onHubEvent?.((ev) => {
+    if (ev.type === 'log') $('hubLog').textContent += `\n${ev.line}`
+    window.settings.hubStatus().then(hubRender)
+  })
+  $('hubStartBtn').onclick = async () => {
+    const r = await window.settings.hubStart({ port: Number($('hubPort').value) || 48883, tunnel: 'off' })
+    if (!r.ok) toast(`启动失败：${r.err}`)
+    window.settings.hubStatus().then(hubRender)
+  }
+  $('hubStopBtn').onclick = async () => { await window.settings.hubStop(); window.settings.hubStatus().then(hubRender) }
+  $('hubTunnelBtn').onclick = async () => {
+    toast('正在启动 Cloudflare 快速隧道…')
+    const r = await window.settings.hubStart({ port: Number($('hubPort').value) || 48883, tunnel: 'quick' })
+    if (!r.ok) toast(`启动失败：${r.err}`)
+    window.settings.hubStatus().then(hubRender)
+  }
+  $('hubCopyBtn').onclick = async () => {
+    const text = hubCopyText()
+    if (!text) { toast('中继未运行且未填对外地址'); return }
+    try { await navigator.clipboard.writeText(text); toast(`已复制 ${text}`) } catch { toast(`接入地址：${text}`) }
+  }
+  $('hubEnabled').onchange = persist
+  $('hubPort').onchange = persist
+}
+
 load().catch((e) => console.error(e))

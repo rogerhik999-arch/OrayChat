@@ -5,6 +5,16 @@
 > 以及公共 TURN 已消亡的先例（见项目记忆）——**公共免费基础设施随时可能劣化到不可用**。
 > 用户提案：一个客户端同时开启"中继服务模式"，充当私有 MQTT broker，用 Cloudflare 暴露稳定
 > 服务地址，作为全房间的中继。
+>
+> **✅ P0 已落地（v1.23.0）**：electron/hub.js（内嵌 Aedes，仅绑 127.0.0.1）+ cloudflared
+> 快速隧道托管（二进制缓存于 OrayChat/cloudflared/，PATH/基础目录自动查找，找不到优雅降级
+> 为本机链）+ 设置页「中继服务模式」卡（启停/端口/隧道/复制接入地址/状态灯/日志）+
+> relay.mjs addBroker() 运行时并链 + 主机自动接入本地回环链 + CSP 放行 ws:。
+> 实测：test/hub-live.mjs（纯私有链拓扑：握手/消息/文件/SHA 全绿）与
+> test/hub-tunnel-live.mjs（bob 仅连 wss://<trycloudflare>.com 经 CF 边缘全公网握手+消息 ✓）。
+> ⚠️ 落地坑：aedes 1.x 必须用 `await Aedes.createBroker()`（new Aedes() 半初始化不回 CONNACK）；
+> aedes-server-factory 的 ws 分支不处理 mqtt.js 的 `mqtt` 子协议（connack timeout）——自建
+> http+ws 桥（handleProtocols 协商）；CSP connect-src 需加 ws:。
 
 ## 0. 结论先行
 
