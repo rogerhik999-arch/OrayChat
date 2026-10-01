@@ -1152,13 +1152,17 @@ export class ChatNet {
   // 身份密钥、握手早断）且中继视野里已无 presence → 一并清理。两台设备同名
   // 且都 ready 的合法场景不受影响。
   dedupeIdentity(peerId, peer) {
-    const relaySees = (pid) => this.relay?.peers?.has(pid)
     for (const [pid, p] of [...this.peers.entries()]) {
       if (pid === peerId || p === peer) continue
       const sameIdentity = p.idPubHex && p.idPubHex === peer.idPubHex
       const knownName = p.name || (p.idPubHex ? this.peerNames.get(p.idPubHex) : null)
       const sameName = peer.name && knownName === peer.name && p.state !== 'ready'
-      if (sameIdentity || (sameName && !relaySees(pid))) {
+      // 同名接管不再要求"中继视野无 presence"（v1.22.2）：设备重启后旧连接
+      // 条目的 presence 残留在 TTL 内，会把清理挡住 → 用户看到同名双条目
+      // （旧条目握手早期失败时连身份公钥都没学到，sameIdentity 也救不了）。
+      // 昵称即账号：我刚与这个名字完成全新加密握手，旧的非 ready 条目即视为
+      // 旧连接清理；真有两台同名活设备，被清的那台会经 presence 重启握手自愈
+      if (sameIdentity || sameName) {
         this.hooks.onLog?.(`同一${sameIdentity ? '身份' : '昵称'}经新连接上线，清理旧会话条目（${knownName || pid.slice(0, 8)}…）`)
         this.dropPeer(pid, p)
       }
@@ -1259,7 +1263,10 @@ export class ChatNet {
       // 实则忙 —— 此时判死拆会话会让 ACK 断流、传输卡死在半路
       if (this.filex?.hasActiveTransfer?.(peerId)) continue
       const pcAlive = !!peer.pc && peer.pc.connectionState === 'connected'
-      if (pcAlive) continue
+      // pcAlive 免死只适用于 ready 会话：对端 app 已关时 WebRTC 通道可能长时间
+      // 僵尸 connected（ICE 保活未超时），非就绪条目没有可保护的数据流，却被它
+      // 挡住回收、同时握手超时不断重启——「协商中（第 N 次尝试）」永生（用户实测 xfold6 手机离线）
+      if (peer.state === 'ready' && pcAlive) continue
       if (this.relay?.peers?.has(peerId)) continue // 仍在广播 presence：真在线（哪怕握手失败）
       if (peer.state === 'ready') {
         // 已建立会话：我方中继视野需稳定（预热门）+ 怀疑宽限期，才判死
