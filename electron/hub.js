@@ -24,6 +24,8 @@ const state = {
   port: 0, tunnelUrl: '', clients: 0, startedAt: 0,
   mode: 'off', name: '', hostname: '', publicUrl: '',
   namedRestarts: 0, loginProc: null, registered: false,
+  clientMap: new Map(), // clientId -> {fp, since}（身份指纹接入表）
+  names: {}, // 指纹 -> 昵称（renderer 经 hub:set-names 推送）
   logs: [], emitter: null, // main.js 注入 EventEmitter（转发 UI/日志事件）
 }
 
@@ -60,11 +62,14 @@ async function start(opts = {}) {
     const aedes = await Aedes.createBroker()
     aedes.on('client', (c) => {
       state.clients++
-      log(`client 连接 total=${state.clients} (${c.req?.socket?.remoteAddress || 'local'})`)
+      const m = String(c.id || '').match(/^oc-([0-9a-f]{8})-/)
+      if (m) state.clientMap.set(c.id, { fp: m[1], since: Date.now() })
+      log(`client 连接 total=${state.clients} (${m ? '成员 ' + m[1] : c.req?.socket?.remoteAddress || 'local'})`)
       state.emitter?.emit('event', { type: 'clients', clients: state.clients })
     })
-    aedes.on('clientDisconnect', () => {
+    aedes.on('clientDisconnect', (c) => {
       state.clients = Math.max(0, state.clients - 1)
+      state.clientMap.delete(String(c?.id || ''))
       state.emitter?.emit('event', { type: 'clients', clients: state.clients })
     })
     // 自建 http+ws 桥（不用 aedes-server-factory 的 ws 分支：它不处理 mqtt.js 的
@@ -386,11 +391,19 @@ function snapshot() {
     certReady: fs.existsSync(CERT_PATH),
     tunnelProc: !!(state.tunnelProc || state.namedProc),
     registered: state.registered,
+    // 按身份指纹聚合的成员接入列表（同名合并条数；名字由 renderer 映射）
+    memberList: (() => {
+      const byFp = new Map()
+      for (const { fp } of state.clientMap.values()) byFp.set(fp, (byFp.get(fp) || 0) + 1)
+      return [...byFp.entries()].map(([fp, links]) => ({ fp, links, name: state.names[fp] || '' }))
+    })(),
     log: state.logs.slice(-40),
   }
 }
 
+function setNames(map) { state.names = map || {} }
+
 module.exports = {
-  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed, verify,
+  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed, verify, setNames,
   set emitter(v) { state.emitter = v },
 }

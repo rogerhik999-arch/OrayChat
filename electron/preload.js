@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('oray', {
   // 中继服务模式（v1.23.0）：主窗口查询状态/监听变化 → 运行中自动并入本地私有链
   hubStatus: () => ipcRenderer.invoke('hub:status'),
   onHubEvent: (fn) => { ipcRenderer.on('hub:event', (_e, ev) => fn(ev)) },
+  hubSetNames: (map) => ipcRenderer.send('hub:set-names', map),
 
   // 身份密钥持久化
   loadIdentity: (username) => ipcRenderer.invoke('identity:load', username),

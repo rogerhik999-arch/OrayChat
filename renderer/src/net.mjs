@@ -150,6 +150,7 @@ export class ChatNet {
       roomId,
       brokerUrls: cfg.relayBrokers || DEFAULT_CONFIG.relayBrokers,
       myName,
+      clientIdBase: `oc-${(this.myIdPubHex || '').slice(0, 8)}`,
       roomKey: this.roomKey,
       onAnnounce: (id, info) => this.onRelayAnnounce(id, info),
       onFrame: (from, kind, data) => this.onRelayFrame(from, kind, data),

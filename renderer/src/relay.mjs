@@ -46,7 +46,7 @@ const DEDUP_WINDOW_MS = 60000
 const DEFAULT_PARALLEL = 2
 
 export class RelayTransport {
-  constructor({ appId, roomId, brokerUrls, myName, roomKey, instanceId, parallel, onAnnounce, onFrame, onPeerGone, onPeerSuspect, onLog }) {
+  constructor({ appId, roomId, brokerUrls, myName, roomKey, instanceId, parallel, clientIdBase = '', onAnnounce, onFrame, onPeerGone, onPeerSuspect, onLog }) {
     this.appId = appId
     this.roomId = roomId
     this.selfId = instanceId || selfId // 可注入实例 ID（便于同进程测试）
@@ -59,6 +59,7 @@ export class RelayTransport {
     this.onLog = onLog || (() => {})
     this.peers = new Map() // selfId -> {name, lastSeen, suspectSince}
     this.closed = false
+    this.clientIdBase = clientIdBase
     this.brokerUrls = brokerUrls?.length ? brokerUrls : ['wss://broker-cn.emqx.io:8084/mqtt']
     this.links = new Map() // url -> {client, alive, attempts}
     this.seenTx = new Map() // txid -> ts（多链路重复帧去重）
@@ -95,7 +96,13 @@ export class RelayTransport {
     const { presence, inbox } = RelayTransport.topics(this.appId, this.roomId)
     let client
     try {
-      client = mqtt.connect(url, { reconnectPeriod: 0, connectTimeout: 8000, keepalive: 30 })
+      // clientId 带身份公钥指纹：私有中继（hub）据此显示「谁」接入了中继
+      //（oc-<pub8>-<rand>；rand 保证同一成员多条并联链路不被 broker 互踢）
+      const clientId = this.clientIdBase
+        ? `${this.clientIdBase}-${Math.random().toString(36).slice(2, 6)}`
+        : undefined
+      client = mqtt.connect(url, { reconnectPeriod: 0, connectTimeout: 8000, keepalive: 30, clientId })
+
     } catch { this.scheduleLinkRetry(url, retry); return }
     const link = { client, alive: false, attempts: 0 }
     this.links.set(url, link)

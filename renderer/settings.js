@@ -148,14 +148,21 @@ if (window.settings.hubStart) {
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
     $('hubStopBtn').disabled = !st?.running
+    // 已接入成员（按身份指纹聚合；名字由主窗口推送映射，未知显示指纹前 8 位）
+    const members = st?.memberList || []
+    const memberText = members.length
+      ? members.map((m) => `${m.name || '指纹 ' + m.fp}${m.links > 1 ? `（${m.links} 条链路）` : ''}`).join('、')
+      : '（暂无）'
+    const el = $('hubMembers')
+    if (el) el.textContent = `已接入成员（${members.length}）：${memberText}`
     if (st?.running && st?.mode === 'named') {
       // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
-      $('hubState').textContent = `状态：运行中（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 成员连接 ${st?.clients ?? 0}`
+      $('hubState').textContent = `状态：运行中（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 链路 ${st?.clients ?? 0}`
       return
     }
     const state = st?.running ? '运行中' : '未运行'
     const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
-    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
+    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 链路 ${st?.clients ?? 0}`
   }
   // 先从持久化配置回填（重启后向导字段暂存恢复；load() 异步未必先到，自行拉取），
   // 再叠加运行时状态

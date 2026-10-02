@@ -1163,6 +1163,18 @@ async function doLogin(name, room) {
   if (window.oray.hubStatus) {
     window.oray.hubStatus().then(hubAdopt).catch(() => {})
     window.oray.onHubEvent?.((ev) => { if (['started', 'stopped', 'tunnel'].includes(ev.type)) window.oray.hubStatus().then(hubAdopt).catch(() => {}) })
+    // 指纹→昵称映射：中继设置页的「已接入成员」按昵称显示（而非公钥指纹）
+    const pushHubNames = () => {
+      if (!state.net || !window.oray.hubSetNames) return
+      const map = { [state.myIdPubHex.slice(0, 8)]: state.name }
+      for (const [, p] of state.net.peers) {
+        if (p.idPubHex && p.name) map[p.idPubHex.slice(0, 8)] = p.name
+      }
+      for (const [pub, n] of state.net.peerNames || []) map[pub.slice(0, 8)] = n
+      window.oray.hubSetNames(map)
+    }
+    pushHubNames()
+    setInterval(pushHubNames, 30000)
   }
 
   setTimeout(flushNotices, 600)
