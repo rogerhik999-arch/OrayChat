@@ -332,6 +332,7 @@ function registerIpc() {
   ipcMain.handle('hub:login', () => hub.loginTunnel(app.getPath('userData')))
   ipcMain.handle('hub:create-tunnel', (_e, name) => hub.createTunnel(name, app.getPath('userData')))
   ipcMain.handle('hub:route-dns', (_e, name, hostname) => hub.routeDns(name, hostname, app.getPath('userData')))
+  ipcMain.handle('hub:verify', (_e, target) => hub.verify(target))
   ipcMain.handle('hub:start-named', (_e, { name, hostname, port }) => {
     // 先确保 broker 本体在跑（用户可能只完成了向导没点过"立即启动"），再挂命名隧道
     if (!hub.snapshot().running) {

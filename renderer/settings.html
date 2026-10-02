@@ -119,8 +119,10 @@
     <input type="text" id="hubPublicUrl" placeholder="wss://mqtt.example.com" />
     <div class="row" style="margin-top:10px">
       <span id="hubState" style="flex:1; font-size:12.5px; color:var(--tx2)">状态：未知</span>
+      <button class="ghost" id="hubTestBtn">测试接入</button>
       <button class="ghost" id="hubCopyBtn">复制接入地址</button>
     </div>
+    <div id="hubTestResult" class="hint" style="margin-top:6px; min-height:15px"></div>
     <pre id="hubLog" class="mono" style="font-size:10.5px; color:var(--tx2); max-height:120px; overflow:auto; white-space:pre-wrap; margin-top:8px"></pre>
   </div>
 

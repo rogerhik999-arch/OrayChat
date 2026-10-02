@@ -346,6 +346,28 @@ function startNamedRun(userDataDir) {
   spawnRun()
 }
 
+// 成员视角接入测试：真实连接目标地址并完成发布/订阅往返。
+// 目标优先级由调用方（设置页）决定：对外地址（验证全公网链路）> 本机回环（只验 Aedes）
+function verify(target) {
+  const url = String(target || '').trim()
+  if (!url) return Promise.resolve({ ok: false, err: '无可用地址（未填对外地址且中继未运行）' })
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (r) => { if (done) return; done = true; try { c.end(true) } catch { /* 已断 */ } resolve(r) }
+    let c
+    try {
+      const mqtt = require('mqtt')
+      const t0 = Date.now()
+      const topic = `hub-verify-${Date.now().toString(36)}`
+      c = mqtt.connect(url, { reconnectPeriod: 0, connectTimeout: 10000 })
+      c.on('connect', () => { c.subscribe(topic); c.publish(topic, 'verify') })
+      c.on('message', () => finish({ ok: true, ms: Date.now() - t0 }))
+      c.on('error', (e) => finish({ ok: false, err: e.message }))
+      setTimeout(() => finish({ ok: false, err: '连接/响应超时（15s）——检查地址、隧道状态或网络' }), 15000)
+    } catch (e) { finish({ ok: false, err: e.message }) }
+  })
+}
+
 function stopNamed() {
   if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null }
   state.namedRestarts = 0
@@ -369,6 +391,6 @@ function snapshot() {
 }
 
 module.exports = {
-  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed,
+  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed, verify,
   set emitter(v) { state.emitter = v },
 }

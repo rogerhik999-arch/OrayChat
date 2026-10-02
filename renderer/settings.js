@@ -143,6 +143,7 @@ if (window.settings.hubStart) {
     $('hubStep4Btn').disabled = !st?.certReady
   }
   function hubRenderDom(st) {
+    window.__hubSnap = st // 测试按钮/复制按钮取运行时快照
     // 日志渲染是公共尾部：named 分支曾用提前返回把它短路（v1.24.4 日志"消失"）
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
@@ -236,6 +237,24 @@ if (window.settings.hubStart) {
     if (!r.ok) { toast(`启动失败：${r.err}`); return }
     $('hubEnabled').checked = true
     persist(); window.settings.hubStatus().then(hubRender)
+  }
+  $('hubTestBtn').onclick = async () => {
+    const btn = $('hubTestBtn')
+    const pub = $('hubPublicUrl').value.trim()
+    const st = window.__hubSnap
+    // 目标优先级：对外地址（完整公网链路：边缘→隧道→本机）> 运行中隧道地址 > 本机回环（只验中继本体）
+    const target = pub || st?.tunnelUrl || (st?.running ? `ws://127.0.0.1:${st.port}/mqtt` : '')
+    if (!target) { $('hubTestResult').textContent = '测试结果：✗ 无可用地址（先启动中继或填对外地址）'; return }
+    btn.disabled = true
+    $('hubTestResult').textContent = `测试中…（成员视角连接 ${target}）`
+    const r = await window.settings.hubVerify(target)
+    btn.disabled = false
+    const line = r.ok
+      ? `测试结果：✓ 可用（往返 ${r.ms}ms · ${target}${target === pub && pub ? ' · 完整公网链路' : ' · 本机链路'}）`
+      : `测试结果：✗ 失败——${r.err}`
+    $('hubTestResult').textContent = line
+    $('hubLog').textContent += `\n[HUB] ${new Date().toLocaleTimeString('zh-CN', { hour12: false })} 接入测试 ${r.ok ? '通过' : '失败'}（${target}${r.ok ? `，${r.ms}ms` : ''}）${r.ok ? '' : '：' + r.err}`
+    window.settings.hubStatus().then(hubRender)
   }
   $('hubCopyBtn').onclick = async () => {
     const text = hubCopyText()
