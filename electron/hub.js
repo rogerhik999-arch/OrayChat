@@ -254,7 +254,12 @@ async function routeDns(name, hostname, userDataDir) {
   if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) return { ok: false, err: '主机名格式不正确（如 mqtt.example.com）' }
   const r = await runCloudflared(bin, ['tunnel', 'route', 'dns', String(name), host])
   if (/Added|created|successfully/i.test(r.out)) { log(`域名 ${host} 已绑定到隧道「${name}」`); return { ok: true } }
-  if (/already exist/i.test(r.out)) { log(`域名 ${host} 的记录已存在（若此前指向其他隧道，请在 Cloudflare 控制台删除后重试）`); return { ok: true, already: true } }
+  // 已绑定核验通过的三种实测措辞：CNAME 已存在（"record already exists"）、
+  // 已指向本隧道（"is already configured to route to your tunnel tunnelID=..."）
+  if (/already exist/i.test(r.out) || /is already configured to route/i.test(r.out)) {
+    log(`域名 ${host} 已绑定到隧道「${name}」（核验通过，继续）`)
+    return { ok: true, already: true }
+  }
   log(`域名绑定失败: ${r.out.trim().slice(0, 200)}`)
   return { ok: false, err: r.out.trim().slice(0, 300) || `exit ${r.code}` }
 }
