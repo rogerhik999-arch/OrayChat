@@ -23,7 +23,7 @@ const state = {
   aedes: null, server: null, tunnelProc: null, namedProc: null,
   port: 0, tunnelUrl: '', clients: 0, startedAt: 0,
   mode: 'off', name: '', hostname: '', publicUrl: '',
-  namedRestarts: 0, loginProc: null,
+  namedRestarts: 0, loginProc: null, registered: false,
   logs: [], emitter: null, // main.js 注入 EventEmitter（转发 UI/日志事件）
 }
 
@@ -127,7 +127,7 @@ async function stop() {
   }
   Object.assign(state, {
     aedes: null, server: null, tunnelUrl: '', port: 0, clients: 0, startedAt: 0,
-    mode: 'off', namedRestarts: 0,
+    mode: 'off', namedRestarts: 0, registered: false,
   })
   state.emitter?.emit('event', { type: 'stopped' })
 }
@@ -278,9 +278,12 @@ function startNamedRun(userDataDir) {
   const spawnRun = () => {
     // ⚠️ --no-autoupdate 是 app 层 flag：放在 `tunnel run` 子命令后不被识别，
     // cloudflared 会打印完整参数帮助然后 code=0 退出（v1.24.0-v1.24.1 秒退根因）
+    // --protocol http2：强制 TCP 边缘连接。默认 quic（UDP）在劣化网络下反复
+    // "timeout: no recent network activity" 断线重连（v1.24.3 用户日志），TCP 稳定；
+    // quick tunnel 同款参数已实测稳定
     const args = useToken && token
-      ? ['--no-autoupdate', 'tunnel', 'run', '--token', token]
-      : ['--no-autoupdate', 'tunnel', 'run', '--url', `http://127.0.0.1:${state.port}`, state.name]
+      ? ['--no-autoupdate', 'tunnel', '--protocol', 'http2', 'run', '--token', token]
+      : ['--no-autoupdate', 'tunnel', '--protocol', 'http2', 'run', '--url', `http://127.0.0.1:${state.port}`, state.name]
     const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.__startedAt = Date.now()
     state.namedProc = proc
@@ -292,6 +295,7 @@ function startNamedRun(userDataDir) {
         if (!l) continue
         if (/Registered tunnel connection|Registered and connected/.test(l)) {
           if (!registered) { registered = true; log(`稳定服务已连接 ${state.tunnelUrl}`) }
+          state.registered = true
           state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
           continue
         }
@@ -313,6 +317,7 @@ function startNamedRun(userDataDir) {
     proc.on('exit', async (code) => {
       if (state.namedProc !== proc) return // stop() 主动关闭
       state.namedProc = null
+      state.registered = false
       state.namedRestarts++
       const lifeMs = Date.now() - proc.__startedAt
       // 本地凭据模式连续秒退：探测 token（Dashboard 管理的隧道无本地凭据文件，
@@ -358,6 +363,7 @@ function snapshot() {
     hostname: state.hostname,
     certReady: fs.existsSync(CERT_PATH),
     tunnelProc: !!(state.tunnelProc || state.namedProc),
+    registered: state.registered,
     log: state.logs.slice(-40),
   }
 }

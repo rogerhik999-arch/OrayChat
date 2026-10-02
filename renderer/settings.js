@@ -145,6 +145,10 @@ if (window.settings.hubStart) {
   function hubRenderDom(st) {
     const state = st?.running ? '运行中' : '未运行'
     const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
+    if (st?.running && st?.mode === 'named') {
+      // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
+      return void ($('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 成员连接 ${st?.clients ?? 0}`)
+    }
     $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
