@@ -320,20 +320,21 @@ button.ghost.warn2:hover { background: #3a2d1c; }
 /* 中继主机标识（v1.24.0） */
 .hub-badge { margin-left: 5px; font-size: 11px; filter: saturate(.9); }
 
-/* 中继状态胶囊与面板（v1.25.2） */
+/* 中继状态胶囊与面板（v1.25.2；v1.25.3 移入左上本用户区域 self-card） */
 .hub-pill {
-  position: absolute; top: 12px; right: 14px; z-index: 30;
-  padding: 6px 12px; border-radius: 999px; font-size: 12px;
+  display: block; width: 100%; margin-top: 8px; text-align: left;
+  padding: 7px 10px; border-radius: 9px; font-size: 12px;
   background: #22314d; color: #bcd3f5; border: 1px solid #33456b; cursor: pointer;
   appearance: none; -webkit-appearance: none; font-family: inherit; line-height: 1.4;
 }
 .hub-pill:hover { background: #2a3c5e; }
+.hub-pill.hidden { display: none; }
 .hub-panel {
-  position: absolute; top: 46px; right: 14px; z-index: 31;
-  min-width: 280px; max-width: 380px; padding: 12px 14px; border-radius: 12px;
-  background: var(--bg2); border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  margin-top: 6px; padding: 10px 12px; border-radius: 10px;
+  background: var(--bg3); border: 1px solid var(--line);
   font-size: 12px; color: var(--tx2);
 }
+.hub-panel.hidden { display: none; }
 .hub-panel-title { font-weight: 700; color: var(--accent); margin-bottom: 4px; }
 .hub-panel-row { margin: 2px 0; word-break: break-all; }
 .hub-member { margin: 1px 0; }

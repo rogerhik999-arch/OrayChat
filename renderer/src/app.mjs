@@ -1916,17 +1916,11 @@ async function main() {
 // 中继状态胶囊（v1.25.2）：本机是中继主机时右上常驻——状态 + 链路数，点开
 // 查看已接入成员明细（名字/链路数）与接入地址，一键复制
 function renderHubPill(st) {
-  let pill = $('hubPill')
-  if (!pill) {
-    pill = document.createElement('button')
-    pill.id = 'hubPill'
-    pill.className = 'hub-pill'
-    pill.title = '私有中继服务状态'
-    $('chatHead').appendChild(pill)
-    const panel = document.createElement('div')
-    panel.id = 'hubPanel'
-    panel.className = 'hub-panel hidden'
-    $('chatHead').appendChild(panel)
+  // 胶囊与面板是 self-card（左上本用户区域）内的静态元素（index.html），此处只填充
+  const pill = $('hubPill')
+  const panel = $('hubPanel')
+  if (!pill || !panel) return
+  if (!pill.onclick) {
     pill.onclick = () => panel.classList.toggle('hidden')
     document.addEventListener('click', (e) => {
       if (!panel.classList.contains('hidden') && !panel.contains(e.target) && e.target !== pill) panel.classList.add('hidden')
@@ -1934,7 +1928,7 @@ function renderHubPill(st) {
   }
   const running = st?.running
   pill.classList.toggle('hidden', !running)
-  if (!running) { $('hubPanel')?.classList.add('hidden'); return }
+  if (!running) { panel.classList.add('hidden'); return }
   const reg = st.mode === 'named' ? (st.registered ? '✓ 已连边缘' : '⏳ 连接中') : (st.tunnelUrl ? '✓ 隧道就绪' : '隧道建立中')
   pill.textContent = `📡 私有中继 · ${reg} · 链路 ${st.clients ?? 0}`
   const members = st.memberList || []
@@ -1942,7 +1936,7 @@ function renderHubPill(st) {
     ? members.map((m) => `<div class="hub-member">· ${esc(m.name || '指纹 ' + m.fp)}${m.links > 1 ? `（${m.links} 条链路）` : ''}</div>`).join('')
     : '<div class="hub-member">· 暂无成员接入</div>'
   const url = st.tunnelUrl || st.publicUrl || `ws://127.0.0.1:${st.port}/mqtt`
-  $('hubPanel').innerHTML = `
+  panel.innerHTML = `
     <div class="hub-panel-title">📡 私有中继运行中</div>
     <div class="hub-panel-row">接入地址：${esc(url)}</div>
     <div class="hub-panel-row">${st.mode === 'named' ? '稳定地址' : '临时地址'}${st.token ? ' · 准入 token 已启用' : ''}</div>
