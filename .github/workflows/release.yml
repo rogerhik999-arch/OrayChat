@@ -24,8 +24,8 @@ jobs:
         run: |
           mkdir -p build/cloudflared
           curl -sSL --retry 5 -o /tmp/cfd.tgz https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-darwin-arm64.tgz
-          echo "5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32  /tmp/cfd.tgz" | shasum -a 256 -c -
           tar -xzf /tmp/cfd.tgz -C build/cloudflared
+          echo "5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32  build/cloudflared/cloudflared" | shasum -a 256 -c -
           chmod +x build/cloudflared/cloudflared
       - run: npx electron-builder --mac --publish never
         env:
@@ -47,7 +47,10 @@ jobs:
         run: |
           mkdir -p build/cloudflared
           curl -sSL --retry 5 -o build/cloudflared/cloudflared.exe https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe
-          python -c "import hashlib;h=hashlib.sha256(open('build/cloudflared/cloudflared.exe','rb').read()).hexdigest();assert h=='f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2',h"
+          $size = (Get-Item build\cloudflared\cloudflared.exe).Length
+          if ($size -lt 40000000) { Write-Host "downloaded size=$size"; exit 1 }
+          $h = (Get-FileHash build\cloudflared\cloudflared.exe -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne 'f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2') { Write-Host "sha mismatch: $h"; exit 1 }
       - run: npx electron-builder --win --publish never
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
