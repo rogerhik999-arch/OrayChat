@@ -143,16 +143,18 @@ if (window.settings.hubStart) {
     $('hubStep4Btn').disabled = !st?.certReady
   }
   function hubRenderDom(st) {
-    const state = st?.running ? '运行中' : '未运行'
-    const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
-    if (st?.running && st?.mode === 'named') {
-      // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
-      return void ($('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 成员连接 ${st?.clients ?? 0}`)
-    }
-    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
+    // 日志渲染是公共尾部：named 分支曾用提前返回把它短路（v1.24.4 日志"消失"）
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
     $('hubStopBtn').disabled = !st?.running
+    if (st?.running && st?.mode === 'named') {
+      // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
+      $('hubState').textContent = `状态：运行中（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 成员连接 ${st?.clients ?? 0}`
+      return
+    }
+    const state = st?.running ? '运行中' : '未运行'
+    const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
+    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
   }
   // 先从持久化配置回填（重启后向导字段暂存恢复；load() 异步未必先到，自行拉取），
   // 再叠加运行时状态
