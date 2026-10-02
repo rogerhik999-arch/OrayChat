@@ -45,11 +45,11 @@ jobs:
       - run: npm run build
       - name: Bundle cloudflared (windows-amd64)
         run: |
-          mkdir -p build/cloudflared
-          curl -sSL --retry 5 -o build/cloudflared/cloudflared.exe https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe
-          $size = (Get-Item build\cloudflared\cloudflared.exe).Length
+          New-Item -ItemType Directory -Force -Path build/cloudflared | Out-Null
+          curl.exe -sSL --retry 5 -o build/cloudflared/cloudflared.exe https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe
+          $size = (Get-Item build/cloudflared/cloudflared.exe).Length
           if ($size -lt 40000000) { Write-Host "downloaded size=$size"; exit 1 }
-          $h = (Get-FileHash build\cloudflared\cloudflared.exe -Algorithm SHA256).Hash.ToLower()
+          $h = (Get-FileHash build/cloudflared/cloudflared.exe -Algorithm SHA256).Hash.ToLower()
           if ($h -ne 'f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2') { Write-Host "sha mismatch: $h"; exit 1 }
       - run: npx electron-builder --win --publish never
         env:
