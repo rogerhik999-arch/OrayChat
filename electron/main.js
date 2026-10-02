@@ -316,7 +316,11 @@ function registerIpc() {
   })
   ipcMain.handle('settings:set-user-config', (_e, userConfig) => {
     const s2 = loadLocalState()
-    s2['oc-config'] = userConfig || {}
+    const prev = s2['oc-config'] || {}
+    // 中继服务向导配置（hub）由 hub:persist 独立写入，设置页整体保存时必须保留
+    const merged = { ...(userConfig || {}) }
+    if (!merged.hub && prev.hub) merged.hub = prev.hub
+    s2['oc-config'] = merged
     fs.writeFileSync(statePath(), JSON.stringify(s2), { mode: 0o600 })
     return true
   })

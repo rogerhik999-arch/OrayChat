@@ -264,38 +264,67 @@ async function routeDns(name, hostname, userDataDir) {
   return { ok: false, err: r.out.trim().slice(0, 300) || `exit ${r.code}` }
 }
 
-// 步骤④ 托管运行命名隧道（崩溃自动重启，指数退避封顶 30s）
+// 步骤④ 托管运行命名隧道（崩溃自动重启，指数退避封顶 30s）。
+// 凭据两种形态都支持：本地凭据 json（CLI 创建）默认 name run；若反复秒退，
+// 自动尝试 token 模式（Dashboard 创建的 remotely-managed 隧道没有本地凭据文件）。
+// cloudflared 的全部输出进 hub 日志——诊断"启动不成功"必须能看到真实错误。
 function startNamedRun(userDataDir) {
   if (state.namedProc) return
   const bin = findCloudflared(userDataDir)
   if (!bin) { log('未找到 cloudflared：命名隧道无法运行（见使用指南第四节安装）'); return }
   if (!state.name || !state.hostname) { log('命名隧道信息不完整（需隧道名与域名）'); return }
+  let useToken = false
+  let token = ''
   const spawnRun = () => {
-    const args = ['tunnel', 'run', '--no-autoupdate', '--url', `http://127.0.0.1:${state.port}`, state.name]
+    const args = useToken && token
+      ? ['tunnel', 'run', '--no-autoupdate', '--token', token]
+      : ['tunnel', 'run', '--no-autoupdate', '--url', `http://127.0.0.1:${state.port}`, state.name]
     const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    proc.__startedAt = Date.now()
     state.namedProc = proc
+    let registered = false
     const feed = (buf) => {
-      for (const l of buf.toString().split('\n')) {
+      for (let l of buf.toString().split('\n')) {
+        l = l.trim()
+        if (!l) continue
         if (/Registered tunnel connection|Registered and connected/.test(l)) {
-          log(`稳定服务已连接 ${state.tunnelUrl}`)
+          if (!registered) { registered = true; log(`稳定服务已连接 ${state.tunnelUrl}`) }
           state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
+          continue
         }
-        if (/ failed to connect|Unable to reach/.test(l)) log(l.trim().slice(0, 160))
+        // 全量进日志（截断）：秒退/失败的真实原因必须可见
+        log(`cfd ${l.slice(0, 180)}`)
       }
     }
     proc.stdout.on('data', feed)
     proc.stderr.on('data', feed)
-    proc.on('exit', (code) => {
+    proc.on('exit', async (code) => {
       if (state.namedProc !== proc) return // stop() 主动关闭
       state.namedProc = null
       state.namedRestarts++
+      const lifeMs = Date.now() - proc.__startedAt
+      // 本地凭据模式连续秒退：探测 token（Dashboard 管理的隧道无本地凭据文件，
+      // name run 会报 credentials 缺失并退出——token 模式是它的正确启动方式）
+      if (!useToken && lifeMs < 10000 && state.namedRestarts >= 2 && !token) {
+        const probe = await runCloudflared(bin, ['tunnel', 'token', state.name], 15000)
+        const m = probe.out.match(/eyJ[A-Za-z0-9=_-]{40,}/)
+        if (m) {
+          useToken = true
+          token = m[0]
+          state.namedRestarts = 0
+          log('本地凭据启动失败：已切换为 token 模式（该隧道由 Cloudflare Dashboard 管理）')
+        } else {
+          log(`token 探测未命中（隧道可能为本地管理，凭据文件缺失）：${probe.out.trim().slice(0, 160)}`)
+          log('请确认本机 ~/.cloudflared/ 下有该隧道的 <ID>.json 凭据（重新 create 或在其他机器导入）')
+        }
+      }
       const delay = Math.min(2000 * 2 ** Math.min(state.namedRestarts, 4), 30000)
-      log(`命名隧道进程退出 code=${code}，${Math.round(delay / 1000)}s 后自动重启`)
+      log(`命名隧道进程退出 code=${code}（存活 ${Math.round(lifeMs / 1000)}s），${Math.round(delay / 1000)}s 后自动重启`)
       setTimeout(() => {
         if (state.server && state.mode === 'named') spawnRun()
       }, delay)
     })
-    log(`命名隧道「${state.name}」运行中 → ${state.tunnelUrl}（随客户端后台运行，异常自动重启）`)
+    log(`命名隧道「${state.name}」${useToken ? '(token 模式)' : ''}启动 → ${state.tunnelUrl}（随客户端后台运行，异常自动重启）`)
   }
   spawnRun()
 }

@@ -25,6 +25,7 @@ async function load() {
   const info = await window.settings.get()
   const cfg = { ...DEFAULTS, ...(info.userConfig || {}) }
   currentUserConfig = info.userConfig || {}
+  window.__userConfig = info.userConfig || {} // hub 向导回填用
 
   $('defaultRoom').value = cfg.defaultRoom || ''
   $('stunUrls').value = (cfg.stunUrls || []).join('\n')
@@ -149,6 +150,18 @@ if (window.settings.hubStart) {
     $('hubTunnelBtn').disabled = !st?.running
     $('hubStopBtn').disabled = !st?.running
   }
+  // 先从持久化配置回填（重启后向导字段暂存恢复；load() 异步未必先到，自行拉取），
+  // 再叠加运行时状态
+  const restoreSaved = (savedHub = {}) => {
+    if (savedHub.port) $('hubPort').value = String(savedHub.port)
+    if (savedHub.name) $('hubTunnelName').value = savedHub.name
+    if (savedHub.hostname) { $('hubHostname').value = savedHub.hostname; if (!$('hubPublicUrl').value.trim()) $('hubPublicUrl').value = `wss://${savedHub.hostname}` }
+    if (savedHub.mode) window.__hubMode = savedHub.mode
+    if (savedHub.mode === 'named' && savedHub.name) window.__tunnelCreated = true
+    if (window.__userConfig) window.__userConfig.hub = savedHub
+    $('hubEnabled').checked = !!savedHub.enabled
+  }
+  window.settings.get().then((info) => restoreSaved((info.userConfig || {}).hub || {})).catch(() => {})
   window.settings.hubStatus().then((st) => {
     hubRender(st)
     if (st.running) $('hubEnabled').checked = true
@@ -225,6 +238,9 @@ if (window.settings.hubStart) {
   }
   $('hubEnabled').onchange = persist
   $('hubPort').onchange = persist
+  $('hubTunnelName').onchange = persist
+  $('hubHostname').onchange = persist
+  $('hubPublicUrl').onchange = () => { window.__hubMode = window.__hubMode || 'external'; persist() }
 }
 
 load().catch((e) => console.error(e))
