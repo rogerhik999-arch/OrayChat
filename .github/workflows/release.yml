@@ -20,6 +20,13 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build
+      - name: Bundle cloudflared (darwin-arm64)
+        run: |
+          mkdir -p build/cloudflared
+          curl -sSL --retry 5 -o /tmp/cfd.tgz https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-darwin-arm64.tgz
+          echo "5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32  /tmp/cfd.tgz" | shasum -a 256 -c -
+          tar -xzf /tmp/cfd.tgz -C build/cloudflared
+          chmod +x build/cloudflared/cloudflared
       - run: npx electron-builder --mac --publish never
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
@@ -36,6 +43,11 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build
+      - name: Bundle cloudflared (windows-amd64)
+        run: |
+          mkdir -p build/cloudflared
+          curl -sSL --retry 5 -o build/cloudflared/cloudflared.exe https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe
+          python -c "import hashlib;h=hashlib.sha256(open('build/cloudflared/cloudflared.exe','rb').read()).hexdigest();assert h=='f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2',h"
       - run: npx electron-builder --win --publish never
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
@@ -50,6 +62,12 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build
+      - name: Bundle cloudflared (linux-amd64)
+        run: |
+          mkdir -p build/cloudflared
+          curl -sSL --retry 5 -o build/cloudflared/cloudflared https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-linux-amd64
+          echo "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2  build/cloudflared/cloudflared" | sha256sum -c -
+          chmod +x build/cloudflared/cloudflared
       - run: npx electron-builder --linux AppImage deb --x64 --publish never
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/

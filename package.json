@@ -1,6 +1,6 @@
 {
   "name": "oraychat",
-  "version": "1.25.0",
+  "version": "1.25.1",
   "description": "Private P2P encrypted chat desktop app",
   "main": "electron/main.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "test:lobby": "npm run build && node test/history.test.mjs && node test/e2e-lobby.mjs",
     "build:www": "node scripts/build-www.mjs",
     "sync:version": "node scripts/sync-version.mjs",
-    "dist:mac": "npm run build && electron-builder --mac zip --publish never"
+    "dist:mac": "mkdir -p build/cloudflared && npm run build && electron-builder --mac zip --publish never"
   },
   "keywords": [],
   "author": "rogerhik999-arch",
@@ -105,7 +105,16 @@
       "category": "Network;InstantMessaging",
       "icon": "build/icon.png",
       "maintainer": "rogerhik999-arch"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "build/cloudflared",
+        "to": "cloudflared",
+        "filter": [
+          "cloudflared*"
+        ]
+      }
+    ]
   },
   "homepage": "https://github.com/rogerhik999-arch/OrayChat"
 }

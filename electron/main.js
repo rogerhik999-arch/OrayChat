@@ -561,6 +561,24 @@ if (!gotTheLock) {
   app.on('second-instance', () => showMainWindow())
 }
 
+// 捆绑的 cloudflared 就位（v1.25.1 方案 A）：安装包自带官方二进制 → 复制到
+// userData/cloudflared/（可执行），随装随用零外部安装；系统 PATH 已有则优先
+// 用用户的（findCloudflared 顺序：PATH → userData → 基础目录）
+try {
+  const bundledName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared'
+  const bundled = path.join(process.resourcesPath || '', 'cloudflared', bundledName)
+  if (fs.existsSync(bundled)) {
+    const destDir = path.join(app.getPath('userData'), 'cloudflared')
+    const dest = path.join(destDir, bundledName)
+    if (!fs.existsSync(dest)) {
+      fs.mkdirSync(destDir, { recursive: true })
+      fs.copyFileSync(bundled, dest)
+      try { fs.chmodSync(dest, 0o755) } catch { /* win 无需 */ }
+      process.stdout.write('[cloudflared] 内嵌二进制已就位\n')
+    }
+  }
+} catch { /* 开发模式无捆绑资源，跳过 */ }
+
 // hub 事件扇出到设置窗口与主窗口（状态灯/URL/连接数/日志）
 function broadcastHubEvent(ev) {
   for (const w of [settingsWin, mainWindow()].filter(Boolean)) {

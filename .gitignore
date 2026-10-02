@@ -19,3 +19,6 @@ ios/DerivedData/
 *.log
 .DS_Store
 /capture
+build/cloudflared/cloudflared
+build/cloudflared/cloudflared-linux-amd64
+build/cloudflared/cloudflared-windows-amd64.exe
