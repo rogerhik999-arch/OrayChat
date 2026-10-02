@@ -276,13 +276,16 @@ function startNamedRun(userDataDir) {
   let useToken = false
   let token = ''
   const spawnRun = () => {
+    // ⚠️ --no-autoupdate 是 app 层 flag：放在 `tunnel run` 子命令后不被识别，
+    // cloudflared 会打印完整参数帮助然后 code=0 退出（v1.24.0-v1.24.1 秒退根因）
     const args = useToken && token
-      ? ['tunnel', 'run', '--no-autoupdate', '--token', token]
-      : ['tunnel', 'run', '--no-autoupdate', '--url', `http://127.0.0.1:${state.port}`, state.name]
+      ? ['--no-autoupdate', 'tunnel', 'run', '--token', token]
+      : ['--no-autoupdate', 'tunnel', 'run', '--url', `http://127.0.0.1:${state.port}`, state.name]
     const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.__startedAt = Date.now()
     state.namedProc = proc
     let registered = false
+    let usageLines = 0
     const feed = (buf) => {
       for (let l of buf.toString().split('\n')) {
         l = l.trim()
@@ -292,7 +295,16 @@ function startNamedRun(userDataDir) {
           state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
           continue
         }
-        // 全量进日志（截断）：秒退/失败的真实原因必须可见
+        // 参数帮助文本（usage）整屏刷不掉诊断重点：折叠为一条明确提示
+        if (/^(--|SUBCOMMAND|GLOBAL|NAME:|USAGE:|VERSION:|AUTHOR|COPYRIGHT|COMMANDS:)/.test(l)) {
+          usageLines++
+          continue
+        }
+        if (usageLines > 0) {
+          log(`cfd 打印了参数帮助（${usageLines} 行，已省略）——通常是 flag 不被识别或参数顺序错误`)
+          usageLines = 0
+        }
+        // 其余全量进日志（截断）：秒退/失败的真实原因必须可见
         log(`cfd ${l.slice(0, 180)}`)
       }
     }
