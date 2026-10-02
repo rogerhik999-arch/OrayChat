@@ -1841,5 +1841,6 @@ document.addEventListener('visibilitychange', () => {
 
 main().catch((e) => {
   console.error('启动失败', e)
+  window.oray?.botLog?.(`BOOT-STACK ${e?.stack || e?.message || e}`)
   if (state.args?.bot) window.oray.botExit(1)
 })

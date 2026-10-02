@@ -11,7 +11,8 @@
     "test:relay": "npm run build && node test/crypto.test.mjs && node test/history.test.mjs && node test/web-shim.test.mjs && node test/resume.test.mjs && node test/relay.test.mjs && node test/relay-multi.test.mjs && node test/e2e.mjs --relay",
     "test:lobby": "npm run build && node test/history.test.mjs && node test/e2e-lobby.mjs",
     "build:www": "node scripts/build-www.mjs",
-    "sync:version": "node scripts/sync-version.mjs"
+    "sync:version": "node scripts/sync-version.mjs",
+    "dist:mac": "npm run build && electron-builder --mac zip --publish never"
   },
   "keywords": [],
   "author": "rogerhik999-arch",
