@@ -119,13 +119,47 @@ function hubCopyText() {
 if (window.settings.hubStart) {
   $('hubCard').style.display = ''
   window.__hubSnap = null
-  const persist = () => window.settings.hubPersist({ enabled: $('hubEnabled').checked, port: Number($('hubPort').value) || 48883 })
+  const hubCfg = () => ({
+    enabled: $('hubEnabled').checked,
+    port: Number($('hubPort').value) || 48883,
+    mode: window.__hubMode || 'off',
+    name: $('hubTunnelName').value.trim() || 'oraychat-hub',
+    hostname: $('hubHostname').value.trim(),
+  })
+  const persist = () => window.settings.hubPersist(hubCfg())
+  const stepMark = (id, ok, text) => { const el = $(id); el.textContent = text || (ok ? '✓ 已完成' : '未完成'); el.style.color = ok ? 'var(--ok)' : 'var(--tx2)' }
+
+  function hubRender(st) {
+    hubRenderDom(st)
+    // 向导四步状态
+    stepMark('hubStep1State', st?.certReady)
+    stepMark('hubStep2State', !!(st?.certReady && st?.name && $('hubTunnelName').value.trim() && window.__tunnelCreated), (st?.certReady && window.__tunnelCreated) ? `✓ ${st?.name || ''}` : undefined)
+    stepMark('hubStep3State', !!st?.hostname, st?.hostname ? `✓ ${st.hostname}` : undefined)
+    stepMark('hubStep4State', !!(st?.running && st?.mode === 'named' && st?.tunnelProc), (st?.running && st?.mode === 'named') ? (st.tunnelProc ? `✓ 运行中 ${st.tunnelUrl}` : '连接中…') : '未启动')
+    $('hubStep1Btn').disabled = !!st?.certReady
+    $('hubStep2Btn').disabled = !st?.certReady
+    $('hubStep3Btn').disabled = !st?.certReady
+    $('hubStep4Btn').disabled = !st?.certReady
+  }
+  function hubRenderDom(st) {
+    const state = st?.running ? '运行中' : '未运行'
+    const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
+    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 成员连接 ${st?.clients ?? 0}`
+    $('hubLog').textContent = (st?.log || []).join('\n')
+    $('hubTunnelBtn').disabled = !st?.running
+    $('hubStopBtn').disabled = !st?.running
+  }
   window.settings.hubStatus().then((st) => {
     hubRender(st)
     if (st.running) $('hubEnabled').checked = true
+    if (st.name) { $('hubTunnelName').value = st.name; window.__tunnelCreated = true }
+    if (st.hostname) { $('hubHostname').value = st.hostname; if (!st.publicUrl) $('hubPublicUrl').value = `wss://${st.hostname}` }
+    if (st.publicUrl) $('hubPublicUrl').value = st.publicUrl
+    if (st.mode && st.mode !== 'off') window.__hubMode = st.mode
   })
   window.settings.onHubEvent?.((ev) => {
     if (ev.type === 'log') $('hubLog').textContent += `\n${ev.line}`
+    if (ev.type === 'tunnel' && ev.url && !$('hubPublicUrl').value.trim()) $('hubPublicUrl').value = ev.url
     window.settings.hubStatus().then(hubRender)
   })
   $('hubStartBtn').onclick = async () => {
@@ -136,9 +170,53 @@ if (window.settings.hubStart) {
   $('hubStopBtn').onclick = async () => { await window.settings.hubStop(); window.settings.hubStatus().then(hubRender) }
   $('hubTunnelBtn').onclick = async () => {
     toast('正在启动 Cloudflare 快速隧道…')
+    window.__hubMode = 'quick'
     const r = await window.settings.hubStart({ port: Number($('hubPort').value) || 48883, tunnel: 'quick' })
     if (!r.ok) toast(`启动失败：${r.err}`)
+    persist()
     window.settings.hubStatus().then(hubRender)
+  }
+  // —— 稳定地址向导四步 ——
+  $('hubStep1Btn').onclick = async () => {
+    toast('正在打开浏览器授权…')
+    const r = await window.settings.hubLogin()
+    if (!r.ok) { toast(`授权失败：${r.err}`); return }
+    toast(r.already ? '此前已完成授权' : '授权成功')
+    window.settings.hubStatus().then(hubRender)
+  }
+  $('hubStep2Btn').onclick = async () => {
+    const name = $('hubTunnelName').value.trim() || 'oraychat-hub'
+    $('hubTunnelName').value = name
+    toast(`正在创建隧道 ${name}…`)
+    const r = await window.settings.hubCreateTunnel(name)
+    if (!r.ok) { toast(`创建失败：${r.err}`); return }
+    window.__tunnelCreated = true
+    window.__hubMode = 'named'
+    toast(r.already ? '隧道已存在（继续）' : '隧道创建成功')
+    persist(); window.settings.hubStatus().then(hubRender)
+  }
+  $('hubStep3Btn').onclick = async () => {
+    const name = $('hubTunnelName').value.trim() || 'oraychat-hub'
+    const host = $('hubHostname').value.trim()
+    if (!host) { toast('请先填写主机名（如 mqtt.example.com）'); return }
+    toast(`正在绑定 ${host}…`)
+    const r = await window.settings.hubRouteDns(name, host)
+    if (!r.ok) { toast(`绑定失败：${r.err}`); return }
+    window.__hubMode = 'named'
+    $('hubPublicUrl').value = `wss://${host}`
+    toast(r.already ? '域名记录已存在（继续）' : '域名绑定成功')
+    persist(); window.settings.hubStatus().then(hubRender)
+  }
+  $('hubStep4Btn').onclick = async () => {
+    const name = $('hubTunnelName').value.trim() || 'oraychat-hub'
+    const host = $('hubHostname').value.trim()
+    if (!host) { toast('请先完成第③步绑定域名'); return }
+    toast('正在启动稳定服务…')
+    window.__hubMode = 'named'
+    const r = await window.settings.hubStartNamed({ name, hostname: host, port: Number($('hubPort').value) || 48883 })
+    if (!r.ok) { toast(`启动失败：${r.err}`); return }
+    $('hubEnabled').checked = true
+    persist(); window.settings.hubStatus().then(hubRender)
   }
   $('hubCopyBtn').onclick = async () => {
     const text = hubCopyText()

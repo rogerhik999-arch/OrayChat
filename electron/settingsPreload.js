@@ -14,5 +14,10 @@ contextBridge.exposeInMainWorld('settings', {
   hubStatus: () => ipcRenderer.invoke('hub:status'),
   hubPersist: (hubCfg) => ipcRenderer.invoke('hub:persist', hubCfg),
   onHubEvent: (fn) => { ipcRenderer.on('hub:event', (_e, ev) => fn(ev)) },
+  // 命名隧道四步向导（v1.24.0）：授权 → 创建 → 绑域名 → 启动稳定服务（app 全托管）
+  hubLogin: () => ipcRenderer.invoke('hub:login'),
+  hubCreateTunnel: (name) => ipcRenderer.invoke('hub:create-tunnel', name),
+  hubRouteDns: (name, hostname) => ipcRenderer.invoke('hub:route-dns', name, hostname),
+  hubStartNamed: (cfg) => ipcRenderer.invoke('hub:start-named', cfg),
   // 安全码列表：从主窗口身份推导需要 crypto——简化为展示身份列表 + 指纹由主窗口页面呈现
 })

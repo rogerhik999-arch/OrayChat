@@ -316,3 +316,6 @@ button.ghost.warn2:hover { background: #3a2d1c; }
   flex: none; border: 1px solid #2c3a55; background: transparent; color: var(--fg-dim);
   border-radius: 6px; font-size: 10.5px; padding: 2px 5px; cursor: pointer;
 }
+
+/* 中继主机标识（v1.24.0） */
+.hub-badge { margin-left: 5px; font-size: 11px; filter: saturate(.9); }

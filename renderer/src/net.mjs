@@ -926,6 +926,7 @@ export class ChatNet {
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       peer.lastProgress = Date.now()
+      if (frame.hubPub !== undefined) peer.hubPub = frame.hubPub || null // 中继主机标识（📡）
       this.relay?.markAlive(peerId) // 心跳即存活证据（SWIM：任意消息撤销怀疑）
       this.hooks.onPresence?.(peerId, peer)
       this.absorbDigest(peerId, frame.digest)
@@ -1092,7 +1093,9 @@ export class ChatNet {
     for (const [peerId, peer] of this.peers) {
       if (peer.state !== 'ready') continue
       try {
-        const frame = { conv: 'dm', op: 'presence', t: now, digest }
+        // hubPub：本机作为中继服务主机的对外地址（📡 标识数据源；未运行时为空串，
+        // 显式覆盖对端缓存的旧标识）
+        const frame = { conv: 'dm', op: 'presence', t: now, digest, hubPub: this.hubPub || '' }
         if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
         else this.ctlAction?.send(frame, { target: peerId }).catch(() => {})
       } catch { /* 心跳失败静默，下轮再报 */ }

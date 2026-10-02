@@ -18,8 +18,10 @@ const PORT = 48990
 const lines = { alice: [], bob: [], carol: [] }
 const procs = []
 const userData = (p) => path.join(os.homedir(), 'Library', 'Application Support', 'OrayChat', `${p}-hub`)
+const shot = '/tmp/hub-badge.png'
 
 // 预写 profile 配置：broker 列表仅私有链（公共链零参与，拓扑隔离）
+try { fs.rmSync(shot, { force: true }) } catch {}
 for (const p of ['alice', 'bob', 'carol']) {
   fs.rmSync(userData(p), { recursive: true, force: true })
   fs.mkdirSync(userData(p), { recursive: true })
@@ -52,10 +54,12 @@ import('node:child_process').then(({ execSync }) => {
 })
 await sleep(1500)
 
-launch('alice', 'alice', ['--relay-hub', `--hub-port=${PORT}`, '--roster-log', '--save-latest', '--auto-reply'])
+launch('alice', 'alice', ['--relay-hub', `--hub-port=${PORT}`, '--hub-public-url=wss://hub-demo.example.com', '--roster-log', '--save-latest', '--auto-reply'])
 await sleep(3000)
 // bob 发文本回环；carol 发文件（bot 注入器 fileMode 下不跑文本回环，须分开）
-launch('bob', 'bob', ['--send-to=alice', '--text=私有链', '--count=2', '--auto-reply'])
+launch('bob', 'bob', ['--send-to=alice', '--text=私有链', '--count=2', '--auto-reply', '--no-exit',
+  '--open-dm=alice', `--shot=${shot}`, "--shot-when=document.body.textContent.includes('📡')",
+  '--shot-when-timeout-ms=60000', '--exit-after-shot', '--dom-dump'])
 await sleep(2000)
 launch('carol', 'carol', ['--send-to=alice', `--send-file=${testFile}`, '--auto-reply'])
 
@@ -71,6 +75,11 @@ let okEcho = false, okFile = false
   }
 }
 await sleep(3000) // 等 SAVED
+// 等 bob 的 📡 徽标截图（shot-when 条件命中或 60s 超时兜底截图），再收场
+{
+  const t0 = Date.now()
+  while (Date.now() - t0 < 90000 && !fs.existsSync(shot)) await sleep(2000)
+}
 killTrees(procs)
 fs.rmSync(testFile, { force: true })
 
@@ -88,8 +97,9 @@ console.log(`  hub 有客户端接入:       ${hubClients ? '✓' : '✗'}`)
 console.log(`  双向握手+消息回环:      ${okEcho ? '✓ ECHO 2/2' : '✗'}`)
 console.log(`  文件经私有链传输完成:   ${okFile ? '✓ FILE-DONE' : '✗'}`)
 console.log(`  下载 SHA-256 一致:      ${shaOk ? '✓' : '✗'}`)
+console.log(`  中继主机 📡 标识渲染:   ${fs.existsSync(shot) ? '✓（bob 视图 DOM 命中）' : '✗'}`)
 
-const ok = hubListen && okEcho && okFile && shaOk
+const ok = hubListen && okEcho && okFile && shaOk && fs.existsSync(shot)
 if (!ok) {
   console.log('\n== 失败诊断：alice 尾部 ==')
   console.log(lines.alice.slice(-20).join('\n'))

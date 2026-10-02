@@ -31,6 +31,7 @@
       opacity: 0; transition: opacity .25s; pointer-events: none;
     }
     #toast.show { opacity: 1; }
+    .stepState { font-size: 12px; color: var(--tx2); min-width: 90px; }
   </style>
 </head>
 <body>
@@ -84,14 +85,37 @@
     <div class="row">
       <button class="primary" id="hubStartBtn">立即启动</button>
       <button class="ghost" id="hubStopBtn">停止</button>
-      <button class="ghost" id="hubTunnelBtn">启动 Cloudflare 快速隧道</button>
+      <button class="ghost" id="hubTunnelBtn">快速隧道（临时地址）</button>
     </div>
-    <div class="hint">快速隧道零配置，但地址每次启动会变化；需要稳定地址：安装 cloudflared 后
-      执行一次 <span class="mono">cloudflared tunnel login</span> → <span class="mono">cloudflared tunnel create &lt;名字&gt;</span>
-      → <span class="mono">cloudflared tunnel route dns &lt;名字&gt; &lt;你的域名&gt;</span>，
-      然后运行 <span class="mono">cloudflared tunnel run --url http://127.0.0.1:&lt;端口&gt; &lt;名字&gt;</span>，并把
-      wss://&lt;你的域名&gt; 填入下方"对外公布地址"。</div>
-    <label>对外公布地址（成员接入用；外部隧道模式手动填写）</label>
+
+    <h2 style="margin-top:14px">稳定地址向导（推荐：四步全部按钮完成，服务随客户端后台常驻）</h2>
+    <div class="row">
+      <span style="min-width:150px; font-size:13px">① 授权 Cloudflare</span>
+      <button class="ghost" id="hubStep1Btn">打开浏览器授权</button>
+      <span class="stepState" id="hubStep1State">未完成</span>
+    </div>
+    <div class="row">
+      <span style="min-width:150px; font-size:13px">② 创建隧道</span>
+      <input type="text" id="hubTunnelName" placeholder="oraychat-hub" style="max-width:180px" />
+      <button class="ghost" id="hubStep2Btn">创建</button>
+      <span class="stepState" id="hubStep2State">未完成</span>
+    </div>
+    <div class="row">
+      <span style="min-width:150px; font-size:13px">③ 绑定域名</span>
+      <input type="text" id="hubHostname" placeholder="mqtt.example.com" style="max-width:220px" />
+      <button class="ghost" id="hubStep3Btn">绑定</button>
+      <span class="stepState" id="hubStep3State">未完成</span>
+    </div>
+    <div class="row">
+      <span style="min-width:150px; font-size:13px">④ 启动稳定服务</span>
+      <button class="ghost" id="hubStep4Btn">启动</button>
+      <span class="stepState" id="hubStep4State">未启动</span>
+    </div>
+    <div class="hint">需要 Cloudflare 账号与已托管在 Cloudflare 的域名。完成后地址永久固定
+      （wss://你的域名），服务随客户端后台运行、断线自动重连。详细说明见仓库
+      docs/private-relay-guide.md。</div>
+
+    <label style="margin-top:10px">对外公布地址（成员接入用；稳定服务启动后自动填入，也可手动填外部隧道地址）</label>
     <input type="text" id="hubPublicUrl" placeholder="wss://mqtt.example.com" />
     <div class="row" style="margin-top:10px">
       <span id="hubState" style="flex:1; font-size:12.5px; color:var(--tx2)">状态：未知</span>

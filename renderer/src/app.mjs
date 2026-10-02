@@ -440,7 +440,7 @@ function renderPeers() {
     li.innerHTML = `
       <div class="avatar" style="background:${avatarColor(peerId)}">${esc(name.slice(0, 1).toUpperCase())}</div>
       <div class="p-info">
-        <div class="p-name">${esc(name)}${unreadBadge(state.net.dmViewKey(p.idPubHex || peerId))}</div>
+        <div class="p-name">${esc(name)}${p.hubPub ? '<span class="hub-badge" title="私有中继服务主机">📡</span>' : ''}${unreadBadge(state.net.dmViewKey(p.idPubHex || peerId))}</div>
         <div class="p-state"><span class="dot ${dotCls}"></span>${esc(stateText)}</div>
       </div>`
     li.onclick = () => selectView({ conv: 'dm', peerId })
@@ -1153,13 +1153,16 @@ async function doLogin(name, room) {
   // 中继服务模式（v1.23.0）：本机 hub 运行中 → 把 ws://127.0.0.1:port 并入为
   // 私有链（主机自己走本地回环，零外网依赖）；hub 中途启停同样跟随
   const hubAdopt = (st) => {
+    if (!state.net) return
+    // 对外地址随 presence 广播（成员列表 📡 标识）；运行时并入本机回环私有链
+    if (state.net) state.net.hubPub = (st?.running && (st.tunnelUrl || st.publicUrl)) || ''
     if (!st?.running || !state.net?.relay) return
     const url = `ws://127.0.0.1:${st.port}/mqtt`
     if (state.net.relay.addBroker(url)) appendSys('中继服务：已并入本机私有中继链路（127.0.0.1 回环）')
   }
   if (window.oray.hubStatus) {
     window.oray.hubStatus().then(hubAdopt).catch(() => {})
-    window.oray.onHubEvent?.((ev) => { if (ev.type === 'started' || ev.type === 'stopped') window.oray.hubStatus().then(hubAdopt).catch(() => {}) })
+    window.oray.onHubEvent?.((ev) => { if (['started', 'stopped', 'tunnel'].includes(ev.type)) window.oray.hubStatus().then(hubAdopt).catch(() => {}) })
   }
 
   setTimeout(flushNotices, 600)

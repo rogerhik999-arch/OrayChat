@@ -324,6 +324,18 @@ function registerIpc() {
   ipcMain.handle('hub:start', (_e, opts = {}) => hub.start({ ...opts, userDataDir: app.getPath('userData') }))
   ipcMain.handle('hub:stop', () => hub.stop())
   ipcMain.handle('hub:status', () => hub.snapshot())
+  // 命名隧道三步向导（稳定域名）：授权 → 创建 → 绑域名；run 由 app 全托管
+  ipcMain.handle('hub:login', () => hub.loginTunnel(app.getPath('userData')))
+  ipcMain.handle('hub:create-tunnel', (_e, name) => hub.createTunnel(name, app.getPath('userData')))
+  ipcMain.handle('hub:route-dns', (_e, name, hostname) => hub.routeDns(name, hostname, app.getPath('userData')))
+  ipcMain.handle('hub:start-named', (_e, { name, hostname, port }) => {
+    // 先确保 broker 本体在跑（用户可能只完成了向导没点过"立即启动"），再挂命名隧道
+    if (!hub.snapshot().running) {
+      const r0 = hub.start({ port: Number(port) || 48883, userDataDir: app.getPath('userData') })
+      if (!r0.ok) return r0
+    }
+    return hub.start({ tunnel: 'named', name, hostname, userDataDir: app.getPath('userData') })
+  })
   ipcMain.handle('hub:persist', (_e, hubCfg) => {
     try {
       const sp = path.join(app.getPath('userData'), 'local-state.json')
@@ -546,6 +558,7 @@ function broadcastHubEvent(ev) {
   for (const w of [settingsWin, mainWindow()].filter(Boolean)) {
     try { w.webContents.send('hub:event', ev) } catch { /* 窗口未就绪 */ }
   }
+  if (ev.type === 'login-url') { try { shell.openExternal(ev.url) } catch { /* 无默认浏览器 */ } }
   process.stdout.write(`${JSON.stringify(ev)}\n`) // bot 断言用（[HUB] 行在 hub.js 日志里，经 hub:log 也打 stdout）
 }
 function mainWindow() { return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.webContents.getURL().includes('index.html')) }
@@ -564,16 +577,24 @@ app.whenReady().then(() => {
 
   // 中继服务模式：bot 参数直启，或设置页曾启用则自动恢复（重启自愈）
   hub.emitter = { emit: (_t, ev) => broadcastHubEvent(ev) }
-  const hubAuto = argv['relay-hub'] ? { port: Number(argv['hub-port']) || 48883, tunnel: argv['hub-tunnel'] ? 'quick' : 'off' } : null
+  const hubAuto = argv['relay-hub']
+    ? {
+        port: Number(argv['hub-port']) || 48883,
+        tunnel: argv['hub-tunnel'] ? 'quick' : 'off',
+        publicUrl: argv['hub-public-url'] || '',
+      }
+    : null
   if (!hubAuto) {
     try {
       const st = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'local-state.json'), 'utf8'))
       const cfg = st['oc-config'] || {}
-      if (cfg.hub?.enabled) hubAuto0(cfg.hub)
+      if (cfg.hub?.enabled) hubAuto0(cfg.hub) // {enabled,port,mode:'quick'|'named',name,hostname}
     } catch { /* 无配置 */ }
   } else { hubAuto0(hubAuto) }
   function hubAuto0(o) {
-    hub.start({ ...o, userDataDir: app.getPath('userData') }).then((r) => {
+    const opts = { ...o, userDataDir: app.getPath('userData') }
+    if (opts.mode === 'named' && !opts.tunnel) opts.tunnel = 'named' // 向导持久化的字段名
+    hub.start(opts).then((r) => {
       process.stdout.write(`[HUB] autostart ${JSON.stringify(r)}\n`)
     })
   }

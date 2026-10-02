@@ -1,26 +1,29 @@
-// 私有中继服务模式（v1.23.0，docs/private-relay-research.md P0）：
-// 主进程内嵌 Aedes MQTT broker（仅绑定 127.0.0.1），可选经 cloudflared 快速隧道
-// 暴露 wss:// 地址给房间成员作第 3 条并联中继链路。中继永远只见密文（relay 层
+// 私有中继服务模式（v1.23.0 P0；v1.24.0 命名隧道全托管）：
+// 主进程内嵌 Aedes MQTT broker（仅绑定 127.0.0.1），经 cloudflared 隧道向房间成员
+// 开放 wss:// 接入地址作为第 3 条并联中继链路。中继永远只见密文（relay 层
 // sealRoom E2EE）；私有链宕机自动回落公共双链——不新增故障模式（退化即现状）。
 //
-// 模式：
-//   - quick:   app 托管 cloudflared 快速隧道（零配置；URL 每次启动变化，trycloudflare.com）
-//   - external: 用户自管隧道/已命名隧道，app 只显示"对外地址"供复制分享
-//
-// 稳定地址（命名隧道）= 一次性 `cloudflared tunnel login/create/route` 后在
-// external 模式填入自定域名；或把 run 交给 app（custom args 留 v2）。
+// 两种隧道：
+//   - quick:  快速隧道（零配置，URL 每次启动变化）——app 托管 cloudflared
+//   - named:  命名隧道（稳定域名）——app 全托管：login→create→route 三步向导
+//             在设置页点按钮完成，run 随客户端后台运行、崩溃自动重启
+// 本模块不依赖 electron（可独立冒烟测试）；URL 打开等 UI 动作由事件交给 main.js。
 const { Aedes } = require('aedes')
 const http = require('http')
+const os = require('node:os')
 const { WebSocketServer, WebSocket } = require('ws')
 const { spawn, execFileSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 
 const HUB_LOG_MAX = 200
+const CERT_PATH = path.join(os.homedir(), '.cloudflared', 'cert.pem')
 
 const state = {
-  aedes: null, server: null, tunnelProc: null,
+  aedes: null, server: null, tunnelProc: null, namedProc: null,
   port: 0, tunnelUrl: '', clients: 0, startedAt: 0,
+  mode: 'off', name: '', hostname: '', publicUrl: '',
+  namedRestarts: 0, loginProc: null,
   logs: [], emitter: null, // main.js 注入 EventEmitter（转发 UI/日志事件）
 }
 
@@ -46,7 +49,10 @@ function findCloudflared(userDataDir) {
 }
 
 async function start(opts = {}) {
-  if (state.server) return { ok: true, already: true, ...snapshot() }
+  if (state.server) {
+    // 已在运行：仅按需更新隧道形态（quick→named / 换域名）
+    return applyTunnel(opts)
+  }
   state.emitter = opts.emitter || state.emitter
   const port = Number(opts.port) || 48883
   try {
@@ -82,8 +88,8 @@ async function start(opts = {}) {
     log(`broker 监听 ws://127.0.0.1:${port}（仅本机回环）`)
     state.emitter?.emit('event', { type: 'started', port })
 
-    if (opts.tunnel === 'quick') startQuickTunnel(opts.userDataDir)
-    return { ok: true, ...snapshot() }
+    state.publicUrl = String(opts.publicUrl || '')
+    return applyTunnel(opts)
   } catch (e) {
     log(`启动失败: ${e.message}`)
     await stop()
@@ -91,33 +97,57 @@ async function start(opts = {}) {
   }
 }
 
+// 按配置应用隧道形态（quick / named / off）
+function applyTunnel(opts) {
+  const mode = opts.tunnel || 'off'
+  state.mode = mode
+  if (mode === 'quick') {
+    startQuickTunnel(opts.userDataDir)
+    return { ok: true, ...snapshot() }
+  }
+  if (mode === 'named') {
+    state.name = String(opts.name || '')
+    state.hostname = String(opts.hostname || '')
+    if (state.hostname) {
+      state.tunnelUrl = `wss://${state.hostname}`
+      state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
+    }
+    startNamedRun(opts.userDataDir)
+    return { ok: true, ...snapshot() }
+  }
+  return { ok: true, ...snapshot() }
+}
+
 async function stop() {
   if (state.tunnelProc) { try { state.tunnelProc.kill('SIGTERM') } catch { /* 已死 */ } state.tunnelProc = null }
+  if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null }
   if (state.server) {
     await new Promise((r) => { try { state.aedes.close(() => r()) } catch { r() } ; try { state.server.close(() => {}) } catch { /* 已关 */ } })
     log('broker 已停止')
   }
-  Object.assign(state, { aedes: null, server: null, tunnelUrl: '', port: 0, clients: 0, startedAt: 0 })
+  Object.assign(state, {
+    aedes: null, server: null, tunnelUrl: '', port: 0, clients: 0, startedAt: 0,
+    mode: 'off', namedRestarts: 0,
+  })
   state.emitter?.emit('event', { type: 'stopped' })
 }
 
-// cloudflared 快速隧道：出站连接 CF 边缘，解析 stdout 的 trycloudflare.com URL
+// ---------- cloudflared 快速隧道（零配置） ----------
 function startQuickTunnel(userDataDir) {
   const bin = findCloudflared(userDataDir)
   if (!bin) {
-    log('未找到 cloudflared：快速隧道不可用（brew install cloudflared，或在设置里改用外部隧道地址）；本机 ws:// 私有链不受影响')
+    log('未找到 cloudflared：快速隧道不可用（见使用指南第四节安装；本机 ws:// 私有链不受影响）')
     return
   }
-  const args = [bin, 'tunnel', '--no-autoupdate', '--protocol', 'http2', '--url', `http://127.0.0.1:${state.port}`]
   log(`启动 cloudflared 快速隧道…`)
-  const proc = spawn(args[0], args.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+  const proc = spawn(bin, ['tunnel', '--no-autoupdate', '--protocol', 'http2', '--url', `http://127.0.0.1:${state.port}`], { stdio: ['ignore', 'pipe', 'pipe'] })
   state.tunnelProc = proc
   const feed = (buf) => {
-    const text = buf.toString()
-    for (const l of text.split('\n')) {
+    for (const l of buf.toString().split('\n')) {
       const m = l.match(/https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i)
       if (m) {
         state.tunnelUrl = `wss://${m[1]}`
+        state.publicUrl = state.tunnelUrl
         log(`隧道就绪 ${state.tunnelUrl}（成员可在设置页 broker 列表加入此地址）`)
         state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
       }
@@ -135,15 +165,158 @@ function startQuickTunnel(userDataDir) {
   })
 }
 
+// ---------- cloudflared 命名隧道（稳定域名；三步向导 + 全托管 run） ----------
+
+// 步骤① 授权：spawn login（打印授权 URL 等浏览器回调），轮询 cert.pem 出现即完成
+function loginTunnel(userDataDir) {
+  if (fs.existsSync(CERT_PATH)) return Promise.resolve({ ok: true, already: true })
+  const bin = findCloudflared(userDataDir)
+  if (!bin) return Promise.resolve({ ok: false, err: '未找到 cloudflared（见使用指南第四节安装）' })
+  if (state.loginProc) return Promise.resolve({ ok: false, err: '已有授权流程进行中' })
+  return new Promise((resolve) => {
+    log('开始 Cloudflare 授权：即将打开浏览器，请在页面中登录并选择域名完成授权…')
+    const proc = spawn(bin, ['tunnel', 'login'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    state.loginProc = proc
+    let urlSeen = false
+    const feed = (buf) => {
+      const m = buf.toString().match(/https:\/\/dash\.cloudflare\.com\/argotunnel[^\s]*/)
+      if (m && !urlSeen) {
+        urlSeen = true
+        log('已获取授权链接，正在打开浏览器…')
+        state.emitter?.emit('event', { type: 'login-url', url: m[0] })
+      }
+      if (/Successfully logged in|已成功登录/.test(buf.toString())) log('授权成功（证书已下载）')
+    }
+    proc.stdout.on('data', feed)
+    proc.stderr.on('data', feed)
+    const t0 = Date.now()
+    const poll = setInterval(() => {
+      if (fs.existsSync(CERT_PATH)) {
+        clearInterval(poll)
+        if (state.loginProc === proc) state.loginProc = null
+        try { proc.kill('SIGTERM') } catch { /* 已退出 */ }
+        log('授权完成（~/.cloudflared/cert.pem 就绪）')
+        resolve({ ok: true })
+      } else if (Date.now() - t0 > 15 * 60 * 1000) {
+        clearInterval(poll)
+        if (state.loginProc === proc) state.loginProc = null
+        try { proc.kill('SIGTERM') } catch { /* 已退出 */ }
+        resolve({ ok: false, err: '授权超时（15 分钟）：请重试' })
+      }
+    }, 1000)
+    proc.on('exit', () => {
+      setTimeout(() => { // 留给 cert 轮询先判定
+        if (state.loginProc === proc) {
+          state.loginProc = null
+          clearInterval(poll)
+          resolve(fs.existsSync(CERT_PATH) ? { ok: true } : { ok: false, err: '授权被取消或未完成' })
+        }
+      }, 1500)
+    })
+  })
+}
+
+// 运行外部命令并收集输出（create/route 都是无交互短命令）
+function runCloudflared(bin, args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    const feed = (b) => { out += b.toString() }
+    proc.stdout.on('data', feed)
+    proc.stderr.on('data', feed)
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL') } catch { /* 已死 */ } }, timeoutMs)
+    proc.on('exit', (code) => {
+      clearTimeout(timer)
+      resolve({ code, out })
+    })
+  })
+}
+
+// 步骤② 创建隧道（幂等：已存在视为成功）
+async function createTunnel(name, userDataDir) {
+  const bin = findCloudflared(userDataDir)
+  if (!bin) return { ok: false, err: '未找到 cloudflared（见使用指南第四节安装）' }
+  if (!fs.existsSync(CERT_PATH)) return { ok: false, err: '尚未完成第①步授权' }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,48}$/.test(String(name))) return { ok: false, err: '隧道名只能包含字母/数字/-/_' }
+  const r = await runCloudflared(bin, ['tunnel', 'create', String(name)])
+  if (/Created tunnel/.test(r.out)) { log(`隧道「${name}」创建成功`); return { ok: true } }
+  if (/already exist/i.test(r.out)) { log(`隧道「${name}」已存在（继续）`); return { ok: true, already: true } }
+  log(`隧道创建失败: ${r.out.trim().slice(0, 200)}`)
+  return { ok: false, err: r.out.trim().slice(0, 300) || `exit ${r.code}` }
+}
+
+// 步骤③ 绑定域名（幂等：CNAME 已存在且指向同隧道视为成功）
+async function routeDns(name, hostname, userDataDir) {
+  const bin = findCloudflared(userDataDir)
+  if (!bin) return { ok: false, err: '未找到 cloudflared（见使用指南第四节安装）' }
+  if (!fs.existsSync(CERT_PATH)) return { ok: false, err: '尚未完成第①步授权' }
+  const host = String(hostname || '').trim().toLowerCase()
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) return { ok: false, err: '主机名格式不正确（如 mqtt.example.com）' }
+  const r = await runCloudflared(bin, ['tunnel', 'route', 'dns', String(name), host])
+  if (/Added|created|successfully/i.test(r.out)) { log(`域名 ${host} 已绑定到隧道「${name}」`); return { ok: true } }
+  if (/already exist/i.test(r.out)) { log(`域名 ${host} 的记录已存在（若此前指向其他隧道，请在 Cloudflare 控制台删除后重试）`); return { ok: true, already: true } }
+  log(`域名绑定失败: ${r.out.trim().slice(0, 200)}`)
+  return { ok: false, err: r.out.trim().slice(0, 300) || `exit ${r.code}` }
+}
+
+// 步骤④ 托管运行命名隧道（崩溃自动重启，指数退避封顶 30s）
+function startNamedRun(userDataDir) {
+  if (state.namedProc) return
+  const bin = findCloudflared(userDataDir)
+  if (!bin) { log('未找到 cloudflared：命名隧道无法运行（见使用指南第四节安装）'); return }
+  if (!state.name || !state.hostname) { log('命名隧道信息不完整（需隧道名与域名）'); return }
+  const spawnRun = () => {
+    const args = ['tunnel', 'run', '--no-autoupdate', '--url', `http://127.0.0.1:${state.port}`, state.name]
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    state.namedProc = proc
+    const feed = (buf) => {
+      for (const l of buf.toString().split('\n')) {
+        if (/Registered tunnel connection|Registered and connected/.test(l)) {
+          log(`稳定服务已连接 ${state.tunnelUrl}`)
+          state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
+        }
+        if (/ failed to connect|Unable to reach/.test(l)) log(l.trim().slice(0, 160))
+      }
+    }
+    proc.stdout.on('data', feed)
+    proc.stderr.on('data', feed)
+    proc.on('exit', (code) => {
+      if (state.namedProc !== proc) return // stop() 主动关闭
+      state.namedProc = null
+      state.namedRestarts++
+      const delay = Math.min(2000 * 2 ** Math.min(state.namedRestarts, 4), 30000)
+      log(`命名隧道进程退出 code=${code}，${Math.round(delay / 1000)}s 后自动重启`)
+      setTimeout(() => {
+        if (state.server && state.mode === 'named') spawnRun()
+      }, delay)
+    })
+    log(`命名隧道「${state.name}」运行中 → ${state.tunnelUrl}（随客户端后台运行，异常自动重启）`)
+  }
+  spawnRun()
+}
+
+function stopNamed() {
+  if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null }
+  state.namedRestarts = 0
+}
+
 function snapshot() {
   return {
     running: !!state.server,
     port: state.port,
     tunnelUrl: state.tunnelUrl,
+    publicUrl: state.publicUrl,
     clients: state.clients,
-    tunnelProc: !!state.tunnelProc,
+    mode: state.mode,
+    name: state.name,
+    hostname: state.hostname,
+    certReady: fs.existsSync(CERT_PATH),
+    tunnelProc: !!(state.tunnelProc || state.namedProc),
     log: state.logs.slice(-40),
   }
 }
 
-module.exports = { start, stop, snapshot, log, set emitter(v) { state.emitter = v } }
+module.exports = {
+  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed,
+  set emitter(v) { state.emitter = v },
+}
