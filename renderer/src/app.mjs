@@ -417,7 +417,7 @@ function renderPeers() {
     let stateText = {
       connecting: '建立 P2P 连接…',
       handshaking: (p.hsCycles || 0) >= 2 ? `协商端到端加密…（第 ${(p.hsCycles || 0) + 1} 次尝试）` : '协商端到端加密…',
-      ready: p.via === 'mqtt' ? (hasPrivateRelayAlive() ? '已加密 · 中继转发（私有中继在线）' : '已加密 · 中继转发')
+      ready: p.via === 'mqtt' ? (state.hubMemberFps?.has((p.idPubHex || '').slice(0, 8)) ? '已加密 · 中继转发（已接入我的中继）' : '已加密 · 中继转发')
         : p.path === 'relay' ? '已加密 · TURN中继' : '已加密 · P2P直连',
       failed: `握手失败：${p.lastError || '未知'}${(p.hsCycles || 0) >= 2 ? `（已重试 ${p.hsCycles} 轮，持续自动重试）` : ''}`,
     }[p.state] || p.state
@@ -1031,16 +1031,6 @@ const PUBLIC_BROKERS = [
   'wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt',
   'wss://test.mosquitto.org:8081/mqtt', 'ws://broker-cn.emqx.io:8084/mqtt', 'ws://broker.emqx.io:8084/mqtt',
 ]
-// 本机是否有存活的私有中继链路（成员条目文案用；多链路并发语义下只描述本机可用性）
-function hasPrivateRelayAlive() {
-  try {
-    for (const [url, link] of state.net?.relay?.links || []) {
-      if (link.alive && !PUBLIC_BROKERS.includes(url)) return true
-    }
-  } catch { /* net 未就绪 */ }
-  return false
-}
-
 async function doLogin(name, room) {
   // 中继服务模式（v1.23.0）：本机 hub 运行中 → 把 ws://127.0.0.1:port 并入为
   // 私有链（主机自己走本地回环，零外网依赖）；hub 中途启停同样跟随
@@ -1661,9 +1651,12 @@ const hubAdopt = (st) => {
   // 对外地址随 presence 广播（成员列表 📡 标识）；运行时并入本机回环私有链
   const mode = window.__hubMode === 'named' || st?.mode === 'named' ? 'named' : (st?.mode === 'quick' ? 'quick' : (st?.tunnelUrl?.includes('trycloudflare') ? 'quick' : ''))
   if (state.net) {
-    state.net.hubPub = (st?.running && (st.tunnelUrl || st.publicUrl)) || ''
-    state.net.hubMode = mode
-    state.net.hubToken = st?.token || ''
+    // 回环地址不广播（远程成员无法接入；本机接入走下方 addBroker 回环链）
+    const pub = (st?.running && (st.tunnelUrl || st.publicUrl)) || ''
+    const exposed = pub && !/ws(s?):\/\/(127\.0\.0\.1|localhost|\[::1\])[:/]/i.test(pub)
+    state.net.hubPub = exposed ? pub : ''
+    state.net.hubMode = exposed ? mode : ''
+    state.net.hubToken = exposed ? (st?.token || '') : ''
   }
   if (!st?.running || !state.net?.relay) return
   const url = `ws://127.0.0.1:${st.port}/mqtt`
@@ -1929,16 +1922,22 @@ function renderHubPill(st) {
   const running = st?.running
   pill.classList.toggle('hidden', !running)
   if (!running) { panel.classList.add('hidden'); return }
-  const reg = st.mode === 'named' ? (st.registered ? '✓ 已连边缘' : '⏳ 连接中') : (st.tunnelUrl ? '✓ 隧道就绪' : '隧道建立中')
+  let reg
+  if (st.mode === 'named') reg = st.registered ? '✓ 已连边缘' : '⏳ 连接中'
+  else if (st.tunnelUrl) reg = '✓ 隧道就绪'
+  else reg = '未暴露公网'
   pill.textContent = `📡 私有中继 · ${reg} · 链路 ${st.clients ?? 0}`
   const members = st.memberList || []
   const list = members.length
     ? members.map((m) => `<div class="hub-member">· ${esc(m.name || '指纹 ' + m.fp)}${m.links > 1 ? `（${m.links} 条链路）` : ''}</div>`).join('')
     : '<div class="hub-member">· 暂无成员接入</div>'
+  const exposed = !!(st.tunnelUrl || st.publicUrl)
   const url = st.tunnelUrl || st.publicUrl || `ws://127.0.0.1:${st.port}/mqtt`
+  const exposeNote = exposed ? '' : '<div class="hub-panel-row" style="color:#e8b64c">⚠ 本机模式：未暴露公网，远程成员无法接入（启动快速隧道或配置稳定地址后自动广播）</div>'
   panel.innerHTML = `
     <div class="hub-panel-title">📡 私有中继运行中</div>
     <div class="hub-panel-row">接入地址：${esc(url)}</div>
+    ${exposeNote}
     <div class="hub-panel-row">${st.mode === 'named' ? '稳定地址' : '临时地址'}${st.token ? ' · 准入 token 已启用' : ''}</div>
     <div class="hub-panel-title" style="margin-top:6px">已接入成员（${members.length}）</div>
     ${list}
