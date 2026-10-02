@@ -56,7 +56,9 @@ v1.24.0 起，稳定地址的准备工作**全部在设置页内完成**，无�
 
 > 老版本（v1.23.x）的终端命令方式仍然有效：手动 `login/create/route/run` 后把 `wss://域名` 填进「对外公布地址」即可，两种方式共存。
 
-## 四、安装 cloudflared（详细指导）
+## 四、cloudflared 说明（v1.25.1 起已内置，通常无需安装）
+
+**v1.25.1 起，Windows/macOS/Linux 安装包已内置官方 cloudflared**——装好 OrayChat 即可直接使用快速隧道与命名隧道，无需任何手动安装。以下手动方式仅适用于想使用更新版本的高级用户（系统 PATH 里自装的版本会被优先采用）。
 
 cloudflared 是 Cloudflare 官方的隧道客户端（单个可执行文件，约 40MB，无其他依赖）。OrayChat 会按以下顺序自动查找它：
 
