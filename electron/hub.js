@@ -22,7 +22,7 @@ const CERT_PATH = path.join(os.homedir(), '.cloudflared', 'cert.pem')
 const state = {
   aedes: null, server: null, tunnelProc: null, namedProc: null,
   port: 0, tunnelUrl: '', clients: 0, startedAt: 0,
-  mode: 'off', name: '', hostname: '', publicUrl: '',
+  mode: 'off', name: '', hostname: '', publicUrl: '', token: '',
   namedRestarts: 0, loginProc: null, registered: false,
   clientMap: new Map(), // clientId -> {fp, since}（身份指纹接入表）
   names: {}, // 指纹 -> 昵称（renderer 经 hub:set-names 推送）
@@ -57,6 +57,9 @@ async function start(opts = {}) {
   }
   state.emitter = opts.emitter || state.emitter
   const port = Number(opts.port) || 48883
+  const bind = String(opts.bind || '127.0.0.1') // 生产仅回环；e2e 用 0.0.0.0 验 token 准入
+  // 准入 token：有则沿用（配置持久化），无则生成（8 组 4 字符 base32 风格，可抄写）
+  state.token = String(opts.token || '') || Array.from({ length: 8 }, () => Math.random().toString(32).slice(2, 3).toUpperCase().replace(/[^A-Z2-7]/, () => 'ABCDEFGHJKMNPQRSTUVWXYZ'[Math.floor(Math.random() * 24)])).join('-').toLowerCase()
   try {
     // aedes 1.x：new Aedes() 已废弃（半初始化实例不回 CONNACK），必须用异步工厂
     const aedes = await Aedes.createBroker()
@@ -85,12 +88,24 @@ async function start(opts = {}) {
       stream.remoteAddress = req.socket?.remoteAddress
       aedes.handle(stream, req)
     })
+    // token 准入（v1.25.0）：回环（本机客户端）免认证；外部连接必须携带 token。
+    // 未启用认证（opts.noAuth，兼容旧成员过渡）时全放行
+    if (!opts.noAuth) {
+      aedes.authenticate = (client, username, password, cb) => {
+        const remote = client.req?.socket?.remoteAddress || ''
+        if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') return cb(null, true)
+        const got = Buffer.isBuffer(password) ? password.toString() : String(password || '')
+        if (got && got === state.token) return cb(null, true)
+        log(`拒绝未授权连接 (${remote || 'unknown'}${client.id ? ' ' + client.id : ''}）`)
+        cb(null, false)
+      }
+    }
     await new Promise((resolve, reject) => {
       server.once('error', reject)
-      server.listen(port, '127.0.0.1', () => resolve())
+      server.listen(port, bind, () => resolve())
     })
     Object.assign(state, { aedes, server, port, clients: 0, startedAt: Date.now() })
-    log(`broker 监听 ws://127.0.0.1:${port}（仅本机回环）`)
+    log(`broker 监听 ws://${bind}:${port}${bind === '127.0.0.1' ? '（仅本机回环）' : ''}`)
     state.emitter?.emit('event', { type: 'started', port })
 
     state.publicUrl = String(opts.publicUrl || '')
@@ -134,6 +149,7 @@ async function stop() {
     aedes: null, server: null, tunnelUrl: '', port: 0, clients: 0, startedAt: 0,
     mode: 'off', namedRestarts: 0, registered: false,
   })
+  // token 保留（属配置非运行态：停止后设置页仍可查看/复制；下次 start 沿用）
   state.emitter?.emit('event', { type: 'stopped' })
 }
 
@@ -391,6 +407,7 @@ function snapshot() {
     certReady: fs.existsSync(CERT_PATH),
     tunnelProc: !!(state.tunnelProc || state.namedProc),
     registered: state.registered,
+    token: state.token,
     // 按身份指纹聚合的成员接入列表（同名合并条数；名字由 renderer 映射）
     memberList: (() => {
       const byFp = new Map()

@@ -60,6 +60,7 @@ export class RelayTransport {
     this.peers = new Map() // selfId -> {name, lastSeen, suspectSince}
     this.closed = false
     this.clientIdBase = clientIdBase
+    this.credentials = new Map() // url -> {username, password}（私有中继 token 准入）
     this.brokerUrls = brokerUrls?.length ? brokerUrls : ['wss://broker-cn.emqx.io:8084/mqtt']
     this.links = new Map() // url -> {client, alive, attempts}
     this.seenTx = new Map() // txid -> ts（多链路重复帧去重）
@@ -101,7 +102,11 @@ export class RelayTransport {
       const clientId = this.clientIdBase
         ? `${this.clientIdBase}-${Math.random().toString(36).slice(2, 6)}`
         : undefined
-      client = mqtt.connect(url, { reconnectPeriod: 0, connectTimeout: 8000, keepalive: 30, clientId })
+      const creds = this.credentials.get(url)
+      client = mqtt.connect(url, {
+        reconnectPeriod: 0, connectTimeout: 8000, keepalive: 30, clientId,
+        username: creds?.username, password: creds?.password, // 私有中继 token 准入
+      })
 
     } catch { this.scheduleLinkRetry(url, retry); return }
     const link = { client, alive: false, attempts: 0 }
@@ -109,6 +114,7 @@ export class RelayTransport {
     client.on('connect', () => {
       link.alive = true
       link.attempts = 0
+      this.onLinkState?.(url, true) // 真实连通（CONNACK）
       this.onLog(`MQTT 中继链路已连接 ${url}（并联 ${this.aliveLinks().length} 条）`)
       client.subscribe([presence, inbox(this.selfId)], (err) => {
         if (err) { this.onLog(`中继订阅失败 ${url}: ${err.message}`, 'warn'); return }
@@ -200,6 +206,7 @@ export class RelayTransport {
   forceReconnect() {
     if (this.closed) return
     for (const [url, l] of this.links) {
+      this.onLinkState?.(url, false)
       l.alive = false
       try { l.client?.end(true) } catch { /* 忽略 */ }
     }
@@ -209,13 +216,19 @@ export class RelayTransport {
 
   // 运行时并入新的 broker 链（v1.23.0 私有中继服务：主机接入本地 hub、或成员
   // 中途采纳房间内分享的私有链）。去重；并联数随链数增长（本地链零成本）
-  addBroker(url) {
+  addBroker(url, creds = null) {
     if (!url || this.closed || this.brokerUrls.includes(url)) return false
     this.brokerUrls.push(url)
+    if (creds) this.credentials.set(url, creds)
     this.parallelN = Math.min(this.parallelN + 1, this.brokerUrls.length)
     this.spawnLink(url)
-    this.onLog(`并入中继链路 ${url}（并联 ${this.parallelN} 条）`)
+    this.onLog(`并入中继链路 ${url}（并联 ${this.parallelN} 条${creds ? '，带准入凭据' : ''}）`)
     return true
+  }
+
+  // 设置既有 broker 的凭据（采纳广播时登记；下次重连生效）
+  setCredentials(url, creds) {
+    if (url && creds) this.credentials.set(url, creds)
   }
 
   get connected() { return this.aliveLinks().length > 0 }

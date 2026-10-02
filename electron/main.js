@@ -343,10 +343,12 @@ function registerIpc() {
     return hub.start({ tunnel: 'named', name, hostname, userDataDir: app.getPath('userData') })
   })
   ipcMain.handle('hub:persist', (_e, hubCfg) => {
+    const cfg = hubCfg || {}
+    if (!cfg.token && hub.snapshot().token) cfg.token = hub.snapshot().token // token 沿用（不因保存轮换）
     try {
       const sp = path.join(app.getPath('userData'), 'local-state.json')
       const st = JSON.parse(fs.readFileSync(sp, 'utf8'))
-      st['oc-config'] = { ...(st['oc-config'] || {}), hub: hubCfg }
+      st['oc-config'] = { ...(st['oc-config'] || {}), hub: cfg }
       fs.writeFileSync(sp, JSON.stringify(st), { mode: 0o600 })
       return true
     } catch (err) { return { err: err.message } }
@@ -600,6 +602,7 @@ app.whenReady().then(() => {
   function hubAuto0(o) {
     const opts = { ...o, userDataDir: app.getPath('userData') }
     if (opts.mode === 'named' && !opts.tunnel) opts.tunnel = 'named' // 向导持久化的字段名
+    opts.noAuth = opts.noAuth ?? false // token 准入默认启用
     hub.start(opts).then((r) => {
       process.stdout.write(`[HUB] autostart ${JSON.stringify(r)}\n`)
     })

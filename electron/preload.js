@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('oray', {
   // 本地 KV 状态（主进程文件持久化，可靠落盘）
   kvGet: (key) => ipcRenderer.invoke('kv:get', key),
   kvSet: (key, val) => ipcRenderer.invoke('kv:set', key, val),
+  saveUserConfig: (cfg) => ipcRenderer.invoke('settings:set-user-config', cfg),
 
   // 文件传输存储层（filex io 适配器：分片落盘/位图/校验/读取/另存）
   fxState: (fid, meta) => ipcRenderer.invoke('fx:state', fid, meta),

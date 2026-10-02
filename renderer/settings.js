@@ -126,6 +126,7 @@ if (window.settings.hubStart) {
     mode: window.__hubMode || 'off',
     name: $('hubTunnelName').value.trim() || 'oraychat-hub',
     hostname: $('hubHostname').value.trim(),
+    token: window.__hubSnap?.token || window.__savedHubToken || '',
   })
   const persist = () => window.settings.hubPersist(hubCfg())
   const stepMark = (id, ok, text) => { const el = $(id); el.textContent = text || (ok ? '✓ 已完成' : '未完成'); el.style.color = ok ? 'var(--ok)' : 'var(--tx2)' }
@@ -158,8 +159,13 @@ if (window.settings.hubStart) {
     if (st?.running && st?.mode === 'named') {
       // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
       $('hubState').textContent = `状态：运行中（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 链路 ${st?.clients ?? 0}`
-      return
+    } else {
+      const state = st?.running ? '运行中' : '未运行'
+      const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
+      $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 链路 ${st?.clients ?? 0}`
     }
+    const tEl = $('hubTokenView')
+    if (tEl) tEl.textContent = st?.token || '—'
     const state = st?.running ? '运行中' : '未运行'
     const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
     $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 链路 ${st?.clients ?? 0}`
@@ -190,7 +196,7 @@ if (window.settings.hubStart) {
     window.settings.hubStatus().then(hubRender)
   })
   $('hubStartBtn').onclick = async () => {
-    const r = await window.settings.hubStart({ port: Number($('hubPort').value) || 48883, tunnel: 'off' })
+    const r = await window.settings.hubStart({ port: Number($('hubPort').value) || 48883, tunnel: 'off', token: window.__hubSnap?.token || window.__savedHubToken || '' })
     if (!r.ok) toast(`启动失败：${r.err}`)
     window.settings.hubStatus().then(hubRender)
   }
@@ -262,6 +268,11 @@ if (window.settings.hubStart) {
     $('hubTestResult').textContent = line
     $('hubLog').textContent += `\n[HUB] ${new Date().toLocaleTimeString('zh-CN', { hour12: false })} 接入测试 ${r.ok ? '通过' : '失败'}（${target}${r.ok ? `，${r.ms}ms` : ''}）${r.ok ? '' : '：' + r.err}`
     window.settings.hubStatus().then(hubRender)
+  }
+  $('hubTokenCopyBtn').onclick = async () => {
+    const t = window.__hubSnap?.token
+    if (!t) { toast('中继未运行'); return }
+    try { await navigator.clipboard.writeText(t); toast('准入 token 已复制') } catch { toast(`token：${t}`) }
   }
   $('hubCopyBtn').onclick = async () => {
     const text = hubCopyText()

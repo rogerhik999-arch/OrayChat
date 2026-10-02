@@ -431,6 +431,7 @@ function renderPeers() {
       }
     }
     if (p.state === 'ready' && p.suspect) stateText += ' · 疑似离线，确认中…'
+    if (p.state === 'ready' && p.hubPub) stateText += ` · 📡 私有中继${p.hubInfo?.mode === 'named' ? '（稳定）' : p.hubInfo?.mode === 'quick' ? '（临时）' : ''}`
     if (p.state === 'ready' && p.lastSeen) {
       const ago = Math.max(0, Math.round((Date.now() - p.lastSeen) / 1000))
       stateText += ago <= 20 ? ` · ${ago}s 前在线报告` : ` · ⚠ ${ago}s 未报告`
@@ -440,7 +441,7 @@ function renderPeers() {
     li.innerHTML = `
       <div class="avatar" style="background:${avatarColor(peerId)}">${esc(name.slice(0, 1).toUpperCase())}</div>
       <div class="p-info">
-        <div class="p-name">${esc(name)}${p.hubPub ? '<span class="hub-badge" title="私有中继服务主机">📡</span>' : ''}${unreadBadge(state.net.dmViewKey(p.idPubHex || peerId))}</div>
+        <div class="p-name">${esc(name)}${p.hubPub ? `<span class="hub-badge" title="私有中继服务主机（${p.hubInfo?.mode === 'named' ? '稳定地址' : '临时地址'}）">📡</span>` : ''}${unreadBadge(state.net.dmViewKey(p.idPubHex || peerId))}</div>
         <div class="p-state"><span class="dot ${dotCls}"></span>${esc(stateText)}</div>
       </div>`
     li.onclick = () => selectView({ conv: 'dm', peerId })
@@ -1026,6 +1027,9 @@ function appendSys(text) {
 // ---------- 登录 ----------
 
 async function doLogin(name, room) {
+  // 中继服务模式（v1.23.0）：本机 hub 运行中 → 把 ws://127.0.0.1:port 并入为
+  // 私有链（主机自己走本地回环，零外网依赖）；hub 中途启停同样跟随
+
   $('loginErr').classList.add('hidden')
   const stored = await window.oray.loadIdentity(name)
   if (stored?.edSeed) {
@@ -1150,19 +1154,18 @@ async function doLogin(name, room) {
   })
   state.net.attachFilex(state.filex)
 
-  // 中继服务模式（v1.23.0）：本机 hub 运行中 → 把 ws://127.0.0.1:port 并入为
-  // 私有链（主机自己走本地回环，零外网依赖）；hub 中途启停同样跟随
-  const hubAdopt = (st) => {
-    if (!state.net) return
-    // 对外地址随 presence 广播（成员列表 📡 标识）；运行时并入本机回环私有链
-    if (state.net) state.net.hubPub = (st?.running && (st.tunnelUrl || st.publicUrl)) || ''
-    if (!st?.running || !state.net?.relay) return
-    const url = `ws://127.0.0.1:${st.port}/mqtt`
-    if (state.net.relay.addBroker(url)) appendSys('中继服务：已并入本机私有中继链路（127.0.0.1 回环）')
-  }
   if (window.oray.hubStatus) {
     window.oray.hubStatus().then(hubAdopt).catch(() => {})
     window.oray.onHubEvent?.((ev) => { if (['started', 'stopped', 'tunnel'].includes(ev.type)) window.oray.hubStatus().then(hubAdopt).catch(() => {}) })
+    // 事件竞态兜底：hub 自启动可能早于本函数的 onHubEvent 注册（started 已错过）
+    // ——周期拉取，hubAdopt 全程幂等（addBroker 去重/hubPub 设置无害）
+    let hubPolls = 0
+    const hubPoll = setInterval(() => {
+      hubPolls++
+      window.oray.hubStatus().then(hubAdopt).catch(() => {})
+      if (hubPolls >= 30) clearInterval(hubPoll) // 5 分钟后停（正常早已稳定）
+    }, 10000)
+    window.oray.hubSetNames?.({}); // 占位：映射推送在 doLogin 后（state.net 就绪时）
     // 指纹→昵称映射：中继设置页的「已接入成员」按昵称显示（而非公钥指纹）
     const pushHubNames = () => {
       if (!state.net || !window.oray.hubSetNames) return
@@ -1290,6 +1293,8 @@ function netHooks() {
       if (state.args.bot) window.oray.botLog(`[BOT] PRESENCE from=${p.name}`)
       renderPeers()
     },
+    onHubAdvertised: (peerId, peer, info) => { void adoptAdvertisedHub(peerId, peer, info) },
+    onLinkState: (url, ok) => noteBroker(url, ok),
     onPeerName: (peerId, p, idPubHex, name) => {
       reviveIgnored(idPubHex) // 对端同步传播来的名字：视为主动恢复
       if (saveName(idPubHex, name)) { renderConv(); renderPeers() }
@@ -1579,6 +1584,76 @@ async function iceProbe() {
 }
 
 // ---------- 启动 ----------
+
+  const PUBLIC_BROKERS = [
+  'wss://broker-cn.emqx.io:8084/mqtt', 'wss://broker.emqx.io:8084/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt', 'ws://broker-cn.emqx.io:8084/mqtt', 'ws://broker.emqx.io:8084/mqtt',
+]
+// 中继稳定度统计：url -> {lastOkAt, fails}（relay 链路事件驱动；参与 broker 排序）
+const relayStats = new Map()
+const noteBroker = (url, ok) => {
+  if (!url) return
+  const st = relayStats.get(url) || { lastOkAt: 0, fails: 0 }
+  if (ok) { st.lastOkAt = Date.now(); st.fails = 0 } else st.fails++
+  relayStats.set(url, st)
+}
+// 排序：固定(named 域名) > 临时(quick) > 公共；同类按稳定度（最近连通新者优先，失败计数低者优先）
+const sortRelayBrokers = (urls) => {
+  const rank = (u) => {
+    if (PUBLIC_BROKERS.includes(u)) return 3
+    if (/trycloudflare\.com/.test(u)) return 2
+    return 1 // 命名隧道/自定义稳定域名
+  }
+  const stOf = (u) => relayStats.get(u) || { lastOkAt: 0, fails: 0 }
+  return [...urls].sort((a, b) => rank(a) - rank(b)
+    || (stOf(b).fails - stOf(a).fails)
+    || (stOf(b).lastOkAt - stOf(a).lastOkAt))
+}
+const persistRelayBrokers = async (urls, credsPatch) => {
+  try {
+    const info = await window.oray.getConfig()
+    const prev = info.userConfig || {}
+    const userConfig = { ...prev, relayBrokers: urls }
+    if (credsPatch) userConfig.relayCreds = { ...(prev.relayCreds || {}), ...credsPatch } // 私有中继凭据随采纳持久化
+    if (window.oray.saveUserConfig) await window.oray.saveUserConfig(userConfig)
+    state.cfg = { ...(state.cfg || {}), relayBrokers: urls, ...(credsPatch ? { relayCreds: userConfig.relayCreds } : {}) }
+  } catch { /* 持久化失败不阻断（本次会话仍可用） */ }
+}
+// 采纳对端广播的私有中继：去重（已有/自己广播的）→ 带凭据并链 → 持久化（排序重写）
+const adoptAdvertisedHub = async (peerId, peer, info) => {
+  const dbg = (m) => { if (state.args?.bot) window.oray.botLog(`ADOPT ${m}`) }
+  try {
+    dbg(`收到广播 url=${info?.url}`)
+    if (!state.net?.relay || !info?.url) return
+    if (state.net.hubPub === info.url) { dbg('跳过：自己广播的'); return }
+    if (state.net.relay.brokerUrls.includes(info.url)) { state.net.relay.setCredentials(info.url, { username: 'member', password: info.token }); dbg('已存在：更新凭据'); return }
+    const creds = info.token ? { username: 'member', password: info.token } : null
+    if (state.net.relay.addBroker(info.url, creds)) {
+      appendSys(`已接入 ${peer.name || '成员'} 提供的私有中继（${info.mode === 'named' ? '稳定地址' : '临时地址'}）：${info.url}`)
+      dbg(`并链成功`)
+      const urls = sortRelayBrokers(state.net.relay.brokerUrls)
+      await persistRelayBrokers(urls, creds ? { [info.url]: creds } : null)
+      dbg(`持久化完成 urls=${urls.length}`)
+    } else dbg('addBroker 返回 false')
+  } catch (e) {
+    if (state.args?.bot) window.oray.botLog(`ADOPT-ERR ${e?.message || e}`)
+    try { appendSys(`私有中继采纳失败：${e?.message || e}`) } catch { /* UI 不可用 */ }
+  }
+}
+const hubAdopt = (st) => {
+  if (!state.net) return
+  // 对外地址随 presence 广播（成员列表 📡 标识）；运行时并入本机回环私有链
+  const mode = window.__hubMode === 'named' || st?.mode === 'named' ? 'named' : (st?.mode === 'quick' ? 'quick' : (st?.tunnelUrl?.includes('trycloudflare') ? 'quick' : ''))
+  if (state.net) {
+    state.net.hubPub = (st?.running && (st.tunnelUrl || st.publicUrl)) || ''
+    state.net.hubMode = mode
+    state.net.hubToken = st?.token || ''
+  }
+  if (!st?.running || !state.net?.relay) return
+  const url = `ws://127.0.0.1:${st.port}/mqtt`
+  if (state.net.relay.addBroker(url)) appendSys('中继服务：已并入本机私有中继链路（127.0.0.1 回环）')
+}
+
 
 async function main() {
   state.cfg = { ...DEFAULT_CONFIG, ...(await window.oray.getConfig()) }

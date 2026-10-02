@@ -158,6 +158,8 @@ export class ChatNet {
       onPeerSuspect: (id) => this.onRelaySuspect(id),
       onLog: (m, lv) => this.hooks.onLog?.(m, lv),
     })
+    // 私有中继凭据（采纳广播时持久化）：重启后重连私有链仍携带 token
+    for (const [url, c] of Object.entries(cfg.relayCreds || {})) this.relay.setCredentials(url, c)
 
     // ---- WebRTC 层 ----
     if (!opts.forceRelay) {
@@ -928,6 +930,15 @@ export class ChatNet {
       peer.lastSeen = Date.now()
       peer.lastProgress = Date.now()
       if (frame.hubPub !== undefined) peer.hubPub = frame.hubPub || null // 中继主机标识（📡）
+      if (frame.hubInfo !== undefined) {
+        const prev = peer.hubInfo?.url
+        peer.hubInfo = frame.hubInfo || null
+        this.hooks.onLog?.(`DBG hubInfo from=${peer.name || peerId.slice(0, 8)} url=${peer.hubInfo?.url || 'null'} mode=${peer.hubInfo?.mode ?? '∅'} token=${peer.hubInfo?.token ? '有' : '无'}`)
+        this.hooks.onLog?.(`DBG hook=${typeof this.hooks.onHubAdvertised}`)
+        if (peer.hubInfo?.url && peer.hubInfo.url !== prev) {
+          try { this.hooks.onHubAdvertised?.(peerId, peer, peer.hubInfo) } catch (e) { this.hooks.onLog?.(`DBG adopt-threw: ${e?.message || e}`) }
+        }
+      }
       this.relay?.markAlive(peerId) // 心跳即存活证据（SWIM：任意消息撤销怀疑）
       this.hooks.onPresence?.(peerId, peer)
       this.absorbDigest(peerId, frame.digest)
@@ -1095,8 +1106,13 @@ export class ChatNet {
       if (peer.state !== 'ready') continue
       try {
         // hubPub：本机作为中继服务主机的对外地址（📡 标识数据源；未运行时为空串，
-        // 显式覆盖对端缓存的旧标识）
-        const frame = { conv: 'dm', op: 'presence', t: now, digest, hubPub: this.hubPub || '' }
+        // 显式覆盖对端缓存的旧标识）。hubInfo 附模式与准入 token——经端到端加密
+        // 通道只达房间成员，成员据此自动采纳并接入（token 准入的授权分发）
+        const frame = {
+          conv: 'dm', op: 'presence', t: now, digest,
+          hubPub: this.hubPub || '',
+          hubInfo: this.hubPub ? { url: this.hubPub, mode: this.hubMode || '', token: this.hubToken || '' } : null,
+        }
         if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
         else this.ctlAction?.send(frame, { target: peerId }).catch(() => {})
       } catch { /* 心跳失败静默，下轮再报 */ }
