@@ -1919,16 +1919,27 @@ function renderHubPill(st) {
       if (!panel.classList.contains('hidden') && !panel.contains(e.target) && e.target !== pill) panel.classList.add('hidden')
     })
   }
-  const running = st?.running
-  pill.classList.toggle('hidden', !running)
-  if (!running) { panel.classList.add('hidden'); return }
+  const links = relayLinksInfo()
+  const alive = links.filter((l) => l.alive).length
+
+  // —— 成员视角（非中继主机）：当前中继链路清单（连着哪几条/存活情况）——
+  if (!st?.running) {
+    pill.classList.remove('hidden')
+    pill.textContent = `🔗 中继链路 · 🟢 ${alive}/${links.length}`
+    panel.innerHTML = `
+      <div class="hub-panel-title">当前中继链路（${alive}/${links.length} 存活）</div>
+      ${links.map((l) => `<div class="hub-member">${l.alive ? '🟢' : '⚪'} ${esc(l.type)}中继 · ${esc(l.url)}${l.fails ? ` · 断线${l.fails}次` : ''}</div>`).join('') || '<div class="hub-member">（无）</div>'}
+      <div class="hub-panel-row" style="margin-top:4px">消息经全部存活链路并发发送、接收端去重；增删可在 设置 → 网络 → MQTT broker</div>`
+    return
+  }
+
+  // —— 主机视角：📡 私有中继运行中 ——
   let reg
   if (st.mode === 'named') reg = st.registered ? '✓ 已连边缘' : '⏳ 连接中'
   else if (st.tunnelUrl) reg = '✓ 隧道就绪'
   else reg = '本机模式（未暴露公网）'
   pill.textContent = `📡 私有中继 · ${reg} · 链路 ${st.clients ?? 0}`
   const members = st.memberList || []
-  const links = relayLinksInfo()
   const list = members.length
     ? members.map((m) => `<div class="hub-member">· ${esc(m.name || '指纹 ' + m.fp)}${m.links > 1 ? `（${m.links} 条链路）` : ''}</div>`).join('')
     : '<div class="hub-member">· 暂无成员接入</div>'
