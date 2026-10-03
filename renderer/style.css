@@ -177,6 +177,8 @@ button.ghost.danger[data-confirm] { background: #3a2323; color: var(--warn); }
 .composer textarea:focus { border-color: var(--accent); }
 .composer textarea:disabled { opacity: .55; }
 .composer button { width: 92px; margin-top: 0; padding: 10px; }
+/* 附件/录音：方形紧凑（手机+PC 一致），与输入框同高 */
+.composer .attach-btn { width: 42px; height: 42px; padding: 0; font-size: 17px; line-height: 1; flex: none; align-self: flex-end; }
 
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: #2b3644; border-radius: 5px; }
@@ -213,7 +215,6 @@ button.ghost.warn2:hover { background: #3a2d1c; }
 
 /* ---------- 移动端适配：侧栏抽屉 ---------- */
 .menu-btn { display: none; font-size: 18px; line-height: 1; padding: 6px 12px; flex: none; }
-.gear-btn { font-size: 17px; line-height: 1; padding: 6px 12px; flex: none; }
 .backdrop { display: none; }
 
 @media (max-width: 760px) {
@@ -247,6 +248,7 @@ button.ghost.warn2:hover { background: #3a2d1c; }
   .composer { padding: 10px 12px calc(10px + var(--sab)); }
   .composer textarea { font-size: 16px; }
   .composer button { width: 74px; }
+  .composer .attach-btn { width: 40px; height: 40px; }
 
   /* 登录卡自适应 */
   .login-card { width: min(400px, calc(100vw - 24px)); padding: 26px 22px 20px; }

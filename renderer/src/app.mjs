@@ -1529,8 +1529,6 @@ function bindUi() {
     if (window.oray.openSettings) window.oray.openSettings()
     else appendSys('当前平台暂无设置界面（Web 版）')
   }
-  if (window.oray.openSettings) $('settingsBtn').onclick = openSettingsIfAvailable
-  else $('settingsBtn').classList.add('hidden')
   const sideBtn = $('sideSettingsBtn')
   if (sideBtn) sideBtn.onclick = openSettingsIfAvailable
 

@@ -39,7 +39,7 @@ const REAP_COOLDOWN_MS = 5 * 60 * 1000 // 刚回收的 peerId 期间不再被摘
 // 握手帧类型短名（OC-HS1-v1 → hs1）：条目上的"停在 →hs1 12s 前"阶段诊断用——
 // 长期协商中的条目由此可分辨"反复发 hs1 无回应（对端收不到/不处理）"与
 // "hs2 已到但校验失败（版本/状态不兼容）"两类完全不同的病因
-const hsShort = (t) => String(t || '?').replace('OC-HS', '').replace('-v1', '').toLowerCase()
+const hsShort = (t) => String(t || '?').replace('-v1', '').replace('OC-HS', 'hs').replace('OC-', '').toLowerCase()
 
 // 免费公共基础设施默认清单（可在 userData/oraychat-config.json 覆盖）
 export const DEFAULT_CONFIG = {
@@ -597,8 +597,23 @@ export class ChatNet {
       peer = this.ensurePeer(peerId, via)
     }
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
-    if (!this.acceptsVia(peer, via)) return
+    // hs1/hs-err 允许跨路径：双方对传输路径的选择可能不一致（本方锁 mqtt、对端锁
+    // p2p），严格匹配会互丢对方 hs1 → presence 正常但握手永远不成（双方失聪，
+    // 用户实测"对端在线信号正常、停在 →hs1"）。hs1 带签名可防伪、lastHs1Key 幂等
+    // 防重放，跨路径安全；hs2/hs3/hs3ack 属特定协商轮次，保持严格匹配
+    if (!this.acceptsVia(peer, via) && msg?.t !== 'OC-HS1-v1' && msg?.t !== 'OC-HS-ERR-v1') return
     peer.lastProgress = Date.now() // 握手有来有回 = 双方都活着（reapGhosts 不回收）
+    // 对端拒收回执：本方发起的 hs1 被对端验证拒绝时，对端回 {t:OC-HS-ERR-v1}——
+    // 把拒绝原因呈现在发起方的阶段诊断里（"停在 ←拒(…)"），否则对端日志里的
+    // 拒绝理由本方永远看不到（远程排查 3070/xfold6 类"对端在线但握手不成"的关键）
+    if (msg?.t === 'OC-HS-ERR-v1') {
+      if (peer.state === 'handshaking') {
+        this.clearRetransmit(peer) // 拒绝通常持续存在（格式/版本不兼容），停掉 3s 重发；周期超时仍会按退避重启
+        peer.hsLastEvt = { t: `←拒(${String(msg.err || '未知').slice(0, 60)})`, at: Date.now() }
+        this.hooks.onLog?.(`对端拒绝握手 (${peerId.slice(0, 8)}…): ${msg.err || '未知'}`, 'warn')
+      }
+      return
+    }
     peer.hsLastEvt = { t: `←${hsShort(msg?.t)}`, at: Date.now() }
     try {
       if (msg.t === 'OC-HS1-v1') {
@@ -671,7 +686,14 @@ export class ChatNet {
       // （传输抖动换路时必有在途旧帧），也可能只是重复帧。failHandshake 在这里会
       // 误杀已经 ready 的活会话（v1.21.5 实测：DM 发送循环被炸、删除传播停摆）。
       // 握手成败只由 hsTimer 超时裁决，这里一律警告并保持现状。
-      peer.hsLastEvt = { t: `←${hsShort(msg?.t)}(校验失败)`, at: Date.now() }
+      // hs1 被拒时回执原因给发起方（仅响应方角色、仅 hs1——回执帧自身走
+      // 上方的 OC-HS-ERR 早退分支，不会形成回环）
+      if (msg?.t === 'OC-HS1-v1' && !this.iAmInitiator(peerId)) {
+        try { this.sendHs(peerId, { t: 'OC-HS-ERR-v1', about: 'hs1', err: String(e?.message || e).slice(0, 80) }) } catch { /* 尽力而为 */ }
+        peer.hsLastEvt = { t: `←hs1(拒：${String(e?.message || e).slice(0, 40)})→已回执`, at: Date.now() }
+      } else {
+        peer.hsLastEvt = { t: `←${hsShort(msg?.t)}(校验失败)`, at: Date.now() }
+      }
       const st = peer.state === 'ready' ? '会话保持' : '等待超时裁决'
       this.hooks.onLog?.(`忽略无效握手帧 (${peerId.slice(0, 8)}…, ${st}): ${e?.message || e}`, 'warn')
     }

@@ -592,7 +592,26 @@ function broadcastHubEvent(ev) {
     try { w.webContents.send('hub:event', ev) } catch { /* 窗口未就绪 */ }
   }
   if (ev.type === 'login-url') { try { shell.openExternal(ev.url) } catch { /* 无默认浏览器 */ } }
+  persistHubModeIfNamed()
   process.stdout.write(`${JSON.stringify(ev)}\n`) // bot 断言用（[HUB] 行在 hub.js 日志里，经 hub:log 也打 stdout）
+}
+
+// 固定中继真实运行状态回写：named 注册成功即把 mode=named 落盘——此后无论用户
+// 最后点过哪个临时暴露按钮，重启/重装后稳定地址都能自动恢复（临时隧道地址每次
+// 都变，自动恢复它对成员毫无价值；用户需求：保存最后一次可用状态）
+function persistHubModeIfNamed() {
+  try {
+    const snap = hub.snapshot()
+    if (!snap.running || snap.mode !== 'named' || !snap.registered) return
+    const sp = path.join(app.getPath('userData'), 'local-state.json')
+    const st = JSON.parse(fs.readFileSync(sp, 'utf8'))
+    const cur = st['oc-config'] || {}
+    const hubCfg = { ...(cur.hub || {}) }
+    if (hubCfg.mode === 'named' && hubCfg.enabled && hubCfg.hostname) return // 已一致
+    st['oc-config'] = { ...cur, hub: { ...hubCfg, mode: 'named', enabled: true, name: hubCfg.name || snap.name || 'oraychat-hub', hostname: hubCfg.hostname || snap.hostname || '' } }
+    fs.writeFileSync(sp, JSON.stringify(st), { mode: 0o600 })
+    process.stdout.write('[HUB] 已持久化稳定服务状态（mode=named，重启自动恢复）\n')
+  } catch { /* 状态不可读时跳过，等下一个事件再试 */ }
 }
 function mainWindow() { return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.webContents.getURL().includes('index.html')) }
 
@@ -626,6 +645,10 @@ app.whenReady().then(() => {
   } else { hubAuto0(hubAuto) }
   function hubAuto0(o) {
     const opts = { ...o, userDataDir: app.getPath('userData') }
+    // 固定中继优先：向导③的 hostname 已配置且未被用户显式关闭时，无论存储里最后
+    // 点的是哪种暴露方式，重启一律恢复 named——临时隧道地址每次都变，自动重启它
+    // 只会让成员的稳定地址失联（用户需求：重装后还能用）
+    if (opts.mode !== 'off' && opts.mode !== 'named' && opts.hostname) opts.mode = 'named'
     if (opts.mode === 'named' && !opts.tunnel) opts.tunnel = 'named' // 向导持久化的字段名
     opts.noAuth = opts.noAuth ?? false // token 准入默认启用
     hub.start(opts).then((r) => {

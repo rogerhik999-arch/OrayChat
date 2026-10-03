@@ -123,7 +123,7 @@ if (window.settings.hubStart) {
   const hubCfg = () => ({
     enabled: $('hubEnabled').checked,
     port: Number($('hubPort').value) || 48883,
-    mode: window.__hubMode || 'off',
+    mode: window.__hubMode || window.__savedHubMode || 'off',
     name: $('hubTunnelName').value.trim() || 'oraychat-hub',
     hostname: $('hubHostname').value.trim(),
     token: window.__hubSnap?.token || window.__savedHubToken || '',
@@ -184,7 +184,7 @@ if (window.settings.hubStart) {
     if (savedHub.port) $('hubPort').value = String(savedHub.port)
     if (savedHub.name) $('hubTunnelName').value = savedHub.name
     if (savedHub.hostname) { $('hubHostname').value = savedHub.hostname; if (!$('hubPublicUrl').value.trim()) $('hubPublicUrl').value = `wss://${savedHub.hostname}` }
-    if (savedHub.mode) window.__hubMode = savedHub.mode
+    if (savedHub.mode) { window.__hubMode = savedHub.mode; window.__savedHubMode = savedHub.mode }
     if (savedHub.mode === 'named' && savedHub.name) window.__tunnelCreated = true
     if (window.__userConfig) window.__userConfig.hub = savedHub
     $('hubEnabled').checked = !!savedHub.enabled
