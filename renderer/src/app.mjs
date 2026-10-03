@@ -1934,6 +1934,7 @@ function renderHubPill(st) {
   }
 
   // —— 主机视角：📡 私有中继运行中 ——
+  pill.classList.remove('hidden') // 主机胶囊常驻（index.html 初始带 hidden）
   let reg
   if (st.mode === 'named') reg = st.registered ? '✓ 已连边缘' : '⏳ 连接中'
   else if (st.tunnelUrl) reg = '✓ 隧道就绪'
