@@ -1928,6 +1928,7 @@ function renderHubPill(st) {
   else reg = '本机模式（未暴露公网）'
   pill.textContent = `📡 私有中继 · ${reg} · 链路 ${st.clients ?? 0}`
   const members = st.memberList || []
+  const links = relayLinksInfo()
   const list = members.length
     ? members.map((m) => `<div class="hub-member">· ${esc(m.name || '指纹 ' + m.fp)}${m.links > 1 ? `（${m.links} 条链路）` : ''}</div>`).join('')
     : '<div class="hub-member">· 暂无成员接入</div>'
@@ -1941,9 +1942,23 @@ function renderHubPill(st) {
     <div class="hub-panel-row">${st.mode === 'named' ? '稳定地址' : '临时地址'}${st.token ? ' · 准入 token 已启用' : ''}</div>
     <div class="hub-panel-title" style="margin-top:6px">已接入成员（${members.length}）</div>
     ${list}
+    <div class="hub-panel-title" style="margin-top:6px">中继链路（${links.length}，按优先级排序）</div>
+    ${links.map((l) => `<div class="hub-member">${l.alive ? '🟢' : '⚪'} ${esc(l.type)}中继 · ${esc(l.url)}${l.fails ? ` · 断线${l.fails}次` : ''}</div>`).join('')}
     <button class="ghost" id="hubPanelCopy" style="margin-top:6px; padding:4px 10px">复制接入地址</button>`
   const cp = $('hubPanelCopy')
   if (cp) cp.onclick = () => { try { navigator.clipboard.writeText(url) } catch { /* 剪贴板不可用 */ } }
+}
+
+// 已采纳中继链路清单：按排序规则（固定>临时>公共，同类按稳定度）输出类型/状态/统计
+function relayLinksInfo() {
+  const relay = state.net?.relay
+  if (!relay) return []
+  return sortRelayBrokers([...relay.brokerUrls]).map((url) => {
+    const link = relay.links.get(url)
+    const st = relayStats.get(url) || { lastOkAt: 0, fails: 0 }
+    const type = /trycloudflare\.com/.test(url) ? '临时' : (PUBLIC_BROKERS.includes(url) ? '公共' : '固定')
+    return { url, type, alive: !!link?.alive, fails: st.fails, lastOkAt: st.lastOkAt }
+  })
 }
 
 // 待机/恢复检测：每次 tick 记录时间；若相邻 tick 间隔剧增（>30s）说明系统冻结过

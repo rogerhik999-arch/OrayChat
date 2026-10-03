@@ -461,7 +461,10 @@ function createWindow() {
               imgs: [...document.querySelectorAll('img.fx-img')].map(i => ({src: (i.currentSrc || i.src || '').slice(0, 40), complete: i.complete, nw: i.naturalWidth, broken: i.complete && i.naturalWidth === 0})),
               cards: [...document.querySelectorAll('.fx-card')].map(c => c.textContent.trim().slice(0, 80)),
               progress: [...document.querySelectorAll('.fx-progress')].map(p => ({ pct: p.querySelector('.fx-fill')?.style.width, text: p.textContent.trim().slice(0, 80) })),
-              imgPh: [...document.querySelectorAll('.fx-img-ph')].map(p => p.textContent.trim().slice(0, 80))
+              imgPh: [...document.querySelectorAll('.fx-img-ph')].map(p => p.textContent.trim().slice(0, 80)),
+              hubPill: document.getElementById('hubPill')?.textContent || null,
+              hubPanel: (document.getElementById('hubPanel')?.textContent || '').slice(0, 160),
+              hubBadges: document.querySelectorAll('.hub-badge').length
             })`
           ).catch((e) => 'eval-err: ' + e.message)
           process.stdout.write(`[dom-dump] ${info}\n`)
