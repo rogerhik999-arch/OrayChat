@@ -6,6 +6,12 @@
   "android": {
     "allowMixedContent": false
   },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "native",
+      "initialViewportFitValueHint": "cover"
+    }
+  },
   "server": {
     "androidScheme": "https"
   }
