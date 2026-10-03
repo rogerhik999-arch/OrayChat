@@ -77,6 +77,7 @@ const revivedRoster = (A().match(/\[BOT\] ROSTER ([^\n]*)/g) || []).pop() || ''
 const recvBack = /RECV from=bob text="我回来了/.test(A())
 const ignoredFinal = (JSON.parse(fs.readFileSync(path.join(userData('alice'), 'local-state.json'), 'utf8'))[`oc-ignored-ids:${ROOM}`] || []).length
 fs.writeFileSync('/tmp/delcontact-live-alice.log', lines.alice.join('\n'))
+fs.writeFileSync('/tmp/delcontact-live-bob.log', lines.bob.join('\n'))
 console.log(`[phase3] bob 回归后：新消息收到=${recvBack ? '✓' : '✗'} 忽略名单大小=${ignoredFinal}（期望 0）`)
 console.log(`[phase3] ${revivedRoster}`)
 

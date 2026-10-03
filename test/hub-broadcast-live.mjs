@@ -56,7 +56,7 @@ function exec(cmd) { return spawn('/bin/zsh', ['-c', cmd], { stdio: 'ignore' }) 
 // T1 alice 开中继（token 启用）；bob/carol 公共链进房
 launch('alice', 'alice', ['--relay-hub', `--hub-port=${PORT}`, `--hub-public-url=${HUB_URL}`, '--roster-log', '--auto-reply'])
 await sleep(2500)
-launch('bob', 'bob', ['--roster-log', '--auto-reply', '--no-exit', '--send-to=alice', '--text=经私有链', '--count=2', '--dom-dump', `--shot=${shot}`, '--shot-delay-ms=45000', '--exit-after-shot'])
+launch('bob', 'bob', ['--roster-log', '--auto-reply', '--no-exit', '--send-to=alice', '--text=经私有链', '--count=2', '--dom-dump', `--shot=${shot}`, '--shot-when=!!document.querySelector(".hub-badge")', '--shot-when-timeout-ms=90000', '--exit-after-shot'])
 launch('carol', 'carol', ['--roster-log', '--auto-reply'])
 
 // T2 bob 自动采纳：日志出现并入（带准入凭据）
@@ -107,9 +107,10 @@ let tokenDeny = false, tokenAllow = false
 }
 
 // T7 📡 标识 DOM（alice 存活时 bob 视图中 alice 条目的徽标；必须在 T6 杀 alice 之前）
+// 截图是状态驱动（徽标一出现即拍）；等待窗给足 90s 覆盖 shot-when 的兜底超时
 {
   const t0 = Date.now()
-  while (Date.now() - t0 < 30000 && !fs.existsSync(shot)) await sleep(2000)
+  while (Date.now() - t0 < 90000 && !fs.existsSync(shot)) await sleep(2000)
 }
 await killProfile('bob')
 
@@ -148,6 +149,10 @@ console.log(`  T7 📡 标识 DOM（成员条目）: ${t7 ? '✓' : '✗'}`)
 
 const ok = adopted && hubFirst && tokenDeny && tokenAllow && echoOk && fallback && t7
 if (!ok) {
+  for (const k of ['alice', 'bob', 'carol']) {
+    try { fs.writeFileSync(`/tmp/hub-broadcast-${k}.log`, lines[k].join('\n')) } catch {}
+  }
+  console.log('\n== 全量日志已落盘 /tmp/hub-broadcast-{alice,bob,carol}.log ==')
   console.log('\n== 失败诊断：bob 消息行 ==')
   console.log(lines.bob.filter((l) => l.includes('并入') || l.includes('已接入') || l.includes('ECHO') || l.includes('SENT') || l.includes('RECV') || l.includes('READY')).slice(-14).join('\n') || '（无）')
   console.log('\n== 失败诊断：alice 的 HUB/采纳行 ==')
