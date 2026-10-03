@@ -489,6 +489,7 @@ export class ChatNet {
     // 条目永生为「协商中（第 N 次尝试）」（v1.22.2 用户实测 xfold6 依旧）。
     // 对端活性只由对端真实到达的帧（onHandshakeFrame/presence）证明。
     if (!peer.lastProgress) peer.lastProgress = Date.now()
+    peer.cycleStartAt = Date.now() // 本轮握手起点：配合 hsInboundAt 判定"整周期零入站"
     if (this.iAmInitiator(peerId)) {
       // 会话恢复：对该身份持有票据且启用时，hs1 附带 epoch 证明（对端不认则自动回退全握手）
       const ticket = this.sessionResume && peer.idPubHex ? this.resumable.get(peer.idPubHex) : null
@@ -550,6 +551,21 @@ export class ChatNet {
   handleHandshakeTimeout(peerId) {
     const peer = this.peers.get(peerId)
     if (!peer) return
+    // 静默链路自愈：整轮握手零入站帧（入站时间戳早于本轮起点）连续 ≥2 轮 →
+    // 中继链路疑似半开（NAT 超时后发送看似成功、入站全死，移动网络常见）→
+    // 强制重建全部中继链路（60s 限频）。若是验证拒绝会收到 hs-err（入站），
+    // 不会走到这里——此路径专治"对端在线信号时有时无、hs1 石沉大海"
+    if (peer.state === 'handshaking' && !(peer.hsInboundAt >= peer.cycleStartAt)) {
+      peer.silentCycles = (peer.silentCycles || 0) + 1
+      if (peer.silentCycles >= 2 && this.relay?.connected && Date.now() - (this._lastRelayForceAt || 0) > 60000) {
+        this._lastRelayForceAt = Date.now()
+        this.hooks.onLog?.(`握手连续 ${peer.silentCycles} 轮零入站（${peerId.slice(0, 8)}…）：疑似半开链路，强制重建中继`, 'warn')
+        try { this.relay.forceReconnect() } catch { /* 忽略 */ }
+        peer.silentCycles = 0
+      }
+    } else if (peer.hsInboundAt >= peer.cycleStartAt) {
+      peer.silentCycles = 0
+    }
     if (peer.via === 'p2p' && !this.opts.forceRelay && this.relay?.connected) {
       this.hooks.onLog?.(`P2P 握手超时，切换到 MQTT 中继回退 (${peerId.slice(0, 8)}…)`, 'warn')
       this.restartHandshake(peerId, 'mqtt')
@@ -609,11 +625,13 @@ export class ChatNet {
     if (msg?.t === 'OC-HS-ERR-v1') {
       if (peer.state === 'handshaking') {
         this.clearRetransmit(peer) // 拒绝通常持续存在（格式/版本不兼容），停掉 3s 重发；周期超时仍会按退避重启
+        peer.hsInboundAt = Date.now()
         peer.hsLastEvt = { t: `←拒(${String(msg.err || '未知').slice(0, 60)})`, at: Date.now() }
         this.hooks.onLog?.(`对端拒绝握手 (${peerId.slice(0, 8)}…): ${msg.err || '未知'}`, 'warn')
       }
       return
     }
+    peer.hsInboundAt = Date.now()
     peer.hsLastEvt = { t: `←${hsShort(msg?.t)}`, at: Date.now() }
     try {
       if (msg.t === 'OC-HS1-v1') {
@@ -690,8 +708,10 @@ export class ChatNet {
       // 上方的 OC-HS-ERR 早退分支，不会形成回环）
       if (msg?.t === 'OC-HS1-v1' && !this.iAmInitiator(peerId)) {
         try { this.sendHs(peerId, { t: 'OC-HS-ERR-v1', about: 'hs1', err: String(e?.message || e).slice(0, 80) }) } catch { /* 尽力而为 */ }
+        peer.hsInboundAt = Date.now()
         peer.hsLastEvt = { t: `←hs1(拒：${String(e?.message || e).slice(0, 40)})→已回执`, at: Date.now() }
       } else {
+        peer.hsInboundAt = Date.now()
         peer.hsLastEvt = { t: `←${hsShort(msg?.t)}(校验失败)`, at: Date.now() }
       }
       const st = peer.state === 'ready' ? '会话保持' : '等待超时裁决'
@@ -708,6 +728,7 @@ export class ChatNet {
     peer.suspectAt = 0
     peer.hsFails = 0
     peer.hsCycles = 0 // 握手完成：连续失败轮次与退避一并归零
+    peer.silentCycles = 0
     peer.lastHsRetryAt = 0
     peer.idPubHex = oc.hex(peer.ctx.peerIdPub)
     // 传输改绑：发送中的事务绑定的是旧 peerId——对端重启后以同身份、新 peerId
