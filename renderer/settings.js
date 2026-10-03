@@ -144,8 +144,7 @@ if (window.settings.hubStart) {
     $('hubStep4Btn').disabled = !st?.certReady
   }
   function hubRenderDom(st) {
-    window.__hubSnap = st // 测试按钮/复制按钮取运行时快照
-    // 日志渲染是公共尾部：named 分支曾用提前返回把它短路（v1.24.4 日志"消失"）
+    window.__hubSnap = st
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
     $('hubStopBtn').disabled = !st?.running
@@ -156,8 +155,15 @@ if (window.settings.hubStart) {
       : '（暂无）'
     const el = $('hubMembers')
     if (el) el.textContent = `已接入成员（${members.length}）：${memberText}`
+    // 公网暴露状态（明确三分：未暴露 / 快速隧道 / 稳定地址）
+    const expose = $('hubExposeState')
+    if (expose) {
+      if (!st?.running) { expose.textContent = '中继未运行'; expose.style.color = 'var(--tx2)' }
+      else if (st.mode === 'named' && st.tunnelUrl) { expose.textContent = `🟢 已暴露（稳定地址 ${st.tunnelUrl}${st.registered ? '，边缘已连接' : '，边缘连接中'}）`; expose.style.color = 'var(--ok)' }
+      else if (st.tunnelUrl) { expose.textContent = `🟢 已暴露（快速隧道 ${st.tunnelUrl}，重启后地址会变）`; expose.style.color = 'var(--ok)' }
+      else { expose.textContent = '🔴 未暴露公网——仅本机可用，远程成员无法接入（点右侧按钮一键暴露）'; expose.style.color = '#e05555' }
+    }
     if (st?.running && st?.mode === 'named') {
-      // registered = 已在边缘注册（真实可服务）；tunnelProc 只代表进程在跑
       $('hubState').textContent = `状态：运行中（本机端口 ${st?.port || '—'}）· ${st.registered ? '✓ 已连接 Cloudflare 边缘' : '⏳ 正在连接边缘…'} · 链路 ${st?.clients ?? 0}`
     } else {
       const state = st?.running ? '运行中' : '未运行'
@@ -166,12 +172,8 @@ if (window.settings.hubStart) {
     }
     const tEl = $('hubTokenView')
     if (tEl) tEl.textContent = st?.token || '—'
-    const state = st?.running ? '运行中' : '未运行'
-    const tunnel = st?.tunnelUrl ? ` · ${st.tunnelUrl}` : (st?.tunnelProc ? ' · 隧道建立中…' : '')
-    $('hubState').textContent = `状态：${state}（本机端口 ${st?.port || '—'}${tunnel}）· 链路 ${st?.clients ?? 0}`
   }
-  // 先从持久化配置回填（重启后向导字段暂存恢复；load() 异步未必先到，自行拉取），
-  // 再叠加运行时状态
+  // 先从持久化配置回填（重启后向导字段暂存恢复；load() 异步未必先到，自行拉取）
   const restoreSaved = (savedHub = {}) => {
     if (savedHub.port) $('hubPort').value = String(savedHub.port)
     if (savedHub.name) $('hubTunnelName').value = savedHub.name
@@ -209,7 +211,7 @@ if (window.settings.hubStart) {
     persist()
     window.settings.hubStatus().then(hubRender)
   }
-  // —— 稳定地址向导四步 ——
+  // 稳定地址向导四步
   $('hubStep1Btn').onclick = async () => {
     toast('正在打开浏览器授权…')
     const r = await window.settings.hubLogin()
@@ -255,7 +257,6 @@ if (window.settings.hubStart) {
     const btn = $('hubTestBtn')
     const pub = $('hubPublicUrl').value.trim()
     const st = window.__hubSnap
-    // 目标优先级：对外地址（完整公网链路：边缘→隧道→本机）> 运行中隧道地址 > 本机回环（只验中继本体）
     const target = pub || st?.tunnelUrl || (st?.running ? `ws://127.0.0.1:${st.port}/mqtt` : '')
     if (!target) { $('hubTestResult').textContent = '测试结果：✗ 无可用地址（先启动中继或填对外地址）'; return }
     btn.disabled = true

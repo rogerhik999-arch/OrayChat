@@ -1925,7 +1925,7 @@ function renderHubPill(st) {
   let reg
   if (st.mode === 'named') reg = st.registered ? '✓ 已连边缘' : '⏳ 连接中'
   else if (st.tunnelUrl) reg = '✓ 隧道就绪'
-  else reg = '未暴露公网'
+  else reg = '本机模式（未暴露公网）'
   pill.textContent = `📡 私有中继 · ${reg} · 链路 ${st.clients ?? 0}`
   const members = st.memberList || []
   const list = members.length
