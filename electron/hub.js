@@ -389,6 +389,21 @@ function verify(target) {
   })
 }
 
+// 只关闭公网隧道（快速/命名），中继本体继续运行（仅本机/回环可用）。
+// 先置 mode='off' 阻断命名隧道的自动重启，再杀进程
+function stopTunnel() {
+  state.mode = 'off'
+  let stopped = false
+  if (state.tunnelProc) { try { state.tunnelProc.kill('SIGTERM') } catch { /* 已死 */ } state.tunnelProc = null; stopped = true }
+  if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null; state.namedRestarts = 0; stopped = true }
+  if (stopped) {
+    state.tunnelUrl = ''
+    log('公网隧道已关闭（中继本体继续运行，仅本机/回环可用）')
+    state.emitter?.emit('event', { type: 'tunnel', url: '' })
+  }
+  return { ok: true, stopped, ...snapshot() }
+}
+
 function stopNamed() {
   if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null }
   state.namedRestarts = 0
@@ -421,6 +436,6 @@ function snapshot() {
 function setNames(map) { state.names = map || {} }
 
 module.exports = {
-  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed, verify, setNames,
+  start, stop, snapshot, log, loginTunnel, createTunnel, routeDns, stopNamed, verify, setNames, stopTunnel,
   set emitter(v) { state.emitter = v },
 }

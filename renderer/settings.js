@@ -148,6 +148,12 @@ if (window.settings.hubStart) {
     $('hubLog').textContent = (st?.log || []).join('\n')
     $('hubTunnelBtn').disabled = !st?.running
     $('hubStopBtn').disabled = !st?.running
+    // 公网暴露 开/关 互斥：隧道进程在跑 → 显示「关闭公网暴露」
+    const tunnelOn = !!(st?.tunnelProc || (st?.mode === 'named' && st?.tunnelUrl))
+    const openBtn = $('hubTunnelBtn'), closeBtn = $('hubTunnelStopBtn')
+    if (openBtn) openBtn.style.display = tunnelOn ? 'none' : ''
+    if (closeBtn) closeBtn.style.display = tunnelOn ? '' : 'none'
+    if (closeBtn) closeBtn.disabled = !st?.running
     // 已接入成员（按身份指纹聚合；名字由主窗口推送映射，未知显示指纹前 8 位）
     const members = st?.memberList || []
     const memberText = members.length
@@ -210,6 +216,14 @@ if (window.settings.hubStart) {
     if (!r.ok) toast(`启动失败：${r.err}`)
     persist()
     window.settings.hubStatus().then(hubRender)
+  }
+  $('hubTunnelStopBtn').onclick = async () => {
+    toast('正在关闭公网暴露…')
+    await window.settings.hubStopTunnel()
+    window.__hubMode = 'off'
+    persist()
+    window.settings.hubStatus().then(hubRender)
+    toast('已关闭公网暴露（中继本体继续运行）')
   }
   // 稳定地址向导四步
   $('hubStep1Btn').onclick = async () => {

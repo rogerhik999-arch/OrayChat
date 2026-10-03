@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('settings', {
   hubCreateTunnel: (name) => ipcRenderer.invoke('hub:create-tunnel', name),
   hubRouteDns: (name, hostname) => ipcRenderer.invoke('hub:route-dns', name, hostname),
   hubStartNamed: (cfg) => ipcRenderer.invoke('hub:start-named', cfg),
+  hubStopTunnel: () => ipcRenderer.invoke('hub:tunnel-stop'),
   hubVerify: (target) => ipcRenderer.invoke('hub:verify', target),
   // 安全码列表：从主窗口身份推导需要 crypto——简化为展示身份列表 + 指纹由主窗口页面呈现
 })
