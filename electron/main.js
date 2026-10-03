@@ -465,7 +465,10 @@ function createWindow() {
               imgPh: [...document.querySelectorAll('.fx-img-ph')].map(p => p.textContent.trim().slice(0, 80)),
               hubPill: document.getElementById('hubPill')?.textContent || null,
               hubPanel: (document.getElementById('hubPanel')?.textContent || '').slice(0, 160),
-              hubBadges: document.querySelectorAll('.hub-badge').length
+              hubBadges: document.querySelectorAll('.hub-badge').length,
+              roster: [...document.querySelectorAll('#peerList .peer-item')].map(el => (el.querySelector('.p-name')?.textContent || '').trim().slice(0, 40)),
+              peerCount: document.getElementById('peerCount')?.textContent || null,
+              title: document.title
             })`
           ).catch((e) => 'eval-err: ' + e.message)
           process.stdout.write(`[dom-dump] ${info}\n`)

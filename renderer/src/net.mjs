@@ -36,6 +36,11 @@ const HS_FAIL_COOLDOWN_MS = 10 * 60000
 const RELAY_VIEW_WARMUP_MS = 75000 // 我方中继刚连上时视野不完整：预热期内不回收
 const REAP_COOLDOWN_MS = 5 * 60 * 1000 // 刚回收的 peerId 期间不再被摘要复种
 
+// 握手帧类型短名（OC-HS1-v1 → hs1）：条目上的"停在 →hs1 12s 前"阶段诊断用——
+// 长期协商中的条目由此可分辨"反复发 hs1 无回应（对端收不到/不处理）"与
+// "hs2 已到但校验失败（版本/状态不兼容）"两类完全不同的病因
+const hsShort = (t) => String(t || '?').replace('OC-HS', '').replace('-v1', '').toLowerCase()
+
 // 免费公共基础设施默认清单（可在 userData/oraychat-config.json 覆盖）
 export const DEFAULT_CONFIG = {
   // STUN：Google / Cloudflare / 小米（打洞用）
@@ -576,6 +581,7 @@ export class ChatNet {
   async sendHs(peerId, msg) {
     const peer = this.peers.get(peerId)
     if (!peer) return
+    peer.hsLastEvt = { t: `→${hsShort(msg?.t)}`, at: Date.now() }
     try {
       if (peer.via === 'mqtt') this.relay.send(peerId, 'hs', msg)
       else await this.hsAction?.send(msg, { target: peerId })
@@ -593,6 +599,7 @@ export class ChatNet {
     if (peer.lockVia === 'mqtt' && via === 'p2p' && peer.state !== 'ready') return // goOnline 恢复期：p2p 帧不可信
     if (!this.acceptsVia(peer, via)) return
     peer.lastProgress = Date.now() // 握手有来有回 = 双方都活着（reapGhosts 不回收）
+    peer.hsLastEvt = { t: `←${hsShort(msg?.t)}`, at: Date.now() }
     try {
       if (msg.t === 'OC-HS1-v1') {
         if (this.iAmInitiator(peerId)) return // 双方角色规则一致，不应收到 hs1；忽略竞态帧
@@ -664,6 +671,7 @@ export class ChatNet {
       // （传输抖动换路时必有在途旧帧），也可能只是重复帧。failHandshake 在这里会
       // 误杀已经 ready 的活会话（v1.21.5 实测：DM 发送循环被炸、删除传播停摆）。
       // 握手成败只由 hsTimer 超时裁决，这里一律警告并保持现状。
+      peer.hsLastEvt = { t: `←${hsShort(msg?.t)}(校验失败)`, at: Date.now() }
       const st = peer.state === 'ready' ? '会话保持' : '等待超时裁决'
       this.hooks.onLog?.(`忽略无效握手帧 (${peerId.slice(0, 8)}…, ${st}): ${e?.message || e}`, 'warn')
     }

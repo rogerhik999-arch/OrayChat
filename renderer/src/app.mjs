@@ -368,7 +368,10 @@ function buildRoster() {
   }
   // 已归并的旧身份（重装换密钥 → 别名指向当前身份）不再单列：
   // 其记录已合并显示在当前身份的会话里；当前另有就绪会话的除外（同名活设备）
-  for (const [id] of [...seen.keys()]) {
+  // ⚠️ 必须遍历键本身：写成 for (const [id] of [...keys]) 是对字符串解构，
+  // id 只会拿到首字符，resolveId(首字符)===首字符 恒不删除——别名建立后名录
+  // 却从不掉旧条目（v1.15.0 起潜伏，用户"历史联系人残身总在"的根因）
+  for (const id of [...seen.keys()]) {
     if (state.net && state.net.resolveId(id) !== id && !state.net.hasReadySession(id)) seen.delete(id)
   }
   // 附加在线状态与显示名兜底
@@ -388,6 +391,31 @@ function buildRoster() {
   return [...seen.entries()]
     .map(([id, info]) => ({ id, ...info }))
     .sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name))
+}
+
+// 同名历史身份组（仅展示层合并）：手机重装换钥后，names 表里同一昵称会积累
+// 多个旧身份（用户截图 xfold6×2 / 3070 新旧并存）——离线区合成一行、时间线
+// 读时合并，消除"残身"观感。不动别名表与握手信任：别名/同名接管在握手就绪
+// 时照常生效，届时旧身份自然退出本组；有会话条目的同名身份（两台活设备）不并入
+function nameGroupIds(pub) {
+  const name = state.names.get(pub)
+  if (!name) return [pub]
+  const ids = []
+  for (const [id, n] of state.names) {
+    if (n !== name || id === state.myIdPubHex || state.ignoredIds.has(id)) continue
+    if (onlinePeerIdByPub(id)) continue
+    ids.push(id)
+  }
+  return ids.length ? ids : [pub]
+}
+
+// 组内全部身份的合并读桶（别名桶 ∪ 同名组各身份的桶，去重）
+function groupBucketKeys(pub) {
+  const keys = new Set()
+  for (const id of nameGroupIds(pub)) {
+    for (const k of state.net.dmMergedBucketKeys(id)) keys.add(k)
+  }
+  return [...keys]
 }
 
 // ---------- 渲染 ----------
@@ -411,7 +439,10 @@ function renderPeers() {
   list.appendChild(lobby)
 
   for (const [peerId, p] of peers) {
+    // 单行渲染失败只跳过该行——否则循环中断后 peerCount（循环之后才赋值）保持
+    // 旧值而列表只剩前几行，出现"计数 5 实际 3 行"的自相矛盾界面
     const li = document.createElement('li')
+    try {
     li.className = 'peer-item' + (state.view.conv === 'dm' && state.view.peerId === peerId ? ' active' : '')
     const name = p.name || `${peerId.slice(0, 8)}…`
     let stateText = {
@@ -430,6 +461,16 @@ function renderPeers() {
         stateText += ago <= 90 ? ` · 对端 ${ago}s 前有在线信号` : ' · 对端无在线信号，即将清理'
       }
     }
+    // 握手阶段诊断：长期协商中/反复失败时看出卡在哪个阶段——
+    // "停在 →hs1 12s 前"= 反复发 hs1 对端一直无回应（收不到或不处理，多为
+    // 对端版本过旧/坏包，更新对端即愈）；"停在 ←hs2(校验失败)"= 有回应但不兼容
+    if (p.state === 'handshaking' || p.state === 'failed') {
+      const evt = p.hsLastEvt
+      if (evt) {
+        const ago = Math.max(0, Math.round((Date.now() - evt.at) / 1000))
+        stateText += ` · 停在 ${ago <= 3 ? evt.t : `${evt.t} ${ago}s 前`}`
+      }
+    }
     if (p.state === 'ready' && p.suspect) stateText += ' · 疑似离线，确认中…'
     if (p.state === 'ready' && p.hubPub) stateText += ` · 📡 私有中继${p.hubInfo?.mode === 'named' ? '（稳定）' : p.hubInfo?.mode === 'quick' ? '（临时）' : ''}`
     if (p.state === 'ready' && p.lastSeen) {
@@ -445,26 +486,38 @@ function renderPeers() {
         <div class="p-state"><span class="dot ${dotCls}"></span>${esc(stateText)}</div>
       </div>`
     li.onclick = () => selectView({ conv: 'dm', peerId })
+    } catch (e) {
+      // 占位行：行数与计数保持一致，且异常可见而非无声黑洞
+      li.className = 'peer-item'
+      li.innerHTML = `<div class="p-info"><div class="p-name">${esc(p.name || peerId.slice(0, 8))}</div><div class="p-state">渲染异常：${esc(String(e?.message || e))}</div></div>`
+    }
     list.appendChild(li)
   }
 
-  // 历史联系人（房间出现过的所有人，离线可点开看聊天记录）
+  // 历史联系人（房间出现过的所有人，离线可点开看聊天记录）；同名身份合并一行
   const roster = buildRoster().filter((r) => !r.online)
-  if (roster.length) {
+  const byName = new Map()
+  for (const r of roster) {
+    if (!byName.has(r.name)) byName.set(r.name, [])
+    byName.get(r.name).push(r)
+  }
+  if (byName.size) {
     const head = document.createElement('li')
     head.className = 'roster-head'
-    head.textContent = `历史联系人 ${roster.length}`
+    head.textContent = `历史联系人 ${byName.size}`
     list.appendChild(head)
-    for (const r of roster) {
+    for (const [name, g] of byName) {
+      // 组代表取最近学到的身份（重装后的新钥最可能在 names 表尾部）
+      const primary = g[g.length - 1]
       const li = document.createElement('li')
-      li.className = 'peer-item offline' + (state.view.conv === 'dm' && state.view.peerId === r.peerId ? ' active' : '')
+      li.className = 'peer-item offline'
       li.innerHTML = `
-        <div class="avatar" style="background:${avatarColor(r.id)}; opacity:.55">${esc(r.name.slice(0, 1).toUpperCase())}</div>
+        <div class="avatar" style="background:${avatarColor(primary.id)}; opacity:.55">${esc(name.slice(0, 1).toUpperCase())}</div>
         <div class="p-info">
-          <div class="p-name">${esc(r.name)}${unreadBadge(dmConvKey(state.myIdPubHex, r.id))}</div>
-          <div class="p-state"><span class="dot off"></span>离线 · 点开查看聊天记录</div>
+          <div class="p-name">${esc(name)}${unreadBadge(dmConvKey(state.myIdPubHex, primary.id))}</div>
+          <div class="p-state"><span class="dot off"></span>离线 · 点开查看聊天记录${g.length > 1 ? ` · ${g.length} 个历史身份（重装换钥已合并显示）` : ''}</div>
         </div>`
-      li.onclick = () => selectView({ conv: 'dm-offline', idPubHex: r.id, name: r.name })
+      li.onclick = () => selectView({ conv: 'dm-offline', idPubHex: primary.id, name })
       list.appendChild(li)
     }
   }
@@ -555,9 +608,18 @@ function viewMessages() {
   if (v.conv === 'lobby') return state.net.store.visible('lobby')
   const pub = v.conv === 'dm-offline' ? v.idPubHex : state.net.peers.get(v.peerId)?.idPubHex
   if (!pub) return []
+  // dm-offline 视图读同名历史身份组的全部桶（重装换钥的旧记录一并显示）；
+  // 在线会话维持原别名合并（组函数对会话中的身份自然退化为单身份）
+  const keys = v.conv === 'dm-offline' ? groupBucketKeys(pub) : state.net.dmMergedBucketKeys(pub)
   const merged = []
-  for (const k of state.net.dmMergedBucketKeys(pub)) {
-    if (state.net.store.convs.has(k)) merged.push(...state.net.store.visible(k))
+  const seenMids = new Set()
+  for (const k of keys) {
+    if (!state.net.store.convs.has(k)) continue
+    for (const e of state.net.store.visible(k)) {
+      if (seenMids.has(e.mid)) continue
+      seenMids.add(e.mid)
+      merged.push(e)
+    }
   }
   merged.sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1))
   return merged
@@ -982,12 +1044,17 @@ function confirmThenDeleteContact(idPubHex, name) {
 
 function doDeleteContact(idPubHex, name) {
   const who = name || `${idPubHex.slice(0, 8)}…`
-  for (const k of state.net.dmMergedBucketKeys(idPubHex)) state.net.store.dropConv(k)
-  if (state.names.delete(idPubHex)) window.oray.kvSet(`oc-names:${state.room}`, Object.fromEntries(state.names)).catch(() => {})
-  state.ignoredIds.add(idPubHex)
+  // 同名历史身份组一并删除（用户删的是"这个人"，不是某一个旧钥）
+  const ids = nameGroupIds(idPubHex)
+  for (const id of ids) {
+    for (const k of state.net.dmMergedBucketKeys(id)) state.net.store.dropConv(k)
+    state.names.delete(id)
+    state.ignoredIds.add(id)
+    clearUnread(dmConvKey(state.myIdPubHex, id))
+  }
+  window.oray.kvSet(`oc-names:${state.room}`, Object.fromEntries(state.names)).catch(() => {})
   persistIgnoredIds()
-  clearUnread(dmConvKey(state.myIdPubHex, idPubHex))
-  appendSys(`已删除联系人 ${who}：本机私聊记录一并清除；对方上线互联会重新出现在在线列表`)
+  appendSys(`已删除联系人 ${who}${ids.length > 1 ? `（含 ${ids.length} 个历史身份）` : ''}：本机私聊记录一并清除；对方上线互联会重新出现在在线列表`)
   if (state.args.bot) {
     window.oray.botLog(`[BOT] CONTACT-DELETED pub=${idPubHex}`)
     window.oray.botLog(`[BOT] ROSTER ${buildRoster().map((r) => r.id.slice(0, 8)).join(',') || '(empty)'}`)
@@ -1002,7 +1069,7 @@ async function confirmThenClear() {
     if (state.view.conv === 'dm-offline') {
       appendSys('对方离线，本机记录将在下次同步时按删除标记收敛')
       const t = Date.now()
-      for (const k of state.net.dmMergedBucketKeys(state.view.idPubHex)) await state.net.store.applyClear(k, t)
+      for (const k of groupBucketKeys(state.view.idPubHex)) await state.net.store.applyClear(k, t)
       renderMessages()
       return
     }
@@ -1779,6 +1846,25 @@ async function main() {
         const line = `online=[${online.join(',')}] history=[${hist.join(',')}]`
         if (line !== last) { last = line; window.oray.botLog(`[BOT] ROSTER ${line}`) }
       }, 5000)
+    }
+    if (state.args.bot) {
+      // 实机测试的内部状态探针（shot-when 条件里可读）：名录/名字表/别名表
+      window.__ocDebug = {
+        get names() { return [...state.names].map(([k, v]) => `${k.slice(0, 8)}=${v}`) },
+        get aliases() { return [...(state.net?.idAliases || [])].map(([k, v]) => `${k.slice(0, 8)}→${v.slice(0, 8)}`) },
+        get roster() { return buildRoster().map((r) => ({ id: r.id.slice(0, 8), name: r.name, online: !!r.online })) },
+        get myId() { return state.myIdPubHex?.slice(0, 8) },
+        get resolve() {
+          const net = state.net
+          if (!net) return null
+          const probe = {}
+          for (const id of state.names.keys()) {
+            if (id === state.myIdPubHex) continue
+            probe[id.slice(0, 8)] = `${net.resolveId(id).slice(0, 8)}/ready=${net.hasReadySession(id)}`
+          }
+          return probe
+        },
+      }
     }
     if (state.args['save-latest'] !== undefined && state.args['save-latest'] !== false) {
       // 下载验证：轮询收到的 file/image/voice 条目，逐个 fxSave；未完成（not-found）
