@@ -67,6 +67,7 @@ export class RelayTransport {
     // 退避永远 3s，长跑中无限高频重连轰炸公共 broker（限流后越试越连不上）
     this.linkAttempts = new Map() // url -> 连续失败次数（CONNACK 成功清零）
     this.seenTx = new Map() // txid -> ts（多链路重复帧去重）
+    this.lastInboundAt = Date.now() // 最近一次任何入站帧（net 层看门狗判据）
     // 并联数不超过 broker 数
     this.parallelN = Math.max(1, Math.min(parallel || DEFAULT_PARALLEL, this.brokerUrls.length))
     for (let i = 0; i < this.parallelN; i++) this.spawnLink(this.brokerUrls[i])
@@ -99,6 +100,12 @@ export class RelayTransport {
     }
   }
 
+  // per-(成员,broker) 稳定 clientId：djb2 哈希前 6 位 base36。同一 URL 恒同值
+  //（persistent session 生效的前提），不同 URL 互异（并联链路防互踢）
+  static stableClientId(base, url) {
+    return `${base}-${Array.from(new TextEncoder().encode(url)).reduce((a, b) => (a * 33 + b) >>> 0, 5381).toString(36).slice(0, 6)}`
+  }
+
   aliveLinks() { return [...this.links.values()].filter((l) => l.alive) }
 
   spawnLink(url, retry) {
@@ -107,18 +114,23 @@ export class RelayTransport {
     const { presence, inbox } = RelayTransport.topics(this.appId, this.roomId)
     let client
     try {
-      // clientId 带身份公钥指纹：私有中继（hub）据此显示「谁」接入了中继
-      //（oc-<pub8>-<rand>；rand 保证同一成员多条并联链路不被 broker 互踢）
-      const clientId = this.clientIdBase
-        ? `${this.clientIdBase}-${Math.random().toString(36).slice(2, 6)}`
-        : undefined
+      // clientId = oc-<身份指纹8>-<broker地址哈希6>：per-(成员,broker) 稳定——
+      // ①私有中继据此显示「谁」接入；②同一成员多条并联链路 clientId 互不相同
+      //（不同 URL 哈希不同）不被 broker 互踢；③稳定 clientId + clean:false =
+      // MQTT persistent session，断线窗口内发给我们的 QoS1 帧（sync/del/clear）
+      // 由 broker 排队补发（P0-③）。⚠️ 旧版随机后缀会让 broker 每次重连视为
+      // 新会话：排队失效 + clean:false 下泄漏旧 session
+      const clientId = this.clientIdBase ? RelayTransport.stableClientId(this.clientIdBase, url) : undefined
       const creds = this.credentials.get(url)
       client = mqtt.connect(url, {
         reconnectPeriod: 0, connectTimeout: 8000, keepalive: 30, clientId,
+        // persistent session 需要 clientId（mqtt.js 对 clean:false+无 clientId 直接抛
+        // "Missing clientId for unclean clients"）——匿名实例（无身份指纹，测试用）保持 clean
+        clean: !clientId,
         username: creds?.username, password: creds?.password, // 私有中继 token 准入
       })
 
-    } catch { this.scheduleLinkRetry(url, retry); return }
+    } catch (e) { this.safeLog(`中继连接创建失败 ${url}: ${e?.message || e}`, 'warn'); this.scheduleLinkRetry(url, retry); return }
     const link = { client, alive: false, attempts: 0, lastInboundAt: Date.now(), probeSentAt: 0 }
     this.links.set(url, link)
     client.on('connect', () => {
@@ -189,6 +201,7 @@ export class RelayTransport {
   }
 
   onMessage(topic, payload) {
+    this.lastInboundAt = Date.now() // 任何入站帧都算（看门狗判据：只认真实到达，不读内部状态）
     // 有口令的房间：帧整体加密，口令不符（解密失败）即丢弃 —— 无口令者无法注入有效帧
     let msg
     try { msg = oc.openRoom(this.roomKey, JSON.parse(payload.toString())) } catch { return }

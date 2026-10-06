@@ -28,6 +28,7 @@ const PRESENCE_HEARTBEAT_MS = 15000
 // peerId 回来，旧条目若死亡路径未触发（崩溃时 WebRTC 没有 leave 事件、
 // p2p 会话不走 onRelayGone）会永远挂在在线列表里。回收判据见 reapGhosts。
 const REAP_INTERVAL_MS = 15000
+const WATCHDOG_SILENT_MS = 5 * 60 * 1000 // 看门狗阈值：就绪会话存在时，5 分钟零入站=链路认知已坏（对端 presence 周期 ≤90s TTL，回收器 2min 内会清掉真消失者，不会误触发）
 const GHOST_GRACE_MS = 90000 // 已建立会话：视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
 const GHOST_FAST_MS = 30000 // 未就绪条目（建联中/握手失败）：无进展 30s 即回收——握手超时才 15s，两倍足矣
 const GHOST_MAX_LIFETIME_MS = 90000 // 未就绪条目总寿命硬上限：无论任何内部续命，bornAt 起 90s 必回收
@@ -143,6 +144,10 @@ export class ChatNet {
     this.antiEntropyTimer = setInterval(() => this.runAntiEntropy(), ANTI_ENTROPY_MS + Math.floor(Math.random() * 30000))
     // 消息级 ACK 簿记：'peerId:seq' -> {envelope, via, tries, timer}
     this.pendingAcks = new Map()
+    // P0-② 同步游标（仅内存）：convKey -> 已确认发送到的最大 t；syncFullAt -> 上次
+    // 全量时间。重启清零=首连全量（封顶），运行期增量
+    this.syncCursors = new Map()
+    this.syncFullAt = new Map()
     // 会话恢复票据（仅内存）：peerIdPubHex -> {key, epoch, sendSeq, recvSeqMax}
     this.resumable = new Map()
     this.sessionResume = opts.sessionResume !== false // 默认启用（设置页可关）
@@ -153,6 +158,13 @@ export class ChatNet {
     this.relayStableSince = 0
     this._relayWasConn = false
     this.reapTimer = setInterval(() => this.reapGhosts(), REAP_INTERVAL_MS)
+    // 全局看门狗（P0-①，docs/longrun-sync-research.md）：自愈机制的下限保证。
+    // 各组件（probe/silent-cycle/goOnline）各管一段且共享同一套链路认知——认知
+    // 本身坏掉时全部失效，"必须重启才激活"的唯一出口。判据只依赖外部观测：
+    // 中继链路自称存活 + 存在就绪会话（就绪对端每 10-15s 必有 presence/心跳
+    // 入站）+ 5 分钟零入站帧 → 强制网络复位。传输活跃期挂起（大流量挤占心跳
+    // 属正常延迟，v1.17.2 教训）
+    this.watchdogTimer = setInterval(() => this.watchdogCheck(), 60000)
 
     // ---- MQTT 中继层（始终启用；forceRelay 时它是唯一传输）----
     this.relay = new RelayTransport({
@@ -931,7 +943,11 @@ export class ChatNet {
   async sendCtl(peerId, frame) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') return
-    if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
+    // P0-③ 删除/清空走 QoS1（broker 重传 + persistent session 离线排队）——
+    // 传播类操作丢了没有自然重试路径；帧 txid 去重保证 QoS1 重复投递幂等。
+    // presence 等高频低值 ctl 保持 QoS0（下一条 10s 后就到，排队无意义）
+    const qos = frame?.op === 'del' || frame?.op === 'clear' ? 1 : 0
+    if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame, { qos })
     else await this.ctlAction?.send(frame, { target: peerId })
   }
 
@@ -1042,9 +1058,22 @@ export class ChatNet {
   async pushSync(peerId, wireConv) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') return
-    // 同步载荷封顶：最新 400 条 / 160KB（超出先剥 thumb 再丢最老）。全量帧随
-    // 30 天日志无界增长，一帧数 MB 经 QoS0 发送会饿死同链路心跳（自拥堵掉线）
-    const state = this.store.exportConv(this.storeKey(wireConv, peerId), { entries: 400, bytes: 160 * 1024 })
+    const key = this.storeKey(wireConv, peerId)
+    // P0-② 增量游标同步（docs/longrun-sync-research.md）：常态轮次只发游标之后的
+    // 条目（开销=O(分歧) 而非 O(30天总量)）。首连或距上次全量 >30min 时做封顶全量
+    // （QoS0 丢帧的兜底对账；重启后游标清零自然首连全量）。游标按发送条目最大 t
+    // 推进——丢失帧由 30min 全量周期覆盖（applyState 幂等，重叠无害）
+    const now = Date.now()
+    // 懒初始化：原型驱动的测试实例（Object.create 绕过构造器）没有这些 Map，
+    // 反熵定时器若在测试进程里触发会 TypeError（hsframe.test 曾炸在进程退出前）
+    this.syncCursors ||= new Map()
+    this.syncFullAt ||= new Map()
+    const cur = this.syncCursors.get(key) || 0
+    const full = !cur || now - (this.syncFullAt.get(key) || 0) > 30 * 60000
+    const state = full
+      ? this.store.exportConv(key, { entries: 400, bytes: 160 * 1024 })
+      : this.store.exportSince(key, cur - 60000, { bytes: 160 * 1024 }) // 60s 重叠窗防时钟偏移漏帧
+    if (!full && !state.entries.length && !Object.keys(state.dels).length) return // 无分歧零载荷
     // 附带作者昵称映射：接收端无需与作者直接握手即可解析历史消息的显示名
     const names = {}
     for (const e of state.entries) {
@@ -1053,9 +1082,13 @@ export class ChatNet {
     }
     const frame = { conv: wireConv, state, names }
     try {
-      if (peer.via === 'mqtt') this.relay.send(peerId, 'sync', frame)
+      if (peer.via === 'mqtt') this.relay.send(peerId, 'sync', frame, { qos: 1 }) // P0-③ 关键帧 QoS1
       else await this.syncAction?.send(frame, { target: peerId })
-    } catch (e) { this.hooks.onLog?.(`同步帧发送失败: ${e?.message || e}`, 'warn') }
+    } catch (e) { this.hooks.onLog?.(`同步帧发送失败: ${e?.message || e}`, 'warn'); return }
+    // 发送成功才推进游标；maxT 取条目/墓碑最大值（纯墓碑轮次也推进，避免重复发）
+    const maxT = Math.max(0, ...state.entries.map((e) => e.t || 0), ...Object.values(state.dels).map((t) => t || 0))
+    this.syncCursors.set(key, Math.max(cur, maxT))
+    if (full) this.syncFullAt.set(key, now)
   }
 
   onSyncFrame(peerId, frame, via) {
@@ -1331,6 +1364,29 @@ export class ChatNet {
   //   2) 直连通道也不是 connected。
   // 真直连（中继看不到但 pc connected）与仍在广播 presence 的一律保留。
   // 回收的 peerId 进冷却名单，digest 摘要在冷却期内不再据此复种新条目。
+  // 全局看门狗检查（每 60s；判据见构造器注释）。复位动作走 goOnline（重建中继
+  // → 等连接 → 全部会话按中继重握手，既有 30s 限频），冷却逐次指数升级（连续
+  // 复位说明环境持续劣化，别每 5min 硬砸一次）；任何正常入站会刷新 lastInboundAt
+  // 使下次检查自然通过并把升级计数清零
+  watchdogCheck() {
+    if (this.destroyed) return
+    const relay = this.relay
+    if (!relay?.connected) return
+    if (![...this.peers.values()].some((p) => p.state === 'ready')) return // 空房静默是正常的
+    if (this.filex?.hasActiveTransfer?.()) return // 传输期挂起
+    if (this.goOnlineInflight) return // 复位已在途
+    const silent = Date.now() - (relay.lastInboundAt || 0)
+    if (silent < WATCHDOG_SILENT_MS) {
+      this._wdK = 0
+      return
+    }
+    if (Date.now() < (this._wdCooldownUntil || 0)) return
+    this._wdK = (this._wdK || 0) + 1
+    this._wdCooldownUntil = Date.now() + Math.min(10 * 60000 * 2 ** (this._wdK - 1), 40 * 60000)
+    this.hooks.onLog?.(`看门狗：链路自称存活但 ${Math.round(silent / 60000)} 分钟零入站（就绪会话 ${[...this.peers.values()].filter((p) => p.state === 'ready').length} 个）——强制网络复位（第 ${this._wdK} 次）`, 'warn')
+    try { this.goOnline('看门狗：链路静默强制复位') } catch { /* 复位失败等下轮冷却后再试 */ }
+  }
+
   reapGhosts() {
     if (this.destroyed) return
     const now = Date.now()
@@ -1504,6 +1560,7 @@ export class ChatNet {
     clearInterval(this.retryFailedTimer)
     clearInterval(this.antiEntropyTimer)
     clearInterval(this.reapTimer)
+    clearInterval(this.watchdogTimer)
     for (const [, a] of this.pendingAcks) clearTimeout(a.timer)
     this.pendingAcks.clear()
     clearInterval(this.directProbeTimer)

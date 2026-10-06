@@ -405,9 +405,27 @@ export class FileX {
         this.log(`传输 ${tx.name}：分路仍无进展，全部改经 MQTT 中继`, 'warn')
       }
       // 自愈 3：任意路径 20s 无新 ACK → 大概率是文件块把心跳/位图帧挤死（QoS0
-      // 拥堵）或会话被对端回收 → 重建中继连接（限频）+ 重发 offer 唤醒接收方
+      // 拥堵）或会话被对端回收 → 重建中继连接（限频）+ 重发 offer 唤醒接收方。
+      // ⚠️ 必须有界：连续 2 次重建后 acked 零进展 → 强制转 stalled（停泵、退保护）。
+      // 否则"对端半死不活"（每次重建瞬间回一点活性，够躲过 5min 停滞检测但不够
+      // 恢复传输）会让本循环以 30s 周期掀翻全部中继链路——链路翻动又反过来打断
+      // 续传握手，ACK 永远回不来（实测 84 次断开风暴，自持循环）。stalled 后
+      // onSessionReady 自动复活，恢复路径不变
       if (tx.acked > 0 && tx.acked < tx.n && now - lastLife > this.relayRebuildMs) {
         if (!tx.lastRebuildAt || now - tx.lastRebuildAt > RELAY_REBUILD_COOLDOWN_MS) {
+          if (tx.lastRebuildAck != null && tx.acked === tx.lastRebuildAck) {
+            tx.rebuildNoProgress = (tx.rebuildNoProgress || 0) + 1
+          } else {
+            tx.rebuildNoProgress = 0
+          }
+          tx.lastRebuildAck = tx.acked
+          if ((tx.rebuildNoProgress || 0) >= 2) {
+            tx.state = 'stalled'
+            if (tx.pumpTimer) { clearInterval(tx.pumpTimer); tx.pumpTimer = null }
+            this.log(`传输 ${tx.name}：连续重建仍无进展，已暂停（对端真正上线后自动续传）`, 'warn')
+            this.emit({ fid: tx.fid, dir: tx.dir, state: 'stalled', done: bitmapCount(tx.have), total: tx.n, name: tx.name })
+            return
+          }
           tx.lastRebuildAt = now
           this.log(`传输 ${tx.name}：通道无响应，重建中继连接并重发传输请求`, 'warn')
           try { this.net.relay?.forceReconnect?.() } catch { /* 忽略 */ }

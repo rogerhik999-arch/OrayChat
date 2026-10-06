@@ -145,23 +145,47 @@ export class LogStore {
       .filter((e) => e.t > cutoff && !c.dels.has(e.mid) && e.t > c.clearT)
       .sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1))
     if (cap && entries.length > cap.entries) entries = entries.slice(-cap.entries)
-    if (cap) {
-      const est = (e) => 140 + (e.text?.length || 0) + (e.thumb?.length || 0) + (e.name?.length || 0)
-      let bytes = entries.reduce((s, e) => s + est(e), 0)
-      if (bytes > cap.bytes) {
-        // 第一优先：剥 thumb（从最老开始，保留最新 40 条的预览）
-        for (let i = 0; i < entries.length - 40 && bytes > cap.bytes; i++) {
-          if (entries[i].thumb) { bytes -= entries[i].thumb.length; entries[i] = { ...entries[i], thumb: undefined } }
-        }
-        // 仍超：从最老开始整条丢弃
-        while (entries.length > 50 && bytes > cap.bytes) bytes -= est(entries.shift())
-      }
-    }
+    entries = this.#trimExport(entries, cap)
     return {
       entries,
       dels: Object.fromEntries([...c.dels].filter(([, t]) => this.now() - t < TOMBSTONE_MS).sort()),
       clearT: c.clearT,
     }
+  }
+
+  // 增量导出（P0-② 游标同步，docs/longrun-sync-research.md）：只发 t > sinceT 的
+  // 条目——常规反熵轮次开销 = O(分歧) 而非 O(数据总量)。重叠窗由调用方的 sinceT
+  // 预留（-60s 防时钟偏移）；墓碑多发 5min 余量（防"删了又同步"时序差漏墓碑）；
+  // clearT 恒带（applyState 幂等合并，重叠无害）。字节预算同 exportConv（超出剥
+  // thumb / 丢最老——增量帧超预算说明离线积压大，优先保最新）
+  exportSince(key, sinceT, cap = 0) {
+    const c = this.conv(key)
+    const cutoff = this.now() - RETENTION_MS
+    let entries = [...c.entries.values()]
+      .filter((e) => e.t > cutoff && !c.dels.has(e.mid) && e.t > c.clearT && e.t > sinceT)
+      .sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1))
+    entries = this.#trimExport(entries, cap)
+    const dels = Object.fromEntries([...c.dels].filter(([mid, t]) => this.now() - t < TOMBSTONE_MS && t > sinceT - 5 * 60000).sort())
+    return { entries, dels, clearT: c.clearT }
+  }
+
+  // 同步帧字节预算裁剪（exportConv/exportSince 共用）：超预算先剥老条目 thumb
+  //（保留最新 40 条预览），仍超剥光全部 thumb（预览可弃，字节必须可控），再超
+  // 从最老整条丢弃（保留 ≥50 条）
+  #trimExport(entries, cap) {
+    if (!cap || !cap.bytes) return entries
+    const est = (e) => 140 + (e.text?.length || 0) + (e.thumb?.length || 0) + (e.name?.length || 0)
+    let bytes = entries.reduce((s, e) => s + est(e), 0)
+    if (bytes > cap.bytes) {
+      for (let i = 0; i < entries.length - 40 && bytes > cap.bytes; i++) {
+        if (entries[i].thumb) { bytes -= entries[i].thumb.length; entries[i] = { ...entries[i], thumb: undefined } }
+      }
+      for (let i = 0; i < entries.length && bytes > cap.bytes; i++) {
+        if (entries[i].thumb) { bytes -= entries[i].thumb.length; entries[i] = { ...entries[i], thumb: undefined } }
+      }
+      while (entries.length > 50 && bytes > cap.bytes) bytes -= est(entries.shift())
+    }
+    return entries
   }
 
   exportAll() {
