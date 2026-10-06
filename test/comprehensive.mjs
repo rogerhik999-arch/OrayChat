@@ -60,6 +60,10 @@ const killProfile = (profile) => {
 }
 
 console.log(`== comprehensive：房间 ${ROOM} ==`)
+// 实例日志全量落盘（T7 类间歇失败需读停传窗口的链路/泵日志）
+if (process.env.COMP_DUMP) setInterval(() => {
+  for (const k of Object.keys(lines)) { try { fs.writeFileSync(`/tmp/oc-e2e/comp-inst-${k}.log`, lines[k].join('\n')) } catch {} }
+}, 10000).unref?.()
 for (const p of ['alice', 'bob', 'carol']) { try { fs.rmSync(userData(p), { recursive: true, force: true }) } catch {} }
 const srcTxt = path.join(os.tmpdir(), `oc-comp-${Date.now()}.txt`)
 fs.writeFileSync(srcTxt, 'OrayChat 完备性测试文件内容。\n'.repeat(40))

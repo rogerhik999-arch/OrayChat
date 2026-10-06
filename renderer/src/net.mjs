@@ -123,10 +123,15 @@ export class ChatNet {
     this.migrateAndScrubDmKeys() // 旧键迁移 + 混桶清洗（见 store.dmConvKey 注释；幂等）
     this.sweepTimer = setInterval(() => this.store.sweep(), SWEEP_INTERVAL_MS)
     // 在线状态心跳（15±3s 抖动，防雷群）：定期向所有就绪对端报告在线
+    // ⚠️ 回调体必须自隔离：这条递归链一旦断掉（任何一次未捕获异常），presence
+    // 永久停摆——所有人看到本机离线、重启才恢复（长跑掉线的形态之一）
     const scheduleHeartbeat = () => {
       if (this.destroyed) return
       const jitter = PRESENCE_HEARTBEAT_MS + (Math.random() * 6000 - 3000)
-      this.heartbeatTimer = setTimeout(() => { this.sendPresenceHeartbeat(); scheduleHeartbeat() }, jitter)
+      this.heartbeatTimer = setTimeout(() => {
+        try { this.sendPresenceHeartbeat() } catch (e) { this.hooks.onLog?.(`心跳轮异常（已跳过本轮）: ${e?.message || e}`, 'warn') }
+        scheduleHeartbeat()
+      }, jitter)
     }
     scheduleHeartbeat()
     // 直连升级探测：中继会话每 45s 静默检查一次 Trystero 侧是否已打通/可重试

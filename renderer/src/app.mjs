@@ -626,7 +626,13 @@ function viewMessages() {
 }
 
 function renderMessages() {
-  const msgs = viewMessages()
+  // DOM 封顶（长跑健壮性）：只渲染最新 400 条——30 天记录全量渲染会让渲染进程
+  // 内存与重排随运行时长无限增长，最终饿死定时器/网络回调（"应用越跑越掉线，
+  // 重启即恢复"的累积型根因）。本地记录仍在（store 30 天保留），只是不全部上 DOM
+  const DOM_CAP = 400
+  const all = viewMessages()
+  const omitted = Math.max(0, all.length - DOM_CAP)
+  const msgs = omitted ? all.slice(-DOM_CAP) : all
   const box = $('msgs')
   box.innerHTML = ''
   if (!msgs.length) {
@@ -640,6 +646,12 @@ function renderMessages() {
     return
   }
   const frag = document.createDocumentFragment()
+  if (omitted) {
+    const notice = document.createElement('div')
+    notice.className = 'day-sep'
+    notice.textContent = `已省略早前 ${omitted} 条（记录仍保存在本机）`
+    frag.appendChild(notice)
+  }
   let lastDay = ''
   for (const m of msgs) {
     // 单条渲染失败只跳过该条，绝不清空整个会话（此前一处气泡异常会让
@@ -1088,6 +1100,14 @@ function appendSys(text) {
   div.className = 'msg'
   div.innerHTML = `<div class="bubble system">${esc(text)} · ${fmtTime(Date.now())}</div>`
   box.appendChild(div)
+  // 系统提示封顶（长跑健壮性）：中继断连/重连风暴会高频追加系统气泡，与消息
+  // 气泡一同无上限累积——渲染进程内存与重排随运行时长增长，最终饿掉定时器。
+  // 超限从最旧开始移除（系统提示是瞬态信息，聊天记录不受影响）
+  try {
+    const sys = box.querySelectorAll('.bubble.system')
+    for (let i = 0; i < sys.length - 60; i++) sys[i].parentElement?.remove()
+    while (box.childElementCount > 2000) box.firstElementChild?.remove()
+  } catch { /* 清理失败不影响本次提示显示 */ }
   box.scrollTop = box.scrollHeight
 }
 
@@ -2012,7 +2032,10 @@ function renderHubPill(st) {
     pill.textContent = `🔗 中继链路 · 🟢 ${alive}/${links.length}`
     panel.innerHTML = `
       <div class="hub-panel-title">当前中继链路（${alive}/${links.length} 存活）</div>
-      ${links.map((l) => `<div class="hub-member">${l.alive ? '🟢' : '⚪'} ${esc(l.type)}中继 · ${esc(l.url)}${l.fails ? ` · 断线${l.fails}次` : ''}</div>`).join('') || '<div class="hub-member">（无）</div>'}
+      ${links.map((l) => {
+        const inbound = l.alive && l.lastInboundAt ? ` · 入站${Math.max(0, Math.round((Date.now() - l.lastInboundAt) / 1000))}s前` : ''
+        return `<div class="hub-member">${l.alive ? '🟢' : '⚪'} ${esc(l.type)}中继 · ${esc(l.url)}${l.fails ? ` · 断线${l.fails}次` : ''}${inbound}</div>`
+      }).join('') || '<div class="hub-member">（无）</div>'}
       <div class="hub-panel-row" style="margin-top:4px">消息经全部存活链路并发发送、接收端去重；增删可在 设置 → 网络 → MQTT broker</div>`
     return
   }
@@ -2053,7 +2076,9 @@ function relayLinksInfo() {
     const link = relay.links.get(url)
     const st = relayStats.get(url) || { lastOkAt: 0, fails: 0 }
     const type = /trycloudflare\.com/.test(url) ? '临时' : (PUBLIC_BROKERS.includes(url) ? '公共' : '固定')
-    return { url, type, alive: !!link?.alive, fails: st.fails, lastOkAt: st.lastOkAt }
+    // lastInboundAt：链路上最后一次收到任何帧（半开链路的关键判据——TCP 活着
+    // 但房间流量黑洞时，状态仍 🟢 而入站早已停止）
+    return { url, type, alive: !!link?.alive, fails: st.fails, lastOkAt: st.lastOkAt, lastInboundAt: link?.lastInboundAt || 0 }
   })
 }
 

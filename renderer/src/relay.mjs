@@ -63,6 +63,9 @@ export class RelayTransport {
     this.credentials = new Map() // url -> {username, password}（私有中继 token 准入）
     this.brokerUrls = brokerUrls?.length ? brokerUrls : ['wss://broker-cn.emqx.io:8084/mqtt']
     this.links = new Map() // url -> {client, alive, attempts}
+    // 退避计数放 url 级：此前存在 link 对象里，spawnLink 重建对象即清零 →
+    // 退避永远 3s，长跑中无限高频重连轰炸公共 broker（限流后越试越连不上）
+    this.linkAttempts = new Map() // url -> 连续失败次数（CONNACK 成功清零）
     this.seenTx = new Map() // txid -> ts（多链路重复帧去重）
     // 并联数不超过 broker 数
     this.parallelN = Math.max(1, Math.min(parallel || DEFAULT_PARALLEL, this.brokerUrls.length))
@@ -71,7 +74,10 @@ export class RelayTransport {
     const scheduleAnnounce = () => {
       if (this.closed) return
       const jitter = PRESENCE_INTERVAL_MS + (Math.random() * 4000 - 2000)
-      this.presenceTimer = setTimeout(() => { this.announce(); scheduleAnnounce() }, jitter)
+      this.presenceTimer = setTimeout(() => {
+        try { this.announce() } catch { /* 广播失败不杀链：presence 链一旦断掉，所有人永远看不到本机（重启才恢复） */ }
+        scheduleAnnounce()
+      }, jitter)
     }
     scheduleAnnounce()
     this.pruneTimer = setInterval(() => this.prune(), 5000)
@@ -79,6 +85,10 @@ export class RelayTransport {
       const now = Date.now()
       for (const [tx, ts] of this.seenTx) if (now - ts > DEDUP_WINDOW_MS) this.seenTx.delete(tx)
     }, 15000)
+    // 半开链路探测（v1.27.1）：TCP 活着、房间流量黑洞的状态（移动网络 NAT 常见）
+    // keepalive 探不到——broker 还在回 PING。自环探测：对安静链路向自己 inbox 发
+    // 一帧，经 broker 回环必然触发 message；两次探测机会内仍零入站 → 强制重建
+    this.probeTimer = setInterval(() => this.probeSilentLinks(), 60000)
   }
 
   static topics(appId, roomId) {
@@ -109,40 +119,73 @@ export class RelayTransport {
       })
 
     } catch { this.scheduleLinkRetry(url, retry); return }
-    const link = { client, alive: false, attempts: 0 }
+    const link = { client, alive: false, attempts: 0, lastInboundAt: Date.now(), probeSentAt: 0 }
     this.links.set(url, link)
     client.on('connect', () => {
       link.alive = true
-      link.attempts = 0
-      this.onLinkState?.(url, true) // 真实连通（CONNACK）
-      this.onLog(`MQTT 中继链路已连接 ${url}（并联 ${this.aliveLinks().length} 条）`)
+      this.linkAttempts.set(url, 0) // CONNACK 成功：退避计数归零（url 级，不随对象重建丢失）
+      link.lastInboundAt = Date.now()
+      try {
+        this.onLinkState?.(url, true) // 真实连通（CONNACK）
+        this.onLog(`MQTT 中继链路已连接 ${url}（并联 ${this.aliveLinks().length} 条）`)
+      } catch { /* UI 钩子异常不拦重连 */ }
       client.subscribe([presence, inbox(this.selfId)], (err) => {
-        if (err) { this.onLog(`中继订阅失败 ${url}: ${err.message}`, 'warn'); return }
+        if (err) { this.safeLog(`中继订阅失败 ${url}: ${err.message}`, 'warn'); return }
         this.announce()
       })
     })
-    client.on('message', (topic, payload) => this.onMessage(topic, payload))
+    client.on('message', (topic, payload) => { link.lastInboundAt = Date.now(); try { this.onMessage(topic, payload) } catch (e) { this.safeLog(`中继帧处理异常: ${e?.message || e}`, 'warn') } })
     client.on('error', () => { /* close 会跟随触发 */ })
     client.on('close', () => {
       link.alive = false
       if (this.closed) return
-      const alive = this.aliveLinks().length
-      if (alive > 0) {
-        this.onLog(`中继链路断开 ${url}（仍有 ${alive} 条并联存活）`, 'warn')
-      } else {
-        this.onLog(`中继链路断开 ${url}（全部并联已断）`, 'warn')
-      }
-      this.scheduleLinkRetry(url, retry)
+      // ⚠️ 顺序即正确性：重连调度必须在任何 UI 钩子之后也无条件执行——此前
+      // onLog/onLinkState 若抛异常（UI 侧错误），scheduleLinkRetry 不再执行，
+      // 该链路静默死亡；各条链陆续死光即"全员掉线，重启才恢复"
+      try {
+        const alive = this.aliveLinks().length
+        this.onLog(alive > 0 ? `中继链路断开 ${url}（仍有 ${alive} 条并联存活）` : `中继链路断开 ${url}（全部并联已断）`, 'warn')
+      } catch { /* UI 钩子异常不拦重连 */ }
+      this.scheduleLinkRetry(url)
     })
+  }
+
+  // 事件回调里安全打日志：onLog 接 UI（appendSys 等），任何异常不得外溢
+  safeLog(msg, level) {
+    try { this.onLog(msg, level) } catch { /* 忽略 */ }
   }
 
   scheduleLinkRetry(url, retry) {
     if (this.closed) return
-    const link = this.links.get(url)
-    const attempts = (link?.attempts || 0) + 1
-    if (link) link.attempts = attempts
-    const delay = retry ?? Math.min(60000, 3000 * 2 ** Math.min(attempts - 1, 4))
+    const attempts = (this.linkAttempts.get(url) || 0) + 1
+    this.linkAttempts.set(url, attempts)
+    const delay = retry ?? Math.min(60000, 3000 * 2 ** Math.min(attempts - 1, 5))
     setTimeout(() => { if (!this.closed) this.spawnLink(url) }, delay)
+  }
+
+  // 半开探测：alive 但 150s 零入站 → 发自环 probe（publish→broker→自己的 inbox
+  // 订阅回环）；发出后 120s 仍无任何入站 → 判半开，end 触发既有重试链重建
+  probeSilentLinks() {
+    if (this.closed) return
+    const now = Date.now()
+    for (const [url, l] of this.links) {
+      if (!l.alive) continue
+      if (l.probeSentAt && l.lastInboundAt >= l.probeSentAt) l.probeSentAt = 0 // 探测已回环：复位，后续半开可再探
+      if (l.probeSentAt && l.lastInboundAt < l.probeSentAt && now - l.probeSentAt > 120000) {
+        l.probeSentAt = 0
+        this.safeLog(`中继链路 ${url} 探测无回环（疑似半开），强制重建`, 'warn')
+        try { l.client.end(true) } catch { /* close 会跟随 */ }
+        continue
+      }
+      if (!l.probeSentAt && now - l.lastInboundAt > 150000) {
+        l.probeSentAt = now
+        try {
+          const { inbox } = RelayTransport.topics(this.appId, this.roomId)
+          const frame = oc.sealRoom(this.roomKey, { from: this.selfId, txid: oc.newMid(), kind: 'probe', data: null })
+          l.client.publish(inbox(this.selfId), JSON.stringify(frame), { qos: 0 })
+        } catch { this.safeLog(`中继探测发送失败 ${url}`, 'warn') }
+      }
+    }
   }
 
   onMessage(topic, payload) {
@@ -203,8 +246,12 @@ export class RelayTransport {
   }
 
   // 主动重连（App 从待机恢复、网络切换时调用）：全部链路推倒重来
+  // ⚠️ 显式自愈动作必须清空退避计数：拓扑变化窗口内链路可能连败数次，若沿用
+  // 指数退避，恢复间隔会爬到 60s——自愈场景要全速重试，退避只针对"被动重连
+  // 撞上 broker 持续不可用"的防轰炸
   forceReconnect() {
     if (this.closed) return
+    this.linkAttempts.clear()
     for (const [url, l] of this.links) {
       this.onLinkState?.(url, false)
       l.alive = false
@@ -251,6 +298,7 @@ export class RelayTransport {
     clearInterval(this.presenceTimer)
     clearInterval(this.pruneTimer)
     clearInterval(this.dedupTimer)
+    clearInterval(this.probeTimer)
     for (const [, l] of this.links) {
       l.alive = false
       try { l.client?.end(true) } catch { /* 忽略 */ }
