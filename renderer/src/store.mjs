@@ -134,13 +134,31 @@ export class LogStore {
   }
 
   // 导出单个会话状态（用于同步给对端；只含保留期内数据，确定性排序保证两端字节一致）
-  exportConv(key) {
+  // ⚠️ 长跑健壮性：全量导出的帧随聊天积累无界增长（数 MB），经 QoS0 中继发送会
+  // 挤占同一 TCP 连接上的心跳/presence（v1.17.2 拥堵教训）→ SWIM 误判 → 会话翻动
+  // ——"应用越用越容易掉线"的元凶。cap：只带最新 N 条；字节预算超限时先剥老条目
+  // 的 thumb（dataURL 是字节大头，只为预览存在），仍超再丢最老条目
+  exportConv(key, cap = 0) {
     const c = this.conv(key)
     const cutoff = this.now() - RETENTION_MS
+    let entries = [...c.entries.values()]
+      .filter((e) => e.t > cutoff && !c.dels.has(e.mid) && e.t > c.clearT)
+      .sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1))
+    if (cap && entries.length > cap.entries) entries = entries.slice(-cap.entries)
+    if (cap) {
+      const est = (e) => 140 + (e.text?.length || 0) + (e.thumb?.length || 0) + (e.name?.length || 0)
+      let bytes = entries.reduce((s, e) => s + est(e), 0)
+      if (bytes > cap.bytes) {
+        // 第一优先：剥 thumb（从最老开始，保留最新 40 条的预览）
+        for (let i = 0; i < entries.length - 40 && bytes > cap.bytes; i++) {
+          if (entries[i].thumb) { bytes -= entries[i].thumb.length; entries[i] = { ...entries[i], thumb: undefined } }
+        }
+        // 仍超：从最老开始整条丢弃
+        while (entries.length > 50 && bytes > cap.bytes) bytes -= est(entries.shift())
+      }
+    }
     return {
-      entries: [...c.entries.values()]
-        .filter((e) => e.t > cutoff && !c.dels.has(e.mid) && e.t > c.clearT)
-        .sort((a, b) => a.t - b.t || (a.mid < b.mid ? -1 : 1)),
+      entries,
       dels: Object.fromEntries([...c.dels].filter(([, t]) => this.now() - t < TOMBSTONE_MS).sort()),
       clearT: c.clearT,
     }

@@ -29,8 +29,31 @@ const state = {
   unread: new Map(), // 会话键(viewKey) -> 未读数
   filex: null, // 文件/图片传输（dm 会话）
   pendingFiles: [], // 待发送附件 [{file:File, kind, orig}]
-  imgUrls: new Map(), // fid -> blob URL（本机已有字节的消息图片显示缓存）
+  imgUrls: new Map(), // fid -> blob URL（本机已有字节的消息图片显示缓存；LRU 上限见 cacheBlobUrl）
+  voiceUrls: [], // 语音播放 blob URL 环形上限（createObjectURL 钉住 Blob 直到 revoke，不封顶=每次播放泄漏一份音频字节）
   fxRenderTimer: null, // 传输进度 → 消息区重渲染节流（leading+trailing，窗口尾必补一次）
+}
+
+// blob URL LRU：createObjectURL 会把 Blob 强引用钉在内存里直到 revokeObjectURL——
+// 图片缓存/语音播放若无上限，30 天累积（每图几百 KB、每语音几百 KB）= 渲染进程
+// 内存无界增长 → 定时器饿死 → "应用长跑掉线、重启即恢复"。图片按 fid 去重 + LRU
+// 淘汰（淘汰后若再滚到该消息会重新 fxRead 建新 URL）；语音保留最近 8 条可回放
+function cacheBlobUrl(mapOrArr, key, url, cap) {
+  if (mapOrArr instanceof Map) {
+    if (mapOrArr.has(key)) return mapOrArr.get(key)
+    while (mapOrArr.size >= cap) {
+      const oldest = mapOrArr.keys().next().value
+      try { URL.revokeObjectURL(mapOrArr.get(oldest)) } catch { /* ignore */ }
+      mapOrArr.delete(oldest)
+    }
+    mapOrArr.set(key, url)
+    return url
+  }
+  while (mapOrArr.length >= cap) {
+    try { URL.revokeObjectURL(mapOrArr.shift()) } catch { /* ignore */ }
+  }
+  mapOrArr.push(url)
+  return url
 }
 
 // ---------- 文件/图片：格式压缩与缩略图 ----------
@@ -905,8 +928,7 @@ async function hydrateFxImage(m, img) {
       }
       return
     }
-    const url = URL.createObjectURL(new Blob([bytes], { type: m.mime || 'image/png' }))
-    state.imgUrls.set(m.fid, url)
+    const url = cacheBlobUrl(state.imgUrls, m.fid, URL.createObjectURL(new Blob([bytes], { type: m.mime || 'image/png' })), 24)
     if (img.isConnected) { img.src = url; img.classList.remove('thumb') }
   } catch { /* WebView 环境：停留缩略图 */ }
 }
@@ -968,10 +990,12 @@ function buildVoiceBubble(bubble, m, mine) {
       state.voicePlaying?.setIcon?.(false)
     }
     if (state.voiceAudio === audio && !audio.paused) { audio.pause(); setIcon(false); return }
+    // loaded 的 URL 可能已被语音 LRU 淘汰 revoke（封顶 8 条）——注册表里查不到就重读磁盘
+    if (loaded && !state.voiceUrls.includes(audio.src)) loaded = false
     if (!loaded) {
       const bytes = await window.oray.fxRead(m.fid)
       if (!bytes) { appendSys('语音字节不在本机：等接收完成后播放，或让对方重发'); return }
-      audio.src = URL.createObjectURL(new Blob([bytes], { type: m.mime || 'audio/webm' }))
+      audio.src = cacheBlobUrl(state.voiceUrls, null, URL.createObjectURL(new Blob([bytes], { type: m.mime || 'audio/webm' })), 8)
       loaded = true
     }
     audio.playbackRate = Number(speed.dataset.rate || 1)
@@ -1205,11 +1229,13 @@ async function doLogin(name, room) {
             for (let i = 0; i < 30 && !bytes; i++) { bytes = await window.oray.fxRead(e.fid); if (!bytes) await new Promise((r) => setTimeout(r, 2000)) }
             if (!bytes) { window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} no-bytes`); return }
             const audio = new Audio()
-            audio.src = URL.createObjectURL(new Blob([bytes], { type: e.mime || 'audio/webm' }))
-            audio.oncanplay = () => window.oray.botLog(`[BOT] PLAYBACK-OK fid=${e.fid} dur=${audio.duration ? audio.duration.toFixed(1) : '?'}`)
-            audio.onerror = () => window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} decode code=${audio.error?.code} msg=${audio.error?.message || ''} bytes=${bytes.length} ctor=${bytes.constructor?.name} mime=${e.mime}`)
+            const vurl = URL.createObjectURL(new Blob([bytes], { type: e.mime || 'audio/webm' }))
+            const dropVurl = () => { try { URL.revokeObjectURL(vurl) } catch { /* ignore */ } } // 一次性验证音频：用完即回收（每条语音数百 KB，不回收=每次接收泄漏一份）
+            audio.src = vurl
+            audio.oncanplay = () => { window.oray.botLog(`[BOT] PLAYBACK-OK fid=${e.fid} dur=${audio.duration ? audio.duration.toFixed(1) : '?'}`); dropVurl() }
+            audio.onerror = () => { window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} decode code=${audio.error?.code} msg=${audio.error?.message || ''} bytes=${bytes.length} ctor=${bytes.constructor?.name} mime=${e.mime}`); dropVurl() }
             audio.load()
-            setTimeout(() => { if (!audio.duration) window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} timeout`) }, 10000)
+            setTimeout(() => { if (!audio.duration) window.oray.botLog(`[BOT] PLAYBACK-ERR fid=${e.fid} timeout`); dropVurl() }, 10000)
           })()
         }
       },

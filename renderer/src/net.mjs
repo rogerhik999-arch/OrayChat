@@ -1042,7 +1042,9 @@ export class ChatNet {
   async pushSync(peerId, wireConv) {
     const peer = this.peers.get(peerId)
     if (!peer || peer.state !== 'ready') return
-    const state = this.store.exportConv(this.storeKey(wireConv, peerId))
+    // 同步载荷封顶：最新 400 条 / 160KB（超出先剥 thumb 再丢最老）。全量帧随
+    // 30 天日志无界增长，一帧数 MB 经 QoS0 发送会饿死同链路心跳（自拥堵掉线）
+    const state = this.store.exportConv(this.storeKey(wireConv, peerId), { entries: 400, bytes: 160 * 1024 })
     // 附带作者昵称映射：接收端无需与作者直接握手即可解析历史消息的显示名
     const names = {}
     for (const e of state.entries) {
