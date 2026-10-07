@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld('oray', {
   openSettings: () => ipcRenderer.invoke('settings:open'),
   // 中继服务模式（v1.23.0）：主窗口查询状态/监听变化 → 运行中自动并入本地私有链
   hubStatus: () => ipcRenderer.invoke('hub:status'),
+  // 分布式自动更新（docs/update-plan.md M1）
+  updaterStage: (args) => ipcRenderer.invoke('updater:stage', args),
+  updaterApply: (args) => ipcRenderer.invoke('updater:apply', args),
   onHubEvent: (fn) => { ipcRenderer.on('hub:event', (_e, ev) => fn(ev)) },
   hubSetNames: (map) => ipcRenderer.send('hub:set-names', map),
 

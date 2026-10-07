@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('settings', {
   clearData: (kind, room) => ipcRenderer.invoke('settings:clear-data', kind, room),
   listRooms: () => ipcRenderer.invoke('settings:list-rooms'),
   health: () => ipcRenderer.invoke('settings:health'),
+  updater: () => ipcRenderer.invoke('settings:updater'),
+  updaterSetCfg: (cfg) => ipcRenderer.invoke('settings:updater-cfg-set', cfg),
   openMainWindow: () => ipcRenderer.invoke('settings:open-main'),
   // 中继服务模式（v1.23.0；desktop 专用——mobile 无此预加载即不显示该区块）
   hubStart: (opts) => ipcRenderer.invoke('hub:start', opts),

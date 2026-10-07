@@ -44,14 +44,14 @@
 
 ## 3. 分期
 
-### M1 —— P0 桌面主链路（macOS 先行，~2-3 天）
-- [ ] 密钥工具 + 公钥内置；CI manifest job（Secret 配置）
-- [ ] presence 心跳捎带 ver/pkg（gossip，验签后采纳）
-- [ ] updater.mjs：策略/守门状态机（§2 全条件）、semver 比较、拉包（filex 多源）、校验、staging
-- [ ] electron/updater.js：macOS stage/apply（detached helper 换装+拉起）+ IPC
-- [ ] 设置页更新区块；托盘/关窗路径适配（isQuiting；重启后恢复前台/托盘状态）
-- [ ] 更新成功自动持有包（files/ 天然成种子）；fx-hold 响应
-- [ ] 单测：semver 比较、守门状态机（假 net 逐条件驱动）、清单验签、gossip 择优
+### M1 —— P0 桌面主链路（macOS 先行）✅ 已完成（2026-10-07）
+- [x] 密钥工具 + 公钥内置；CI manifest job（Secret 配置）
+- [x] presence 心跳捎带 ver/pkg（gossip，验签后采纳）
+- [x] updater.mjs：策略/守门状态机（§2 全条件）、semver 比较、拉包（filex 多源）、校验、staging
+- [x] electron/updater.js：macOS stage/apply（detached helper 换装+拉起）+ IPC
+- [x] 设置页更新区块；托盘/关窗路径适配（isQuiting；重启后恢复前台/托盘状态）
+- [x] 更新成功自动持有包（files/ 天然成种子）；fx-hold 响应
+- [x] 单测：semver 比较、守门状态机（假 net 逐条件驱动）、清单验签、gossip 择优
 - 验收：双实例实机演练——A 持 vN+1 包（测试签名密钥+假清单），B 经 gossip 发现→多源拉包→校验→staging→确认换装→重启后版本号为 vN+1 且自动成为种子
 
 ### M2 —— P1 补全（+1-2 天）

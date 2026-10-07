@@ -1298,6 +1298,39 @@ async function doLogin(name, room) {
     setInterval(pushHubNames, 30000)
     const renderPillSafe = (st) => { try { renderHubPill(st) } catch (e) { if (state.args?.bot) window.oray.botLog(`PILL-ERR ${e?.stack || e}`) } }
     window.oray.hubStatus().then(renderPillSafe).catch((e) => { if (state.args?.bot) window.oray.botLog(`PILL-IPC-ERR ${e?.message || e}`) })
+
+  // ---------- 分布式自动更新装配（docs/update-plan.md M1）----------
+  if (state.net && state.filex) {
+    import('./updater.mjs').then(async ({ Updater }) => {
+      const info = await (window.oray.appInfo ? window.oray.appInfo() : Promise.resolve({ version: '0.0.0', platform: 'web' }))
+      const platform = info.platform === 'darwin' || /Mac/.test(navigator.userAgent) ? 'darwin' : /Win/.test(navigator.userAgent) || info.platform === 'win32' ? 'win32' : 'linux'
+      const test = info.updateTest || null
+      const updater = new Updater({
+        net: state.net,
+        filex: state.filex,
+        appVersion: test?.client ? '1.0.0' : info.version,
+        platform,
+        trusted: test?.pubkey ? [test.pubkey] : undefined,
+        kv: { get: (k) => window.oray.kvGet(k), set: (k, v) => window.oray.kvSet(k, v) },
+        notify: (m) => appendSys(`🔄 ${m}`),
+        ipc: {
+          stage: (args) => window.oray.updaterStage(args),
+          apply: (args) => window.oray.updaterApply(args),
+        },
+        onLog: (m, lv) => { window.oray.botLog(`[UPD] ${m}`); if (lv === 'warn' || lv === 'error') appendSys(`🔄 ${m}`) },
+      })
+      updater.hubStatus = () => window.oray.hubStatus()
+      state.net.updateGossip = () => updater.gossipPayload()
+      state.net.hooks.onPkgGossip = (pkg, fromName) => { void updater.onPkgGossip(pkg, fromName) }
+      state.updater = updater
+      await updater.init()
+      if (test?.manifest) {
+        updater.knownPkg = test.manifest // 甲=种子：直接持清单广播（验签过测试公钥）
+        if (test.client) await updater.saveCfg({ policy: 'quit-install', source: 'peers-only' }) // 乙=过期客户端
+      }
+      if (state.args?.bot) window.oray.botLog(`[UPD] 已装配 v=${updater.appVersion} platform=${updater.platform}`)
+    }).catch((e) => { if (state.args?.bot) window.oray.botLog(`[UPD] 装配失败 ${e?.message || e}`) })
+  }
     window.oray.onHubEvent?.((ev) => { if (['started', 'stopped', 'tunnel', 'clients'].includes(ev.type)) window.oray.hubStatus().then(renderPillSafe).catch(() => {}) })
     const hubPillPoll = setInterval(() => { window.oray.hubStatus().then(renderPillSafe).catch(() => {}) }, 15000)
     window.addEventListener('beforeunload', () => clearInterval(hubPillPoll))

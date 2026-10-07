@@ -192,6 +192,30 @@ if (window.settings.hubStart) {
   window.settings.get().then((info) => restoreSaved((info.userConfig || {}).hub || {})).catch(() => {})
 
   // 健康面板（任务 A）：有采样数据才显示区块
+  // 更新区块（任务 M1-5）
+  if (window.settings.updater) {
+    const renderUpd = async () => {
+      try {
+        const u = await window.settings.updater()
+        const status = u.status || {}
+        const cfg = u.cfg || {}
+        $('updateCard').style.display = ''
+        $('updVersion').textContent = `${status.version || '—'} / ${status.knownPkg?.v || '（房间无更新信息）'}`
+        $('updPolicy').value = cfg.policy || status.policy || 'download-prompt'
+        $('updSource').value = cfg.source || status.source || 'peers-first'
+        const bits = [`阶段 ${status.phase || 'idle'}`]
+        if (status.stagedOk) bits.push('✅ 已暂存待装')
+        if ((status.fails || 0) > 0) bits.push(`自动更新失败 ${status.fails} 次`)
+        if (status.knownPkg) bits.push(`清单 ${new Date(status.knownPkg.ts).toLocaleString('zh-CN')}`)
+        $('updStatus').textContent = bits.join(' · ')
+      } catch { /* 状态不可读就不显示 */ }
+    }
+    renderUpd()
+    setInterval(renderUpd, 15000)
+    $('updPolicy').onchange = () => window.settings.updaterSetCfg({ policy: $('updPolicy').value })
+    $('updSource').onchange = () => window.settings.updaterSetCfg({ source: $('updSource').value })
+  }
+
   window.settings.health?.().then((samples) => {
     if (!Array.isArray(samples) || !samples.length) return
     $('healthCard').style.display = ''

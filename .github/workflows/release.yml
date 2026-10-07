@@ -149,8 +149,17 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: npm ci --ignore-scripts || npm install --no-audit --no-fund
       - uses: actions/download-artifact@v4
         with: { merge-multiple: true, path: artifacts }
+      # 分布式自动更新：签名清单（Secret 缺失时跳过，不阻断发版）
+      - name: Sign update manifest
+        env:
+          ORAY_UPDATE_SIGN_KEY: ${{ secrets.ORAY_UPDATE_SIGN_KEY }}
+        run: node tools/sign-update-manifest.mjs artifacts "${{ github.ref_name }}"
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -158,6 +167,8 @@ jobs:
           overwrite_files: true
           generate_release_notes: true
           files: |
+            artifacts/manifest.json
+            artifacts/manifest.sig
             artifacts/**/*.dmg
             artifacts/**/*.zip
             artifacts/**/*.exe

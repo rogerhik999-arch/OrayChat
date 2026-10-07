@@ -1001,6 +1001,8 @@ export class ChatNet {
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       peer.lastProgress = Date.now()
+      if (frame.ver) peer.ver = String(frame.ver) // 对端客户端版本（分布式更新 gossip）
+      if (frame.pkg) { try { this.hooks.onPkgGossip?.(frame.pkg, peer.name) } catch { /* 钩子异常不伤 presence */ } }
       if (frame.hubPub !== undefined) peer.hubPub = frame.hubPub || null // 中继主机标识（📡）
       if (frame.hubInfo !== undefined) {
         const prev = peer.hubInfo?.url
@@ -1231,6 +1233,8 @@ export class ChatNet {
           conv: 'dm', op: 'presence', t: now, digest,
           hubPub: this.hubPub || '',
           hubInfo: this.hubPub ? { url: this.hubPub, mode: this.hubMode || '', token: this.hubToken || '' } : null,
+          // 分布式更新 gossip（docs/update-plan.md）：本机版本 + 最新已知签名清单
+          ...(this.updateGossip ? this.updateGossip() : {}),
         }
         if (peer.via === 'mqtt') this.relay.send(peerId, 'ctl', frame)
         else this.ctlAction?.send(frame, { target: peerId }).catch(() => {})

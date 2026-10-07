@@ -22,3 +22,7 @@ ios/DerivedData/
 build/cloudflared/cloudflared
 build/cloudflared/cloudflared-linux-amd64
 build/cloudflared/cloudflared-windows-amd64.exe
+
+# 更新签名私钥（绝不入库；配置 GitHub Secret ORAY_UPDATE_SIGN_KEY）
+*update-signing*.txt
+*update-signing*.b64

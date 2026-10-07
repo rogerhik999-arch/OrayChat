@@ -11,6 +11,7 @@ const fs = require('node:fs')
 const crypto2 = require('node:crypto')
 const zlib = require('node:zlib')
 const hub = require('./hub')
+const appUpdater = require('./updater')
 
 const argv = {}
 for (const a of process.argv.slice(2)) {
@@ -91,7 +92,15 @@ function registerIpc() {
     } catch { return merged }
   })
   ipcMain.handle('launch-args:get', () => argv)
-  ipcMain.handle('app:info', () => ({ version: app.getVersion(), platform: process.platform, profile: PROFILE }))
+  ipcMain.handle('app:info', () => ({
+    version: app.getVersion(), platform: process.platform, profile: PROFILE,
+    // 演练注入（test/update-live.mjs）：测试受信公钥/假清单/过期版本伪装
+    updateTest: process.env.ORAY_UPDATE_PUBKEY ? {
+      pubkey: process.env.ORAY_UPDATE_PUBKEY,
+      manifest: process.env.ORAY_UPDATE_TEST_MANIFEST ? JSON.parse(fs.readFileSync(process.env.ORAY_UPDATE_TEST_MANIFEST, 'utf8')) : null,
+      client: !!process.env.ORAY_UPDATE_TEST_CLIENT,
+    } : null,
+  }))
 
   // 本地 KV 状态（记住的房间口令、共享聊天日志、名字映射）：
   // 必须走主进程文件而不是 localStorage —— localStorage 在 app.exit()/SIGKILL 下不保证落盘
@@ -377,6 +386,32 @@ function registerIpc() {
     fs.writeFileSync(statePath(), JSON.stringify(s4), { mode: 0o600 })
     return cleared
   })
+  // ---------- 分布式自动更新（docs/update-plan.md M1）----------
+  ipcMain.handle('updater:stage', (_e, args) => appUpdater.stage(args))
+  ipcMain.handle('updater:apply', async (_e, args) => {
+    const r = await appUpdater.apply(args)
+    if (r.ok && args?.immediate) setTimeout(() => appUpdater.quitForUpdate(), 1500) // 等 renderer 收到应答
+    return r
+  })
+  ipcMain.handle('updater:quit-install-flag', (_e, flag) => {
+    const st = loadLocalState()
+    if (flag === null) delete st['oc-updater-quitinstall']
+    else st['oc-updater-quitinstall'] = flag
+    try { fs.writeFileSync(path.join(app.getPath('userData'), 'local-state.json'), JSON.stringify(st), { mode: 0o600 }) } catch { /* 忽略 */ }
+    return true
+  })
+  ipcMain.handle('settings:updater-cfg-set', (_e, cfg) => {
+    try {
+      const st = loadLocalState()
+      st['oc-updater-cfg'] = { ...(st['oc-updater-cfg'] || {}), ...(cfg || {}) }
+      fs.writeFileSync(path.join(app.getPath('userData'), 'local-state.json'), JSON.stringify(st), { mode: 0o600 })
+      return true
+    } catch (e) { return { err: e.message } }
+  })
+  ipcMain.handle('settings:updater', () => {
+    const s0 = loadLocalState()
+    return { cfg: s0['oc-updater-cfg'] || null, status: s0['oc-updater-status'] || null }
+  })
   ipcMain.handle('settings:health', () => {
     try { return JSON.parse(loadLocalState()['oc-health'] || '[]') } catch { return [] }
   })
@@ -619,7 +654,25 @@ function persistHubModeIfNamed() {
 function mainWindow() { return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.webContents.getURL().includes('index.html')) }
 
 app.whenReady().then(() => {
+  // 演练注入：把假更新包落进本实例 files/（甲=种子持有者）
+  try {
+    if (process.env.ORAY_UPDATE_TEST_PKG && process.env.ORAY_UPDATE_TEST_FID) {
+      const dir = path.join(app.getPath('userData'), 'files')
+      fs.mkdirSync(dir, { recursive: true })
+      fs.copyFileSync(process.env.ORAY_UPDATE_TEST_PKG, path.join(dir, process.env.ORAY_UPDATE_TEST_FID + '.zip'))
+      fs.writeFileSync(path.join(dir, process.env.ORAY_UPDATE_TEST_FID + '.json'), JSON.stringify({ have: Array.from({ length: 9999 }, (_, i) => i) }))
+    }
+  } catch { /* 演练注入失败即演练失败 */ }
   registerIpc()
+  appUpdater.registerIpc(() => {
+    try {
+      const st = loadLocalState()
+      st['oc-updater-restore'] = { visible: mainWindow() ? mainWindow().isVisible() : true, at: Date.now() }
+      fs.writeFileSync(path.join(app.getPath('userData'), 'local-state.json'), JSON.stringify(st), { mode: 0o600 })
+    } catch { /* 恢复信息不可写就放弃 */ }
+    isQuiting = true // 绕过关窗即隐藏：更新换装的退出是真退出
+    app.quit()
+  })
   createWindow()
   // 托盘驻留开关（设置页可改；默认开）。读取 local-state（尚未迁移前的轻量读取）
   try {
@@ -629,6 +682,21 @@ app.whenReady().then(() => {
     } else if (!IS_BOT) createTray()
   } catch { if (!IS_BOT) createTray() }
   app.on('activate', () => showMainWindow()) // macOS 点 Dock 图标恢复
+
+  // 更新自愈簿记：①稳定运行 2min 写 boot-ok（崩溃环计数用）；②恢复重启前的
+  // 前台/托盘状态（全自动换装重启不该把托盘驻留的应用弹到前台）
+  try {
+    const st0 = loadLocalState()
+    const restore = st0['oc-updater-restore']
+    if (restore && restore.visible === false) setTimeout(() => { try { mainWindow().hide() } catch { /* 忽略 */ } }, 800)
+    setTimeout(() => {
+      try {
+        const st1 = loadLocalState()
+        st1['oc-boot-ok'] = { ver: app.getVersion(), at: Date.now() }
+        fs.writeFileSync(path.join(app.getPath('userData'), 'local-state.json'), JSON.stringify(st1), { mode: 0o600 })
+      } catch { /* 忽略 */ }
+    }, 120000)
+  } catch { /* 簿记失败不影响主流程 */ }
 
   // 中继服务模式：bot 参数直启，或设置页曾启用则自动恢复（重启自愈）
   hub.emitter = { emit: (_t, ev) => broadcastHubEvent(ev) }
@@ -661,4 +729,8 @@ app.whenReady().then(() => {
 })
 
 // 关窗即隐藏，通常不会走到这里；bot 模式靠 botExit 退出
+app.on('before-quit', () => {
+  // quit-install 档：用户退出时若已 staging 则顺路换装（helper 等本进程退出后生效）
+  try { if (appUpdater.state.staged) appUpdater.apply({ version: appUpdater.state.staged.version, immediate: false }) } catch { /* 换装失败照常退出 */ }
+})
 app.on('window-all-closed', () => { if (IS_BOT) app.exit(0) })

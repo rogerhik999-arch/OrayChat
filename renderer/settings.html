@@ -151,6 +151,34 @@
     </div>
   </div>
 
+  <div class="set-card" id="updateCard" style="display:none">
+    <h2>更新（分布式：同伴互为更新源）</h2>
+    <div class="row">
+      <span style="flex:1; font-size:12.5px; color:var(--tx2)">当前版本 / 已知最新</span>
+      <span id="updVersion" style="font-size:12.5px">—</span>
+    </div>
+    <div class="row">
+      <span style="flex:1; font-size:12.5px; color:var(--tx2)">更新策略</span>
+      <select id="updPolicy" style="flex:1.2; padding:7px; border-radius:8px; border:1px solid var(--line); background:var(--bg3); color:var(--tx)">
+        <option value="off">关闭（不自动更新）</option>
+        <option value="prompt">提示我</option>
+        <option value="download-prompt">自动下载后提示安装</option>
+        <option value="quit-install">下载后退出时换装</option>
+        <option value="full-auto">全自动（下载+换装+自动重启）</option>
+      </select>
+    </div>
+    <div class="row">
+      <span style="flex:1; font-size:12.5px; color:var(--tx2)">更新源</span>
+      <select id="updSource" style="flex:1.2; padding:7px; border-radius:8px; border:1px solid var(--line); background:var(--bg3); color:var(--tx)">
+        <option value="peers-first">同伴优先 + GitHub 兜底</option>
+        <option value="peers-only">仅同伴（纯分布式）</option>
+        <option value="github-only">仅 GitHub</option>
+      </select>
+    </div>
+    <div id="updStatus" style="font-size:11.5px; color:var(--tx2); margin-top:6px">—</div>
+    <div class="hint">全自动档内置守门：无传输/验签三闸/崩溃环冷却/错峰抖动/中继服务空闲或维护窗口才重启。签名不符的清单一律拒绝。</div>
+  </div>
+
   <div class="set-card" id="healthCard" style="display:none">
     <h2>健康（长跑观测）</h2>
     <div id="healthNow" style="font-size:12.5px; color:var(--tx)">—</div>
