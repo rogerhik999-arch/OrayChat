@@ -388,6 +388,9 @@ function registerIpc() {
   })
   // ---------- 分布式自动更新（docs/update-plan.md M1）----------
   ipcMain.handle('updater:stage', (_e, args) => appUpdater.stage(args))
+  ipcMain.handle('updater:github-manifest', () => appUpdater.githubFetchManifest())
+  ipcMain.handle('updater:github-asset', (_e, asset) => appUpdater.githubDownloadAsset(asset))
+  ipcMain.handle('updater:rollback', () => appUpdater.rollback())
   ipcMain.handle('updater:apply', async (_e, args) => {
     const r = await appUpdater.apply(args)
     if (r.ok && args?.immediate) setTimeout(() => appUpdater.quitForUpdate(), 1500) // 等 renderer 收到应答
@@ -615,7 +618,10 @@ try {
   if (fs.existsSync(bundled)) {
     const destDir = path.join(app.getPath('userData'), 'cloudflared')
     const dest = path.join(destDir, bundledName)
-    if (!fs.existsSync(dest)) {
+    // 任务 M2：按 mtime/大小不同才覆盖——自动更新换装后新包带的 cloudflared
+    // 版本更新，旧副本必须被替换（隧道用新二进制重启）
+    const needsUpdate = !fs.existsSync(dest) || fs.statSync(bundled).size !== fs.statSync(dest).size
+    if (needsUpdate) {
       fs.mkdirSync(destDir, { recursive: true })
       fs.copyFileSync(bundled, dest)
       try { fs.chmodSync(dest, 0o755) } catch { /* win 无需 */ }
@@ -654,6 +660,33 @@ function persistHubModeIfNamed() {
 function mainWindow() { return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.webContents.getURL().includes('index.html')) }
 
 app.whenReady().then(() => {
+  // 回滚簿记（M2）：oc-updater-apply {ver,at,startsSince} 换装时写入；boot-ok 2min
+  // 后写 ver。若换装版本连续 3 次启动未见 boot-ok 更新 → 新版起不来，恢复 .bak
+  try {
+    const stR = loadLocalState()
+    const applyRec = stR['oc-updater-apply']
+    const bootOk = stR['oc-boot-ok']
+    if (applyRec && applyRec.ver !== (bootOk && bootOk.ver)) {
+      applyRec.startsSince = (applyRec.startsSince || 0) + 1
+      if (applyRec.startsSince >= 3 && process.platform === 'darwin' && fs.existsSync('/Applications/OrayChat.app.bak')) {
+        const helper = path.join(app.getPath('userData'), 'staging', 'rollback.sh')
+        fs.writeFileSync(helper, [
+          '#!/bin/bash',
+          'for i in $(seq 1 120); do kill -0 ' + process.pid + ' 2>/dev/null || break; sleep 0.5; done',
+          'sleep 1',
+          'rm -rf /Applications/OrayChat.app',
+          'ditto "/Applications/OrayChat.app.bak" /Applications/OrayChat.app',
+          'rm -f /Applications/OrayChat.app.bak',
+          'open /Applications/OrayChat.app',
+        ].join('\n'), { mode: 0o755 })
+        const child = spawn('/bin/bash', [helper], { detached: true, stdio: 'ignore' })
+        child.unref()
+        process.stdout.write('[updater] 新版连续 3 次启动异常，回滚到备份版本\n')
+      } else {
+        fs.writeFileSync(path.join(app.getPath('userData'), 'local-state.json'), JSON.stringify({ ...stR, 'oc-updater-apply': applyRec }), { mode: 0o600 })
+      }
+    }
+  } catch { /* 回滚簿记失败不影响启动 */ }
   // 演练注入：把假更新包落进本实例 files/（甲=种子持有者）
   try {
     if (process.env.ORAY_UPDATE_TEST_PKG && process.env.ORAY_UPDATE_TEST_FID) {

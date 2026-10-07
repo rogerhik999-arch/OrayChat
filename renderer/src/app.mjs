@@ -1316,6 +1316,8 @@ async function doLogin(name, room) {
         ipc: {
           stage: (args) => window.oray.updaterStage(args),
           apply: (args) => window.oray.updaterApply(args),
+          githubManifest: () => window.oray.updaterGithubManifest(),
+          githubAsset: (a) => window.oray.updaterGithubAsset(a),
         },
         onLog: (m, lv) => { window.oray.botLog(`[UPD] ${m}`); if (lv === 'warn' || lv === 'error') appendSys(`🔄 ${m}`) },
       })

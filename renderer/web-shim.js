@@ -37,7 +37,7 @@
       try { return { ...DEFAULT_CONFIG, ...JSON.parse(ls.get('oray-config') || '{}') } } catch { return { ...DEFAULT_CONFIG } }
     },
     getLaunchArgs: async () => ({}),
-    appInfo: async () => ({ version: '__APP_VERSION__', platform: 'web', profile: 'mobile' }),
+    appInfo: async () => ({ version: '__APP_VERSION__', platform: (window.Capacitor && window.Capacitor.getPlatform) ? window.Capacitor.getPlatform() : 'web', profile: 'mobile' }),
 
     loadIdentity: async (username) => {
       try { return JSON.parse(ls.get(kv(`identity:${username}`))) || null } catch { return null }

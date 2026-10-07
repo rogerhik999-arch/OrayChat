@@ -45,6 +45,7 @@ export function platformAssetKey(platform) {
   if (platform === 'darwin') return 'mac-zip'
   if (platform === 'win32') return 'win-nsis'
   if (platform === 'linux') return 'linux-appimage'
+  if (platform === 'android') return 'android-apk'
   return null
 }
 
@@ -156,10 +157,18 @@ export class Updater {
     void this.evaluate('gossip')
   }
 
-  // GitHub 兜底（M2 完整实现；M1 提供入口占位）：拉 Release 最新 manifest
+  // GitHub 兜底（M2）：主进程拉最新 Release 的签名清单（验签后与 gossip 清单同权）
   async fetchFromGitHub() {
-    this.onLog('GitHub 兜底拉取将在 M2 提供；当前可由持有新版本的成员直接分发')
-    return null
+    if (!this.ipc?.githubManifest) return null
+    const m = await this.ipc.githubManifest()
+    if (!m || !verifyManifest(m, this.trustedPubkeys)) throw new Error('GitHub 清单验签失败')
+    return m
+  }
+
+  // GitHub 直下资产（主进程下载到 files/<fid>，与 filex 拉取同位）
+  async downloadAssetFromGitHub(asset) {
+    if (!this.ipc?.githubAsset) throw new Error('GitHub 下载不可用')
+    await this.ipc.githubAsset(asset)
   }
 
   // 守门 tick（30s）
@@ -202,13 +211,59 @@ export class Updater {
       now: Date.now(),
     })
     if (!decision || decision.startsWith('defer')) return
-    try {
+      // Android（M3 轻量版）：WebView 内存 io 装不下 140MB 安装包——走"通知 +
+      // 引导到 Releases 页"（系统边界：安装本就必须用户确认）。原生 filex-io 桥
+      // 落地后可升级为包直送一键装
+      if (this.platform === 'android' && ['download', 'notify', 'notify-install', 'apply', 'apply-on-quit'].includes(decision)) {
+        if (this._androidNotified !== this.knownPkg.v) {
+          this._androidNotified = this.knownPkg.v
+          this.notify(`新版本 ${this.knownPkg.v} 已发布：请到 GitHub Releases 页下载安装`)
+          this.onLog(`Android 检测到新版本 ${this.knownPkg.v}（引导下载模式）`)
+        }
+        return
+      }
+      try {
       if (decision === 'notify') { this.notify(`发现新版本 ${this.knownPkg.v}（设置→更新 可选择策略）`); return }
       if (decision === 'notify-install') { this.notify(`新版本 ${this.knownPkg.v} 已下载就绪，重启即完成更新`); return }
-      if (decision === 'download') { void this.download() ; return }
+      if (decision === 'download') {
+        const githubOk = this.cfg.source === 'github-only' || (this._peerPullFailed && this.cfg.source !== 'peers-only')
+        if (githubOk) { void this.downloadViaGitHub(); return }
+        void this.download()
+        return
+      }
       if (decision === 'apply-on-quit') { this.notify(`新版本 ${this.knownPkg.v} 已就绪，退出时自动换装`); return } // before-quit 钩子执行换装
       if (decision === 'apply') { void this.applyStaged(true); return }
     } catch (e) { this.onLog(`更新流程异常: ${e?.message || e}`, 'warn') }
+  }
+
+  // GitHub 兜底下载：清单+资产走主进程，校验/暂存与同伴路径完全一致
+  async downloadViaGitHub() {
+    if (this.phase === 'downloading' || this.phase === 'staged' || this.phase === 'applying') return
+    const cur = this.knownPkg
+    try {
+      this.phase = 'downloading'
+      const gh = await this.fetchFromGitHub()
+      if (!gh || semverCompare(gh.v, this.appVersion) <= 0) throw new Error('GitHub 无更新')
+      const asset = gh.assets?.[platformAssetKey(this.platform)]
+      if (!asset) throw new Error('GitHub 清单无本平台资产')
+      this.onLog(`从 GitHub 拉取更新包 ${gh.v}（${Math.round(asset.size / 1048576)}MB）`)
+      await this.downloadAssetFromGitHub(asset)
+      const bytes = await this.filex.io.read(asset.fid)
+      if (!bytes) throw new Error('包不在本机')
+      const { sha256Hex } = await import('./filex.mjs')
+      if (asset.sha256 && (await sha256Hex(bytes)) !== asset.sha256) throw new Error('整包 SHA-256 不符（拒绝）')
+      this.knownPkg = gh
+      this.phase = 'staged'
+      this.onLog(`GitHub 更新包校验通过（${gh.v}），已暂存待安装`)
+      await this.ipc.stage?.({ version: gh.v, fid: asset.fid, assetName: asset.name || '' })
+      this.stagedOk = true
+      this.notify(`新版本 ${gh.v} 已就绪`)
+      void this.evaluate('staged')
+    } catch (e) {
+      this.phase = 'idle'
+      this._ghFailAt = Date.now()
+      this.onLog(`GitHub 兜底失败：${e?.message || e}`, 'warn')
+    }
   }
 
   // 多源拉包（filex 既有协议）→ 校验 → 主进程 staging
@@ -248,7 +303,8 @@ export class Updater {
       void this.evaluate('staged')
     } catch (e) {
       this.phase = 'idle'
-      this.onLog(`更新包获取失败：${e?.message || e}（30 分钟后随下轮 tick 重试，或等更多成员成为种子）`, 'warn')
+      this._peerPullFailed = true // 源路由：下次 evaluate 转 GitHub 兜底（peers-only 除外）
+      this.onLog(`更新包获取失败：${e?.message || e}（30 分钟后随下轮 tick 重试，或转 GitHub 兜底）`, 'warn')
       this.jitterUntil = Date.now() + 30 * 60000 // 拉取失败：歇 30 分钟再试（避免风暴）
     }
   }
@@ -264,6 +320,7 @@ export class Updater {
       ...state, lastAutoApplyAt: this.lastAutoApplyAt, autoAppliedVer: this.knownPkg.v,
       autoAppliedAt: Date.now(), autoApplyFails: this.autoApplyFails,
     }))
+    await this.kv.set('oc-updater-apply', JSON.stringify({ ver: this.knownPkg.v, at: Date.now(), startsSince: 0 })) // 回滚簿记
     this.onLog(`${immediate ? '自动更新' : '退出换装'}：应用 ${this.knownPkg.v}（换装后自动重启并成为种子）`, 'warn')
     try { await this.ipc.apply?.({ version: this.knownPkg.v, immediate }) } catch (e) {
       this.phase = 'staged'

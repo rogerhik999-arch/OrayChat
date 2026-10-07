@@ -203,6 +203,8 @@ if (window.settings.hubStart) {
         $('updVersion').textContent = `${status.version || '—'} / ${status.knownPkg?.v || '（房间无更新信息）'}`
         $('updPolicy').value = cfg.policy || status.policy || 'download-prompt'
         $('updSource').value = cfg.source || status.source || 'peers-first'
+        const btn = $('updInstallBtn')
+        if (btn) btn.style.display = status.stagedOk ? '' : 'none'
         const bits = [`阶段 ${status.phase || 'idle'}`]
         if (status.stagedOk) bits.push('✅ 已暂存待装')
         if ((status.fails || 0) > 0) bits.push(`自动更新失败 ${status.fails} 次`)
@@ -212,6 +214,14 @@ if (window.settings.hubStart) {
     }
     renderUpd()
     setInterval(renderUpd, 15000)
+    $('updInstallBtn').onclick = async () => {
+      const u = await window.settings.updater()
+      const v = u.status?.knownPkg?.v
+      if (!v) return
+      toast(`正在换装 ${v}，应用将自动重启…`)
+      await window.settings.updaterApply({ version: v, immediate: true })
+    }
+    $('updGithubBtn').onclick = () => toast('GitHub 为自动兜底：同伴无源时自动走 GitHub，无需手动检查')
     $('updPolicy').onchange = () => window.settings.updaterSetCfg({ policy: $('updPolicy').value })
     $('updSource').onchange = () => window.settings.updaterSetCfg({ source: $('updSource').value })
   }

@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('oray', {
   // 分布式自动更新（docs/update-plan.md M1）
   updaterStage: (args) => ipcRenderer.invoke('updater:stage', args),
   updaterApply: (args) => ipcRenderer.invoke('updater:apply', args),
+  updaterGithubManifest: () => ipcRenderer.invoke('updater:github-manifest'),
+  updaterGithubAsset: (asset) => ipcRenderer.invoke('updater:github-asset', asset),
   onHubEvent: (fn) => { ipcRenderer.on('hub:event', (_e, ev) => fn(ev)) },
   hubSetNames: (map) => ipcRenderer.send('hub:set-names', map),
 
