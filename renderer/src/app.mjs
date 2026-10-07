@@ -1708,6 +1708,7 @@ async function iceProbe() {
 
   // 中继稳定度统计：url -> {lastOkAt, fails}（relay 链路事件驱动；参与 broker 排序）
 const relayStats = new Map()
+let healthSamples = [] // 健康环形样本（A 任务；state.health 引用它）
 const noteBroker = (url, ok) => {
   if (!url) return
   const st = relayStats.get(url) || { lastOkAt: 0, fails: 0 }
@@ -2120,6 +2121,39 @@ setInterval(() => {
 setInterval(() => {
   if (state.net && !$('mainView').classList.contains('hidden')) renderPeers()
 }, 5000)
+
+// ---------- 健康采样（docs/longrun-hardening-plan.md 任务 A）----------
+// 每 10min 采一次长跑健康指标，环形存 local-state 'oc-health'（144 条 = 24h）。
+// 长跑问题（内存增长/链路翻动/看门狗误触发）从此有数字可查，设置页「健康」区块
+// 展示——"感觉变慢了"变成"堆内存从 X 涨到 Y"
+window.oray.kvGet('oc-health').then((v) => { try { healthSamples = JSON.parse(v) || [] } catch { healthSamples = [] } }).catch(() => {})
+
+function sampleHealth() {
+  try {
+    const relay = state.net?.relay
+    const links = relayLinksInfo()
+    const rate = relay ? Math.round(((relay.framesIn || 0) - (state._framesInMark || 0)) / 600) : 0 // 帧/秒（10min 窗口均值）
+    if (relay) state._framesInMark = relay.framesIn || 0
+    const sample = {
+      t: Date.now(),
+      heap: Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576), // MB
+      blobs: (state.imgUrls?.size || 0) + (state.voiceUrls?.length || 0),
+      dom: document.getElementsByTagName('*').length,
+      inRate: rate,
+      drops: links.reduce((s, l) => s + (l.fails || 0), 0),
+      linksAlive: links.filter((l) => l.alive).length,
+      linksAll: links.length,
+      ready: [...(state.net?.peers?.values() || [])].filter((p) => p.state === 'ready').length,
+      wd: state.net?._wdK || 0,
+    }
+    healthSamples.push(sample)
+    while (healthSamples.length > 144) healthSamples.shift()
+    window.oray.kvSet('oc-health', JSON.stringify(healthSamples)).catch(() => {})
+    if (state.args.bot) window.oray.botLog(`[BOT] HEALTH heap=${sample.heap}MB blobs=${sample.blobs} dom=${sample.dom} in=${sample.inRate}/s drops=${sample.drops} links=${sample.linksAlive}/${sample.linksAll} ready=${sample.ready}`)
+  } catch { /* 采样失败不影响主流程 */ }
+}
+setInterval(sampleHealth, 10 * 60000)
+
 // 回到前台：主动检查上线状态
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.net) state.net.onVisible()

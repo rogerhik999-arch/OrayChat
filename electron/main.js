@@ -377,6 +377,9 @@ function registerIpc() {
     fs.writeFileSync(statePath(), JSON.stringify(s4), { mode: 0o600 })
     return cleared
   })
+  ipcMain.handle('settings:health', () => {
+    try { return JSON.parse(loadLocalState()['oc-health'] || '[]') } catch { return [] }
+  })
   ipcMain.handle('settings:list-rooms', () => {
     const s5 = loadLocalState()
     return Object.keys(s5).filter((k) => k.startsWith('oc-log2:')).map((k) => k.replace('oc-log2:', ''))

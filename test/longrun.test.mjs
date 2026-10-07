@@ -115,6 +115,85 @@ console.log('[3] stableClientId')
   ok('3.3 保留身份指纹前缀（hub 成员识别兼容）', /^oc-abcd1234-[0-9a-z]{1,6}$/.test(a), a)
 }
 
+// ---------- ④ 同步分块（任务 B）----------
+console.log('[4] pushSync 分块 + 节流')
+{
+  const now = Date.now()
+  const store = new LogStore({ now: () => now })
+  for (let i = 0; i < 300; i++) store.addMsg('lobby', { mid: `k${i}`, author: 'a'.repeat(64), text: 'x'.repeat(300), t: now - (300 - i) * 1000, type: 'text' })
+  const net = Object.create(ChatNet.prototype)
+  net.store = store
+  net.peers = new Map([['p1', { state: 'ready', via: 'mqtt', name: 'bob' }]])
+  net.relay = { send: (to, kind, frame, opts) => { net.sent = [...(net.sent || []), { to, kind, frame, opts }] }, connected: true, lastInboundAt: Date.now() }
+  net.peerNames = new Map([['a'.repeat(64), 'alice']])
+  net.storeKey = (conv) => conv
+  net.syncCursors = new Map()
+  net.syncFullAt = new Map()
+  net.hooks = { onLog: () => {} }
+  await net.pushSync('p1', 'lobby')
+  const sends = net.sent.filter((x) => x.kind === 'sync')
+  const total = sends.reduce((s, x) => s + JSON.stringify(x.frame).length, 0)
+  ok('4.1 大帧拆多帧', sends.length >= 3, `${sends.length} 帧 / 共 ${Math.round(total / 1024)}KB`)
+  ok('4.2 首帧携带墓碑与 clearT', Object.keys(sends[0].frame.state.dels || {}).length >= 0 && 'clearT' in sends[0].frame.state && sends[0].frame.names && Object.keys(sends[0].frame.names).length === 1)
+  ok('4.3 各帧条目不重不漏（拼回=全量）', sends.flatMap((x) => x.frame.state.entries).length === 300)
+  ok('4.4 全部走 QoS1', sends.every((x) => x.opts?.qos === 1))
+  // 接收端幂等收敛：逐帧 applyState 与整帧一次 applyState 等价
+  const r1 = new LogStore({ now: () => now })
+  for (const x of sends) r1.applyState('lobby', x.frame.state)
+  const r2 = new LogStore({ now: () => now })
+  r2.applyState('lobby', store.exportConv('lobby'))
+  ok('4.5 分帧应用与整帧应用收敛一致', r1.exportConv('lobby').entries.length === r2.exportConv('lobby').entries.length)
+  // 小帧不拆
+  const small = new LogStore({ now: () => now })
+  small.addMsg('lobby', { mid: 's1', author: 'a'.repeat(64), text: 'hi', t: now, type: 'text' })
+  const net2 = Object.create(ChatNet.prototype)
+  net2.store = small
+  net2.peers = new Map([['p1', { state: 'ready', via: 'mqtt', name: 'bob' }]])
+  net2.relay = { send: (to, kind, frame, opts) => { net2.sent = [...(net2.sent || []), { kind }] } }
+  net2.peerNames = new Map()
+  net2.storeKey = (conv) => conv
+  net2.syncCursors = new Map()
+  net2.syncFullAt = new Map()
+  net2.hooks = { onLog: () => {} }
+  await net2.pushSync('p1', 'lobby')
+  ok('4.6 小帧单发不拆', net2.sent.length === 1)
+}
+
+// ---------- ⑤ Lifeguard 动态怀疑（任务 C）----------
+console.log('[5] Lifeguard 动态怀疑宽限')
+{
+  const now = Date.now()
+  const mkPeer = (arrivals) => ({ name: 'p', lastSeen: now - 200 * 1000, suspectSince: now - 45 * 1000, arrivals })
+  // 稳定链路（抖动小）：35s 怀疑 > 20s×1.x → 判死
+  const t1 = Object.create(RelayTransport.prototype)
+  t1.peers = new Map([['stable', { name: 'p', lastSeen: now - 200 * 1000, suspectSince: now - 35 * 1000, arrivals: [10000, 10200, 9900, 10100, 10050] }]])
+  t1._dropTimes = []
+  t1.onPeerGone = (id) => { t1.gone = id }
+  t1.onPeerSuspect = () => {}
+  t1.prune()
+  ok('5.1 稳定链路 35s 怀疑判死', t1.gone === 'stable')
+  // 抖动链路（移动网络形态 10/10/60/10/10s：σ/avg≈0.93 → 宽限×1.93≈38.6s）→ 35s 不判死
+  const t2 = Object.create(RelayTransport.prototype)
+  t2.peers = new Map([['jittery', { name: 'p', lastSeen: now - 200 * 1000, suspectSince: now - 35 * 1000, arrivals: [10000, 10000, 60000, 10000, 10000] }]])
+  t2._dropTimes = []
+  t2.onPeerGone = (id) => { t2.gone = id }
+  t2.onPeerSuspect = () => {}
+  t2.prune()
+  ok('5.2 抖动链路宽限放大后 35s 不判死', t2.gone === undefined && t2.peers.has('jittery'))
+  // 劣化模式：近 10min 3 次断开 → 宽限 ×2（同抖动链路 35s：20×0.93... 稳定链路 35s>40s? ×2=40s → 存活）
+  const t3 = Object.create(RelayTransport.prototype)
+  t3.peers = new Map([['stable', { name: 'p', lastSeen: now - 200 * 1000, suspectSince: now - 35 * 1000, arrivals: [10000, 10200, 9900, 10100, 10050] }]])
+  const now2 = Date.now()
+  t3._dropTimes = [now2 - 1000, now2 - 2000, now2 - 3000]
+  t3.onPeerGone = (id) => { t3.gone = id }
+  t3.onPeerSuspect = () => {}
+  t3.prune()
+  ok('5.3 劣化模式判定（3 次断开）且宽限 ×2 后稳定链路 35s 也不判死', t3.degraded() === true && t3.gone === undefined && t3.peers.has('stable'))
+  // 正常模式
+  t3._dropTimes = [now2 - 1000]
+  ok('5.4 恢复常态（1 次断开）', t3.degraded() === false)
+}
+
 const pass = results.filter(Boolean).length
 console.log(`\n${pass === results.length ? '✅' : '❌'} longrun.test.mjs：${pass}/${results.length} 通过`)
 process.exit(pass === results.length ? 0 : 1)

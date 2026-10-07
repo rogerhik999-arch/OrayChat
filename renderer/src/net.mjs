@@ -1082,8 +1082,36 @@ export class ChatNet {
     }
     const frame = { conv: wireConv, state, names }
     try {
-      if (peer.via === 'mqtt') this.relay.send(peerId, 'sync', frame, { qos: 1 }) // P0-③ 关键帧 QoS1
-      else await this.syncAction?.send(frame, { target: peerId })
+      if (peer.via === 'mqtt') {
+        // 任务 B（longrun-hardening-plan）：>32KB 拆多帧 + 50ms pacing——首帧携带
+        // dels/clearT/names（幂等合并先落墓碑），条目按预算分批。接收端零改动
+        //（applyState 逐帧幂等），txid 去重天然处理 QoS1 重复；中间丢帧由
+        // 30min 全量周期兜底。同步大帧不再整块挤占链路（控制面/数据面隔离）
+        const body = JSON.stringify(frame)
+        if (body.length <= 32 * 1024) {
+          this.relay.send(peerId, 'sync', frame, { qos: 1 })
+        } else {
+          const est = (e) => 140 + (e.text?.length || 0) + (e.thumb?.length || 0) + (e.name?.length || 0)
+          const batches = [[]]
+          let bytes = 0
+          for (const e of state.entries) {
+            const w = est(e)
+            if (bytes + w > 30 * 1024 && batches[batches.length - 1].length) { batches.push([]); bytes = 0 }
+            batches[batches.length - 1].push(e)
+            bytes += w
+          }
+          this.hooks.onLog?.(`同步 → ${peer.name || peerId.slice(0, 8)}…（${Math.round(body.length / 1024)}KB，拆 ${batches.length} 帧 pacing 发送）`)
+          for (let i = 0; i < batches.length; i++) {
+            const head = i === 0
+            this.relay.send(peerId, 'sync', {
+              conv: wireConv,
+              state: { entries: batches[i], dels: head ? state.dels : {}, clearT: head ? state.clearT : 0 },
+              names: head ? names : {},
+            }, { qos: 1 })
+            if (i < batches.length - 1) await new Promise((r) => setTimeout(r, 50))
+          }
+        }
+      } else await this.syncAction?.send(frame, { target: peerId })
     } catch (e) { this.hooks.onLog?.(`同步帧发送失败: ${e?.message || e}`, 'warn'); return }
     // 发送成功才推进游标；maxT 取条目/墓碑最大值（纯墓碑轮次也推进，避免重复发）
     const maxT = Math.max(0, ...state.entries.map((e) => e.t || 0), ...Object.values(state.dels).map((t) => t || 0))

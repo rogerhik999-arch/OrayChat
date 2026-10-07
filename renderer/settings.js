@@ -190,6 +190,21 @@ if (window.settings.hubStart) {
     $('hubEnabled').checked = !!savedHub.enabled
   }
   window.settings.get().then((info) => restoreSaved((info.userConfig || {}).hub || {})).catch(() => {})
+
+  // 健康面板（任务 A）：有采样数据才显示区块
+  window.settings.health?.().then((samples) => {
+    if (!Array.isArray(samples) || !samples.length) return
+    $('healthCard').style.display = ''
+    const fmt = (x) => {
+      const d = new Date(x.t)
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} 堆${x.heap}MB · blob${x.blobs} · DOM${x.dom} · 入站${x.inRate}/s · 断线${x.drops} · 链路${x.linksAlive}/${x.linksAll} · 就绪${x.ready}${x.wd ? ` · 看门狗×${x.wd}` : ''}`
+    }
+    const last = samples[samples.length - 1]
+    const d = new Date(last.t)
+    const age = Math.round((Date.now() - last.t) / 60000)
+    $('healthNow').textContent = `最近样本（${age} 分钟前）：${fmt(last)}`
+    $('healthList').textContent = samples.slice(-24).reverse().map(fmt).join('\n')
+  }).catch(() => {})
   window.settings.hubStatus().then((st) => {
     hubRender(st)
     if (st.running) $('hubEnabled').checked = true

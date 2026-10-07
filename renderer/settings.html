@@ -151,6 +151,13 @@
     </div>
   </div>
 
+  <div class="set-card" id="healthCard" style="display:none">
+    <h2>健康（长跑观测）</h2>
+    <div id="healthNow" style="font-size:12.5px; color:var(--tx)">—</div>
+    <div id="healthList" style="margin-top:8px; font-family:var(--mono, monospace); font-size:11px; color:var(--tx2); max-height:180px; overflow-y:auto"></div>
+    <div class="hint">每 10 分钟采样一次（保留 24 小时）。堆内存持续上涨 / 断线数暴涨 / 看门狗触发 = 长跑隐患信号；链路与就绪会话正常时无需重启。</div>
+  </div>
+
   <div class="set-card" id="about">
     <h2>关于</h2>
     <table>

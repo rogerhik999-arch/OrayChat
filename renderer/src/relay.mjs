@@ -27,6 +27,7 @@ import { selfId } from '@trystero-p2p/mqtt'
 import * as oc from './crypto.mjs'
 
 const PRESENCE_INTERVAL_MS = 10000
+const PRESENCE_IDLE_INTERVAL_MS = 30000 // 任务 D：成员集合稳定 5min 后的放宽间隔
 const PRESENCE_TTL_MS = 30000
 const TTL_MIN_MS = 15000
 const TTL_MAX_MS = 90000
@@ -41,9 +42,20 @@ function adaptiveTtl(entry) {
   const varr = h.reduce((a, b) => a + (b - avg) ** 2, 0) / h.length
   return Math.max(TTL_MIN_MS, Math.min(TTL_MAX_MS, avg * 2 + 4 * Math.sqrt(varr)))
 }
-const SUSPECT_MS = 20000 // 怀疑 → 判死的宽限期（期间可被 ping/digest 复活）
+const SUSPECT_MS = 20000 // 怀疑 → 判死的宽限期基线（Lifeguard 化：实际值按到达抖动/劣化动态放大）
 const DEDUP_WINDOW_MS = 60000
 const DEFAULT_PARALLEL = 2
+
+// 到达节奏抖动系数（Lifeguard）：σ/avg ∈ [0,2] → 宽限 ×(1+σ/avg)。抖动大的
+// 链路给更长的"沉默不算死"窗口；样本不足回退 1（不放大）
+function arrivalGrace(p) {
+  const h = p?.arrivals
+  if (!h || h.length < 3) return 1
+  const avg = h.reduce((a, b) => a + b, 0) / h.length
+  if (avg <= 0) return 1
+  const varr = h.reduce((a, b) => a + (b - avg) ** 2, 0) / h.length
+  return 1 + Math.min(2, Math.sqrt(varr) / avg)
+}
 
 export class RelayTransport {
   constructor({ appId, roomId, brokerUrls, myName, roomKey, instanceId, parallel, clientIdBase = '', onAnnounce, onFrame, onPeerGone, onPeerSuspect, onLog }) {
@@ -71,10 +83,15 @@ export class RelayTransport {
     // 并联数不超过 broker 数
     this.parallelN = Math.max(1, Math.min(parallel || DEFAULT_PARALLEL, this.brokerUrls.length))
     for (let i = 0; i < this.parallelN; i++) this.spawnLink(this.brokerUrls[i])
-    // P2-5 抖动广播：10±2s 随机间隔（防多端同步广播的雷群效应）
+    // P2-5 抖动广播：10±2s 随机间隔（防多端同步广播的雷群效应）。
+    // 任务 D（longrun-hardening-plan）：成员集合稳定 5min（无加入/离开/新认知）
+    // → 间隔自动放宽到 30s（公共 broker 流量减半，降低限流风险）；接收端
+    // adaptiveTtl 按到达节奏自适应，天然跟随无需改动
     const scheduleAnnounce = () => {
       if (this.closed) return
-      const jitter = PRESENCE_INTERVAL_MS + (Math.random() * 4000 - 2000)
+      const idle = Date.now() - (this._presencePatternAt || Date.now()) > 5 * 60000
+      const base = idle ? PRESENCE_IDLE_INTERVAL_MS : PRESENCE_INTERVAL_MS
+      const jitter = base + (Math.random() * 4000 - 2000)
       this.presenceTimer = setTimeout(() => {
         try { this.announce() } catch { /* 广播失败不杀链：presence 链一旦断掉，所有人永远看不到本机（重启才恢复） */ }
         scheduleAnnounce()
@@ -156,6 +173,7 @@ export class RelayTransport {
       // 该链路静默死亡；各条链陆续死光即"全员掉线，重启才恢复"
       try {
         const alive = this.aliveLinks().length
+        this.noteLinkDrop() // Lifeguard 劣化感知：近 10min ≥3 次 → 宽限窗放大
         this.onLog(alive > 0 ? `中继链路断开 ${url}（仍有 ${alive} 条并联存活）` : `中继链路断开 ${url}（全部并联已断）`, 'warn')
       } catch { /* UI 钩子异常不拦重连 */ }
       this.scheduleLinkRetry(url)
@@ -202,6 +220,7 @@ export class RelayTransport {
 
   onMessage(topic, payload) {
     this.lastInboundAt = Date.now() // 任何入站帧都算（看门狗判据：只认真实到达，不读内部状态）
+    this.framesIn = (this.framesIn || 0) + 1 // 健康面板：入站帧速率采样
     // 有口令的房间：帧整体加密，口令不符（解密失败）即丢弃 —— 无口令者无法注入有效帧
     let msg
     try { msg = oc.openRoom(this.roomKey, JSON.parse(payload.toString())) } catch { return }
@@ -214,7 +233,7 @@ export class RelayTransport {
       const arrivals = prev?.arrivals?.slice(-ARRIVAL_HISTORY + 1) || []
       if (prev?.lastSeen && now > prev.lastSeen) arrivals.push(now - prev.lastSeen)
       this.peers.set(msg.id, { name: String(msg.name || '未知用户'), lastSeen: now, suspectSince: null, arrivals })
-      if (!known) this.onAnnounce?.(msg.id, this.peers.get(msg.id))
+      if (!known) { this._presencePatternAt = Date.now(); this.onAnnounce?.(msg.id, this.peers.get(msg.id)) }
     } else if (topic === RelayTransport.topics(this.appId, this.roomId).inbox(this.selfId)) {
       if (!msg?.from || msg.from === this.selfId) return
       // 多链路去重：同一 txid 只处理一次（旧版本无 txid 的帧照常处理）
@@ -235,13 +254,34 @@ export class RelayTransport {
     }
   }
 
+  // 链路健康（Lifeguard 化，任务 C）：近 10min 断开次数 ≥3 → 劣化模式——
+  // 全部宽限窗放大（本机网络抖动期，presence 到达慢是常态不是死亡证据），
+  // 恢复后自动回常态
+  noteLinkDrop() {
+    const now = Date.now()
+    this._dropTimes = [...(this._dropTimes || []), now].filter((t) => now - t < 10 * 60000)
+  }
+
+  degraded() {
+    const now = Date.now()
+    this._dropTimes = (this._dropTimes || []).filter((t) => now - t < 10 * 60000)
+    return this._dropTimes.length >= 3
+  }
+
   prune() {
     const now = Date.now()
+    // Lifeguard（docs/longrun-sync-research.md §2.1）：怀疑宽限不再固定 20s——
+    // ①按对端到达节奏动态（抖动大的链路给更长的"沉默不算死"窗口）；②本机链路
+    // 劣化时整体 ×2（低敏感模式）。真消失者仍有 adaptiveTtl（≤90s）+ 上层
+    // reapGhosts 的 90s 硬上限双保险兜住，不会因放宽而永生
+    const grace = arrivalGrace
+    const suspectMs = Math.min(60000, SUSPECT_MS * (this.degraded() ? 2 : 1))
     for (const [id, p] of this.peers) {
       if (now - p.lastSeen > adaptiveTtl(p) && !p.suspectSince) {
         p.suspectSince = now
         this.onPeerSuspect?.(id) // SWIM 怀疑标记：交上层 ping/digest 确认
-      } else if (p.suspectSince && now - p.suspectSince > SUSPECT_MS) {
+      } else if (p.suspectSince && now - p.suspectSince > suspectMs * (p.arrivals?.length >= 3 ? grace(p) : 1)) {
+        this._presencePatternAt = Date.now() // 成员离开：presence 回快节奏
         this.peers.delete(id)
         this.onPeerGone?.(id)
       }
