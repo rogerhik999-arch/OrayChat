@@ -1250,6 +1250,17 @@ export class ChatNet {
       if (known?.suspectSince) this.relay.markAlive(pid)
       if (this.recentlyReaped.has(pid)) continue // 刚回收的残身：冷却期内不被摘要复种
       const name = decodeURIComponent(encName || '')
+      // 同名 ready 会话已存在（昵称即账号）：摘要里的其他 pid 是该成员重启/升级
+      // 换 selfId 后其他成员的认知残影——不复种、不重试，旧条目由常驻接管清扫
+      //（误清的两台同名活设备之一经 presence 直连发现自愈）
+      const readySame = this.readySameNamePid(name)
+      if (readySame && readySame !== pid) {
+        const stale = this.peers.get(pid)
+        if (stale && stale.state !== 'ready') {
+          this.dropGhost(pid, stale, `摘要中的同名旧连接已被就绪会话取代`)
+        }
+        continue
+      }
       const existing = this.peers.get(pid)
       if (!existing) {
         if ((this.digestTries.get(pid) || 0) >= 2) continue // 多次间接介绍未果：不再复种
@@ -1415,6 +1426,15 @@ export class ChatNet {
     try { this.goOnline('看门狗：链路静默强制复位') } catch { /* 复位失败等下轮冷却后再试 */ }
   }
 
+  // 同名 ready 会话（昵称即账号）：接管/防复种共用
+  readySameNamePid(name) {
+    if (!name) return null
+    for (const [pid, p] of this.peers) {
+      if (p.state === 'ready' && p.name === name) return pid
+    }
+    return null
+  }
+
   reapGhosts() {
     if (this.destroyed) return
     const now = Date.now()
@@ -1423,6 +1443,33 @@ export class ChatNet {
     if (!conn) this.relayStableSince = 0
     this._relayWasConn = conn
     for (const [pid, ts] of this.recentlyReaped) if (now - ts > REAP_COOLDOWN_MS) this.recentlyReaped.delete(pid)
+    // 同名接管常驻化（此前只在 markReady 一次性触发）：对端升级/重启换 selfId 后，
+    // 其他成员的认知滞后（SWIM 摘要/presence 残留）会在我方 ready **之后**才复种出
+    // 旧 peerId 条目——握手失败 + presence 残留在 TTL 内挡住回收（reap 的
+    // "仍在线播 presence 即真在线"守卫连 90s 硬上限都拦），双条目挂数分钟（用户实测
+    // FengGpd 升级后）。昵称即账号：同名 ready 会话存在时，非 ready 同名条目随时
+    // 可清；误清的第二台同名活设备经 presence 重启握手自愈（v1.22.2 已论证无害）
+    {
+      const readyByName = new Map()
+      for (const [pid, p] of this.peers) {
+        if (p.state === 'ready' && p.name && !readyByName.has(p.name)) readyByName.set(p.name, pid)
+      }
+      if (readyByName.size) {
+        for (const [pid, p] of [...this.peers.entries()]) {
+          if (p.state === 'ready') continue
+          if (this.filex?.hasActiveTransfer?.(pid)) continue
+          const name = p.name || (p.idPubHex ? this.peerNames.get(p.idPubHex) : null)
+          const readyPid = name && readyByName.get(name)
+          if (!readyPid || readyPid === pid) continue
+          // ⚠️ 只清 presence 已过气（>30s 无广播）或缺失的旧影——presence 新鲜的
+          // 同名失败条目可能是真在线的第二台设备/握手抖动，必须保持可恢复
+          //（reap 主循环的 k3 不变量）。FengGpd 实测场景是 62s 的死 presence 残留
+          const seen = this.relay?.peers?.get(pid)?.lastSeen
+          if (seen && Date.now() - seen < GHOST_FAST_MS) continue
+          this.dropGhost(pid, p, `同名接管清扫：「${name}」已有就绪会话`)
+        }
+      }
+    }
     // 我方中继不在线/刚连上：视野不可信，本轮不回收
     if (!conn || !this.relayStableSince || now - this.relayStableSince < RELAY_VIEW_WARMUP_MS) return
     for (const [peerId, peer] of [...this.peers.entries()]) {

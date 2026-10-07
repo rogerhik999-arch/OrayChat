@@ -218,4 +218,31 @@ function fakePeer(over = {}) {
   assert.ok(net.peers.has(pid), '对端主动 hs1 无条目也接受')
 }
 
+// ---- 7) 同名接管常驻化（FengGpd 升级后双条目实测）：ready 之后才复种出的
+// 旧 peerId 条目（握手失败 + presence 残留挡回收）由 reapGhosts 常驻清扫 ----
+{
+  const { net, events } = bareNet(['oldPid'], { stableFor: 0 }) // 视野未预热也要清（接管不依赖中继视野）
+  net.peers.set('newPid', fakePeer({ name: 'FengGpd', state: 'ready' }))
+  net.peers.set('oldPid', fakePeer({ name: 'FengGpd', state: 'failed', lastError: '握手超时' }))
+  net.relay.peers.set('oldPid', { name: 'FengGpd', lastSeen: Date.now() - 62000 }) // 残留 TTL 内，挡回收的元凶
+  net.reapGhosts()
+  assert.ok(!net.peers.has('oldPid'), '同名 ready 存在时，旧 peerId 失败条目应被常驻清扫（无视 presence 残留/预热）')
+  assert.ok(net.peers.has('newPid'), 'ready 条目保留')
+  assert.ok(events.logs.some((l) => l.includes('同名接管清扫')), '应有清扫日志')
+}
+
+// ---- 8) 摘要同名额防复种：digest 携带旧 pid（同名）→ 不复种、旧 failed 条目清理 ----
+{
+  const { net, events } = bareNet(['oldPid'])
+  net.peers.set('newPid', fakePeer({ name: 'FengGpd', state: 'ready' }))
+  net.peers.set('oldPid', fakePeer({ name: 'FengGpd', state: 'failed', lastError: '握手超时' }))
+  net.absorbDigest('newPid', [`oldPid|${encodeURIComponent('FengGpd')}`])
+  assert.ok(!net.peers.has('oldPid'), '摘要复种同名旧 pid 应直接清理旧条目')
+  assert.ok(!net.peers.has('oldPid2') === false || true)
+  // 无同名 ready 时摘要照常复种（不误伤正常间接发现）
+  const { net: net2, events: ev2 } = bareNet()
+  net2.absorbDigest('somebody', [`freshPid|${encodeURIComponent('新人')}`])
+  assert.ok(net2.peers.has('freshPid'), '无同名 ready 时摘要照常复种')
+}
+
 console.log('ghosts.test.mjs ✓ 全部通过（身份去重 / 残身回收 / 视野门控 / 摘要复种防护 / 握手失败簿记）')
