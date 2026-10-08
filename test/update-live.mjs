@@ -16,7 +16,7 @@ import { createRequire } from 'node:module'
 const ROOT = path.dirname(path.dirname(import.meta.url.replace('file://', '')))
 const ELECTRON = createRequire(path.join(ROOT, 'package.json'))('electron')
 const ROOM = `oc-updlive-${Date.now().toString(36)}`
-const TEST_DIR = '/tmp/oc-updlive'
+const TEST_DIR = path.join(os.tmpdir(), 'oc-updlive')
 fs.rmSync(TEST_DIR, { recursive: true, force: true })
 fs.mkdirSync(TEST_DIR, { recursive: true })
 
@@ -33,7 +33,12 @@ fs.writeFileSync(path.join(pkgDir, 'Info.plist'), `<?xml version="1.0" encoding=
 fs.writeFileSync(path.join(TEST_DIR, 'pkg', 'OrayChat.app', 'Contents', 'marker.txt'), 'oraychat-update-live')
 const zipPath = path.join(TEST_DIR, 'OrayChat-9.9.9-arm64-mac.zip')
 const { execFileSync } = createRequire(import.meta.url)('node:child_process')
-execFileSync('zip', ['-qr', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
+// Windows 无 zip 命令，用系统自带 bsdtar（Win10 1803+）按后缀出 zip；mac/linux 用 zip
+if (process.platform === 'win32') {
+  execFileSync('tar', ['-a', '-c', '-f', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
+} else {
+  execFileSync('zip', ['-qr', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
+}
 const buf = fs.readFileSync(zipPath)
 const sha = crypto.createHash('sha256').update(buf).digest('hex')
 const fid = sha.slice(0, 24)
@@ -73,7 +78,11 @@ launch('b', '乙', ['--update-test-client'])
 
 // 乙发现→拉取→暂存（180s 预算）。断言用落盘状态而非日志行（更可靠）：
 // B 的 oc-updater-state.knownPkg.v（gossip 采纳）+ files/ 里出现更新包
-const bProfile = path.join(os.homedir(), 'Library', 'Application Support', 'OrayChat', 'b')
+// userData 与主进程 app.setPath 对齐：mac=~/Library/Application Support，win=%APPDATA%，linux=~/.config
+const APP_DATA = process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support')
+  : process.platform === 'win32' ? path.join(os.homedir(), 'AppData', 'Roaming')
+  : path.join(os.homedir(), '.config')
+const bProfile = path.join(APP_DATA, 'OrayChat', 'b')
 const bState = () => { try { return JSON.parse(fs.readFileSync(path.join(bProfile, 'local-state.json'), 'utf8')) } catch { return {} } }
 const staged = await waitFor(() => {
   try { return JSON.parse(bState()['oc-updater-state'] || '{}').knownPkg?.v === ver } catch { return false }
@@ -86,9 +95,9 @@ console.log(`乙: 发现/采纳=${found} 拉取=${pulled} 暂存=${staged}`)
 const dstZipOk = fs.existsSync(path.join(TEST_DIR, 'dst', '乙')) || staged // dst 由 apply 阶段产出
 
 for (const p of procs) { try { process.kill(-p.pid, 'SIGKILL') } catch { try { p.kill('SIGKILL') } catch {} } }
-fs.writeFileSync('/tmp/oc-updlive-a.log', L('a'))
-fs.writeFileSync('/tmp/oc-updlive-b.log', L('b'))
+fs.writeFileSync(path.join(TEST_DIR, 'a.log'), L('a'))
+fs.writeFileSync(path.join(TEST_DIR, 'b.log'), L('b'))
 
 const pass = staged && found
-console.log(`\n${pass ? '✅' : '❌'} update-live：${pass ? 'gossip→拉取→校验→暂存 全链通过' : '链路未走通（日志 /tmp/oc-updlive-{a,b}.log）'}`)
+console.log(`\n${pass ? '✅' : '❌'} update-live：${pass ? 'gossip→拉取→校验→暂存 全链通过' : `链路未走通（日志 ${path.join(TEST_DIR, 'a.log')} / ${path.join(TEST_DIR, 'b.log')}）`}`)
 process.exit(pass ? 0 : 1)

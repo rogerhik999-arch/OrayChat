@@ -102,7 +102,19 @@ async function apply(opts) {
   if (process.platform === 'darwin') {
     steps = buildApplySteps('darwin', { dst: process.env.ORAY_UPDATE_DST || '/Applications/OrayChat.app', appPath: st.appPath, pid: pid })
   } else if (process.platform === 'win32') {
-    steps = buildApplySteps('win32', { installerPath: st.installerPath, pid: pid })
+    // Windows 无 /bin/bash：写 cmd 批处理 helper——等待本进程退出（释放 exe 句柄）
+    // 后静默安装，NSIS /S 自带完成重启。未实机验证（首次跨平台测试重点纠错项）。
+    const helper = path.join(userDataDir(), 'staging', 'update-helper.cmd')
+    fs.writeFileSync(helper, [
+      '@echo off',
+      'rem OrayChat 换装 helper（自动生成 v' + version + '）',
+      'for /l %%i in (1,1,120) do (tasklist /FI "PID eq ' + pid + '" 2>nul | find "' + pid + '" >nul && ping -n 2 127.0.0.1 >nul)',
+      'ping -n 2 127.0.0.1 >nul',
+      '"' + st.installerPath + '" /S',
+    ].join('\r\n'))
+    const child = spawn('cmd.exe', ['/c', helper], { detached: true, stdio: 'ignore' })
+    child.unref()
+    return { ok: true, helper: helper }
   } else {
     steps = buildApplySteps('linux', { dst: process.env.ORAY_UPDATE_DST || process.execPath, appPath: st.appPath, pid: pid })
   }
