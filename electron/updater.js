@@ -13,7 +13,13 @@ const fs = require('node:fs')
 // GitHub 下载走 Chromium 网络栈（net.fetch）：自动使用系统代理。Node 裸 fetch
 // 不认 Windows 系统代理——github.com 直连超时、代理可达的环境（典型国内网络）
 // 会让兜底链路整个卡死。app 未 ready 或无 net.fetch 时退回 Node fetch。
-const xfetch = (url, opts) => (app.isReady() && typeof net?.fetch === 'function' ? net.fetch(url, opts) : fetch(url, opts))
+// ⚠️ 必须带 AbortSignal 超时：连接被黑洞（墙/SNI 阻断）时两层 fetch 都会永久挂起，
+// 渲染层 phase 停在 downloading 无日志无重试（2026-10-08 实机 gh6 复现）。
+const xfetch = (url, opts, timeoutMs = 45000) => {
+  const o = { ...opts, signal: AbortSignal.timeout(timeoutMs) }
+  if (app.isReady() && typeof net?.fetch === 'function') return net.fetch(url, o)
+  return fetch(url, o)
+}
 
 const state = { staged: null } // { version, appPath|installerPath }
 
@@ -161,7 +167,7 @@ async function githubFetchManifest() {
 async function githubDownloadAsset(asset) {
   const url = asset.url || asset.browser_download_url || ghAssetUrlByFid.get(asset.fid)
   if (!url) throw new Error('资产无下载地址（清单未附 URL 且非本次 API 结果）')
-  const res = await xfetch(url, { headers: { 'User-Agent': 'oraychat-updater' } })
+  const res = await xfetch(url, { headers: { 'User-Agent': 'oraychat-updater' } }, 20 * 60000) // 150MB 慢网宽容
   if (!res.ok) throw new Error('资产下载 ' + res.status)
   const buf = Buffer.from(await res.arrayBuffer())
   const dir = filesDir()
