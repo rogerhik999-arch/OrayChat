@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { b64, unb64, utf8 } from '../renderer/src/crypto.mjs'
-import { semverCompare, verifyManifest, manifestBytes, gateDecision, inMaintenanceWindow, shouldProbeGitHub, GH_PROBE_BACKOFF_MS, Updater } from '../renderer/src/updater.mjs'
+import { semverCompare, verifyManifest, manifestBytes, gateDecision, inMaintenanceWindow, shouldProbeGitHub, routeSource, PEER_RETRY_MS, GH_PROBE_BACKOFF_MS, Updater } from '../renderer/src/updater.mjs'
 
 const results = []
 const ok = (name, cond, detail = '') => { results.push(cond); console.log(`  ${cond ? '✅' : '❌'} ${name}${detail ? ` — ${detail}` : ''}`) }
@@ -117,6 +117,17 @@ console.log('[5] shouldProbeGitHub')
   ok('5.6 退避未到 → 不探测', shouldProbeGitHub({ ...base, lastProbeAt: now - GH_PROBE_BACKOFF_MS + 60000 }) === false)
   ok('5.7 退避已过 → 再探测', shouldProbeGitHub({ ...base, lastProbeAt: now - GH_PROBE_BACKOFF_MS - 60000 }) === true)
   ok('5.8 无对端版本信息 → 不探测', shouldProbeGitHub({ ...base, maxPeerVer: null }) === false)
+}
+
+// ---------- 5b) 源路由：同伴失败后的 GitHub 窗口与回退重试 ----------
+console.log('[5b] routeSource')
+{
+  const now = Date.now()
+  ok('5b.1 peers-first 无失败史 → 同伴', routeSource({ source: 'peers-first', peerPullFailedAt: 0, now }) === 'peers')
+  ok('5b.2 github-only → 恒 GitHub', routeSource({ source: 'github-only', peerPullFailedAt: 0, now }) === 'github')
+  ok('5b.3 peers-only 失败后仍走同伴', routeSource({ source: 'peers-only', peerPullFailedAt: now - 1000, now }) === 'peers')
+  ok('5b.4 失败 10min 内 → GitHub 兜底', routeSource({ source: 'peers-first', peerPullFailedAt: now - 5 * 60000, now }) === 'github')
+  ok('5b.5 失败超 10min → 回退重试同伴（自愈竞态）', routeSource({ source: 'peers-first', peerPullFailedAt: now - PEER_RETRY_MS - 60000, now }) === 'peers')
 }
 
 // ---------- 6) 盲种子补救端到端（tick → GitHub 探测 → 采纳）----------

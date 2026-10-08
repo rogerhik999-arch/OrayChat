@@ -21,6 +21,7 @@ import * as oc from './crypto.mjs'
 
 export const FX_CHUNK_SIZE = 32 * 1024 // 32KB：中继帧（b64 后 ~43KB）更小，与心跳/presence 交错更好、重传代价低
 export const FX_MAX_SIZE = 200 * 1024 * 1024
+export const FX_HOLD_WINDOW_MS = 8000 // fx-hold 应答窗：须覆盖持有者首次整读+哈希耗时（144MB ≈2-3s）
 const WINDOW_P2P = 16 // 自适应前的初始窗口（就绪后按 BDP 自适应，见 windowFor）
 const WINDOW_MQTT = 4
 const MQTTPace_MS = 25
@@ -820,7 +821,9 @@ export class FileX {
     this.net.sendCtl(peerId, { op: 'fx-hold', fid: f.fid, ...meta }).catch(() => {})
   }
 
-  // 收集在线成员的 fx-hold 应答（want 广播后 2.5s 窗口）
+  // 收集在线成员的 fx-hold 应答。⚠️ 窗口必须覆盖持有者的首次应答耗时：onWant 需
+  // 整读文件+算 SHA-256（实测 144MB 更新包 ≈2-3s），2.5s 窗口下大文件必超时——
+  // 表现为"在线成员都没有这个文件"（小文件演练测不出，2026-10-08 实机发现）
   onHold(peerId, f) {
     if (!this.holdWaiters?.has(f?.fid)) return
     const w = this.holdWaiters.get(f.fid)
@@ -834,7 +837,7 @@ export class FileX {
       if (!this.holdWaiters) this.holdWaiters = new Map()
       const w = { holders: [] }
       this.holdWaiters.set(fid, w)
-      const timer = setTimeout(() => { this.holdWaiters.delete(fid); resolve(w.holders) }, 2500)
+      const timer = setTimeout(() => { this.holdWaiters.delete(fid); resolve(w.holders) }, FX_HOLD_WINDOW_MS)
       void timer
       for (const pid of this.net.readyPeerIds()) this.net.sendCtl(pid, { op: 'fx-want', fid }).catch(() => {})
     })

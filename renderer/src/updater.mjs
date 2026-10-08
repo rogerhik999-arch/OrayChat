@@ -97,6 +97,19 @@ export function shouldProbeGitHub({ maxPeerVer, myVersion, knownPkgV, source, la
   return now - (lastProbeAt || 0) >= GH_PROBE_BACKOFF_MS
 }
 
+// ---------- 源路由：同伴拉取失败后的兜底窗口（纯函数便于单测）----------
+// gossip 采纳可能先于与持有者的握手完成（presence 不受限、握手需数秒）——首拉
+// 常见"在线成员都没有这个文件"竞态。失败后转 GitHub 一段时间，**到点必须回退
+// 重试同伴**（持有者可能已上线；此前的一次性布尔闩锁会让同伴路径永不重试，
+// 叠加 GitHub 兜底故障时整条更新链路永久空转，2026-10-08 实机测试发现）。
+export const PEER_RETRY_MS = 10 * 60000
+export function routeSource({ source, peerPullFailedAt, now }) {
+  if (source === 'github-only') return 'github'
+  if (source === 'peers-only') return 'peers'
+  return peerPullFailedAt && now - peerPullFailedAt < PEER_RETRY_MS ? 'github' : 'peers'
+}
+
+
 // ---------- 主类 ----------
 export class Updater {
   constructor({ net, filex, appVersion, platform, kv, notify, ipc, onLog, trusted }) {
@@ -118,6 +131,7 @@ export class Updater {
     this._hubBusy = false
     this._lastSeenVer = null
     this._ghProbeAt = 0 // 上次 GitHub 清单兜底探测时刻（退避用）
+    this._peerPullFailedAt = 0 // 上次同伴拉取失败时刻（routeSource 退避窗口用）
     this._ghProbing = false
   }
 
@@ -276,8 +290,12 @@ export class Updater {
       if (decision === 'notify') { this.notify(`发现新版本 ${this.knownPkg.v}（设置→更新 可选择策略）`); return }
       if (decision === 'notify-install') { this.notify(`新版本 ${this.knownPkg.v} 已下载就绪，重启即完成更新`); return }
       if (decision === 'download') {
-        const githubOk = this.cfg.source === 'github-only' || (this._peerPullFailed && this.cfg.source !== 'peers-only')
-        if (githubOk) { void this.downloadViaGitHub(); return }
+        if (routeSource({ source: this.cfg.source, peerPullFailedAt: this._peerPullFailedAt, now: Date.now() }) === 'github') {
+          // GitHub 失败退避 5 分钟：未认证 API 限流 60/h，失败循环会打爆限额（实测 403）
+          if (this._ghFailAt && Date.now() - this._ghFailAt < 5 * 60000) return
+          void this.downloadViaGitHub()
+          return
+        }
         void this.download()
         return
       }
@@ -330,14 +348,24 @@ export class Updater {
       const already = await this.filex.holding(asset.fid)
       if (!already) {
         // fx-want 多源：包随房间分发，多个持有者并发供块。pullFromPeers 只启动
-        // 拉取事务（接收方驱动、异步完成）——轮询等传输完成再校验
-        await this.filex.pullFromPeers(asset.fid, { name: `OrayChat-${pkg.v}-update`, size: asset.size })
-        const waitT0 = Date.now()
-        while (!(await this.filex.holding(asset.fid)) && Date.now() - waitT0 < 180000) {
-          if (this.phase !== 'downloading') return // tick 重入/策略变更：放弃本轮
-          await new Promise((r) => setTimeout(r, 2000))
+        // 拉取事务（接收方驱动、异步完成）——轮询等传输完成再校验。
+        // "已在传输队列中" = 上一轮启动的事务还在跑（tick 重入）→ 直接进入等待。
+        try {
+          await this.filex.pullFromPeers(asset.fid, { name: `OrayChat-${pkg.v}-update`, size: asset.size })
+        } catch (e) {
+          if (!/已在传输队列中/.test(e?.message || '')) throw e
         }
-        if (!(await this.filex.holding(asset.fid))) throw new Error('拉取超时（3 分钟）——稍后自动重试，或等更多成员成为种子')
+        // 首窗 3 分钟；大文件慢链路（实测 144MB @230KB/s ≈ 11 分钟）只要事务仍在
+        // active 推进就续等（上限 30 分钟）——过早放弃会把进行中的拉取整轮作废，
+        // 叠加源路由窗口后出现 GitHub/同伴来回震荡（2026-10-08 实机测试发现）
+        const waitT0 = Date.now()
+        while (!(await this.filex.holding(asset.fid)) && Date.now() - waitT0 < 30 * 60000) {
+          if (this.phase !== 'downloading') return // tick 重入/策略变更：放弃本轮
+          const txActive = this.filex.tx?.get(asset.fid)?.state === 'active'
+          if (Date.now() - waitT0 >= 180000 && !txActive) break
+          await new Promise((r) => setTimeout(r, 5000))
+        }
+        if (!(await this.filex.holding(asset.fid))) throw new Error('拉取超时——稍后自动重试，或等更多成员成为种子')
       }
       // 全量终检（fid 前缀绑定之外再对整包 sha256 与清单比对——双保险）
       const bytes = await this.filex.io.read(asset.fid)
@@ -353,7 +381,7 @@ export class Updater {
       void this.evaluate('staged')
     } catch (e) {
       this.phase = 'idle'
-      this._peerPullFailed = true // 源路由：下次 evaluate 转 GitHub 兜底（peers-only 除外）
+      this._peerPullFailedAt = Date.now() // 源路由：10 分钟内走 GitHub 兜底，到点回退重试同伴（routeSource）
       this.onLog(`更新包获取失败：${e?.message || e}（30 分钟后随下轮 tick 重试，或转 GitHub 兜底）`, 'warn')
       this.jitterUntil = Date.now() + 30 * 60000 // 拉取失败：歇 30 分钟再试（避免风暴）
     }

@@ -130,6 +130,20 @@ async function apply(opts) {
   return { ok: true, helper: helper }
 }
 
+// 清单资产 URL：CI 签名清单里只有 name/size/sha256/fid——必须在这里补下载地址。
+// 缺失时 downloadAssetFromGitHub fetch(undefined) 静默失败、整条兜底链路空转
+// （2026-10-08 实机测试发现）。
+// ⚠️ 两个约束实测得出：①url 不能挂清单对象上过 IPC——structured clone 丢非枚举
+//   属性，普通枚举属性又会进 manifestBytes 序列化破坏验签 → 用 fid 映射表在
+//   main 进程内部传递；②API 未认证限流 60/h，重试必须有节流（配合渲染层退避）。
+function assetDownloadUrl(asset, rel) {
+  if (asset.url || asset.browser_download_url) return asset.url || asset.browser_download_url
+  const apiAsset = (rel.assets || []).find((a) => a.name === asset.name)
+  if (apiAsset?.browser_download_url) return apiAsset.browser_download_url
+  return `https://github.com/rogerhik999-arch/OrayChat/releases/download/${rel.tag_name}/${asset.name}`
+}
+const ghAssetUrlByFid = new Map() // fid → 下载地址（githubFetchManifest 时填充）
+
 // GitHub 兜底（主进程下载，绕开渲染层 CSP；写进 files/<fid> 供 filex/staging 复用）
 async function githubFetchManifest() {
   const res = await xfetch('https://api.github.com/repos/rogerhik999-arch/OrayChat/releases/latest', { headers: { 'User-Agent': 'oraychat-updater' } })
@@ -140,11 +154,14 @@ async function githubFetchManifest() {
   const m = await (await xfetch(mAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).json()
   const sigAsset = (rel.assets || []).find((a) => a.name === 'manifest.sig')
   if (sigAsset) m.sig = (await (await xfetch(sigAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).text()).trim()
+  for (const k of Object.keys(m.assets || {})) ghAssetUrlByFid.set(m.assets[k].fid, assetDownloadUrl(m.assets[k], rel))
   return m
 }
 
 async function githubDownloadAsset(asset) {
-  const res = await xfetch(asset.url || asset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })
+  const url = asset.url || asset.browser_download_url || ghAssetUrlByFid.get(asset.fid)
+  if (!url) throw new Error('资产无下载地址（清单未附 URL 且非本次 API 结果）')
+  const res = await xfetch(url, { headers: { 'User-Agent': 'oraychat-updater' } })
   if (!res.ok) throw new Error('资产下载 ' + res.status)
   const buf = Buffer.from(await res.arrayBuffer())
   const dir = filesDir()
