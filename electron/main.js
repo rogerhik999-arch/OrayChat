@@ -548,9 +548,9 @@ let settingsWin = null
 function createSettingsWindow() {
   if (settingsWin && !settingsWin.isDestroyed()) { settingsWin.show(); settingsWin.focus(); return }
   settingsWin = new BrowserWindow({
-    width: 720,
-    height: 640,
-    minWidth: 560,
+    width: 880,
+    height: 660,
+    minWidth: 620,
     minHeight: 480,
     title: 'OrayChat 设置',
     backgroundColor: '#101418',

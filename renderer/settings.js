@@ -7,6 +7,50 @@ const toast = (msg) => {
   setTimeout(() => t.classList.remove('show'), 1800)
 }
 
+// ---------- 类别导航：左侧栏（窄屏自动变顶部 chips），点击按类别过滤卡片 ----------
+// 条件卡片（中继/更新/健康）data-ready="0" 时整卡隐藏，对应导航项一并隐藏（手机端无这些能力）
+const NAV_ITEMS = [
+  ['all', '全部'],
+  ['general', '通用'],
+  ['network', '网络'],
+  ['hub', '中继服务'],
+  ['data', '数据'],
+  ['update', '更新'],
+  ['health', '健康'],
+  ['about', '关于'],
+]
+let curCat = 'all'
+function applyNav() {
+  const nav = $('settingsNav')
+  if (!nav) return
+  const cards = [...document.querySelectorAll('.set-card[data-cat]')]
+  if (!nav.childElementCount) {
+    for (const [cat, label] of NAV_ITEMS) {
+      const b = document.createElement('button')
+      b.className = 'nav-item'
+      b.dataset.cat = cat
+      b.textContent = label
+      b.onclick = () => { curCat = cat; applyNav(); window.scrollTo({ top: 0 }) }
+      nav.appendChild(b)
+    }
+  }
+  for (const b of nav.querySelectorAll('.nav-item')) {
+    const cat = b.dataset.cat
+    const card = cards.find((c) => c.dataset.cat === cat)
+    b.style.display = !card || card.dataset.ready !== '0' ? '' : 'none'
+    b.classList.toggle('active', curCat === cat)
+  }
+  if (curCat !== 'all') {
+    const card = cards.find((c) => c.dataset.cat === curCat)
+    if (!card || card.dataset.ready === '0') curCat = 'all' // 所选类别不可用（如手机端）→ 回全部
+  }
+  for (const card of cards) {
+    const ready = card.dataset.ready !== '0'
+    card.style.display = ready && (curCat === 'all' || card.dataset.cat === curCat) ? '' : 'none'
+  }
+}
+applyNav()
+
 // 内置默认（与 renderer/src/net.mjs DEFAULT_CONFIG 保持一致；展示用）
 const DEFAULTS = {
   stunUrls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478', 'stun:stun.miwifi.com:3478'],
@@ -118,7 +162,8 @@ function hubCopyText() {
   return ''
 }
 if (window.settings.hubStart) {
-  $('hubCard').style.display = ''
+  $('hubCard').dataset.ready = '1'
+  applyNav()
   window.__hubSnap = null
   const hubCfg = () => ({
     enabled: $('hubEnabled').checked,
@@ -199,7 +244,8 @@ if (window.settings.hubStart) {
         const u = await window.settings.updater()
         const status = u.status || {}
         const cfg = u.cfg || {}
-        $('updateCard').style.display = ''
+        $('updateCard').dataset.ready = '1'
+        applyNav()
         $('updVersion').textContent = `${status.version || '—'} / ${status.knownPkg?.v || '（房间无更新信息）'}`
         $('updPolicy').value = cfg.policy || status.policy || 'download-prompt'
         $('updSource').value = cfg.source || status.source || 'peers-first'
@@ -228,7 +274,8 @@ if (window.settings.hubStart) {
 
   window.settings.health?.().then((samples) => {
     if (!Array.isArray(samples) || !samples.length) return
-    $('healthCard').style.display = ''
+    $('healthCard').dataset.ready = '1'
+    applyNav()
     const fmt = (x) => {
       const d = new Date(x.t)
       return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} 堆${x.heap}MB · blob${x.blobs} · DOM${x.dom} · 入站${x.inRate}/s · 断线${x.drops} · 链路${x.linksAlive}/${x.linksAll} · 就绪${x.ready}${x.wd ? ` · 看门狗×${x.wd}` : ''}`
