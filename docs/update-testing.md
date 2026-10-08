@@ -1,7 +1,7 @@
 # 更新功能测试指南（跨平台：macOS / Windows / Linux）
 
 面向在实际部署机器上拉取本项目、对**分布式自动更新**做测试与纠错的场景。
-更新链路：**版本 gossip（presence 心跳捎带）→ 清单 Ed25519 验签采纳 → filex 多源拉包（或 GitHub 兜底）→ SHA-256 校验 → staging → 换装（守门）→ 回滚簿记**。
+更新链路：**版本 gossip（presence 心跳捎带）→ 清单 Ed25519 验签采纳（对端只有版本号而无清单——"盲种子"——时，主动去 GitHub 兜底拉清单）→ filex 多源拉包（或 GitHub 兜底）→ SHA-256 校验 → staging → 换装（守门）→ 回滚簿记**。
 
 ## 0. 准备
 
@@ -25,7 +25,7 @@ npm run build        # esbuild 出 renderer/dist/app.bundle.js（L2/L4 需要）
 | L4 真机整链 | 手工（见 §4） | 两台真机或一台+GitHub | 真实下载→暂存→换装→重启后版本变化→回滚簿记 | 分钟级 |
 
 预期输出：
-- L1 末行 `✅ update.test.mjs：33/33 通过`
+- L1 末行 `✅ update.test.mjs：45/45 通过`
 - L2 末行 `✅ update-live：gossip→拉取→校验→暂存 全链通过`（日志在 `<系统临时目录>/oc-updlive/{a,b}.log`）
 - L3 末行 `✅ Ed25519 验签有效`
 
@@ -62,10 +62,10 @@ node test/update-live.mjs
 
 ## 4. L4 真机整链（Windows / Linux）
 
-准备：目标机装**旧版**（如 v1.29.0 的 `Setup.exe` / `AppImage`，Release 附件），同房间放一台 ≥ 该版本的设备（如 macOS 1.30.0，心跳每 15s 捎带清单广播）。 companion 全下线也能测 GitHub 兜底（默认源 `peers-first` 含之）。
+准备：目标机装**旧版**（如 v1.29.0 的 `Setup.exe` / `AppImage`，Release 附件），同房间放一台**持有效清单**的设备——经更新链路升级上去的机器换装重启后即"种子"（心跳每 15s 捎带清单广播）。注意**手动安装**的最新版是"盲种子"：心跳只带版本号不带清单，靠它发现不了更新，此场景依赖客户端的 GitHub 清单兜底发现（30s tick 触发、30 分钟退避，需 github.com 可达）。 companion 全下线也能测 GitHub 兜底（默认源 `peers-first` 含之）。
 
 1. 旧版登录房间 → 设置 → 左侧「更新」：确认策略/源（默认 download-prompt / peers-first）。
-2. **半分钟内**「当前版本 / 已知最新」的后者应变为新版号（gossip 采纳成功）。
+2. **半分钟内**「当前版本 / 已知最新」的后者应变为新版号（gossip 采纳成功；盲种子场景则再等一个 tick 由 GitHub 兜底拉到清单）。
 3. 观察阶段行：`idle → downloading → staged`，同时 `files\<fid>` 出现、大小接近安装包。
 4. `staged` 后面板出现**「立即安装并重启」**：
    - **Windows**：点击 → 应用退出 → `update-helper.cmd` 等 PID 消失 → `Setup /S` 静默安装 → 安装器拉起新版。*未实机验证，纠错点：若退出后无动静，手动 `type %APPDATA%\OrayChat\default\staging\update-helper.cmd` 检查内容，再 `cmd /c <该文件>` 看报错。*
@@ -78,7 +78,8 @@ node test/update-live.mjs
 
 | 症状 | 检查点 |
 |---|---|
-| 「已知最新」一直显示「（房间无更新信息）」 | 房间无新版同伴在线 **且** GitHub 兜底不通：跑 L3 自检网络；`api.github.com` 未认证限流 60 次/h |
+| 「已知最新」一直显示「（房间无更新信息）」 | 房间无同伴持有效清单 **且** GitHub 兜底不通。注意"盲种子"：**手动安装**新版（非经更新链路升级）的机器心跳只带版本号、不带清单，靠它发现不了更新——新版客户端见到更高对端版本会主动去 GitHub 拉清单（30 分钟退避、peers-only 源除外）；仍失败看下一行 |
+| GitHub 清单/包下载超时（api.github.com 通、github.com 下载域超时） | 典型代理环境：github.com release 资产直连被墙、系统代理可达。客户端 GitHub 下载已走 `net.fetch`（自动用系统代理）；L3 工具是裸 Node fetch 不认系统代理——给终端 `export HTTPS_PROXY=http://127.0.0.1:<端口>` 再跑对照 |
 | 阶段一直 `idle` | 守门等待（传输中/中继服务忙碌/崩溃环冷却）。看 `oc-updater-state.autoApplyFails`：≥2 已自动降级为只提示 |
 | 下载卡 0% | 同伴无完整源（未满足 fx-hold）→ 让持有者主窗口保持打开；或源切 `github-only` 对照 |
 | staged 后点安装无动静（Windows） | 见 §4.4 纠错点（cmd helper 未实机验证） |

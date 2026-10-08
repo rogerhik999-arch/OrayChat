@@ -83,6 +83,20 @@ export function inMaintenanceWindow(now, hour = 4) {
   return new Date(now).getHours() === hour
 }
 
+// ---------- GitHub 清单兜底发现（盲种子补救，纯函数便于单测）----------
+// 心跳里的 peer.ver 只是版本号；pkg 只在机器采纳过清单后才随 gossip 传播——手动
+// 安装新版的机器是"盲种子"（人人可见其版本，却无清单可广播），全房间会陷入
+// 无清单死锁（GitHub 兜底只下载包，清单本身原设计没有任何主动获取路径）。
+// 见到比本机更高的对端版本、且本地清单覆盖不了它时，主动去 GitHub 拉签名清单
+// （与 gossip 清单同源同验签）。退避 30 分钟：未认证 GitHub API 限流 60 次/h。
+export const GH_PROBE_BACKOFF_MS = 30 * 60000
+export function shouldProbeGitHub({ maxPeerVer, myVersion, knownPkgV, source, lastProbeAt, now }) {
+  if (!maxPeerVer || source === 'peers-only') return false
+  if (semverCompare(maxPeerVer, myVersion) <= 0) return false // 无人比我新
+  if (knownPkgV && semverCompare(knownPkgV, maxPeerVer) >= 0) return false // 本地清单已覆盖
+  return now - (lastProbeAt || 0) >= GH_PROBE_BACKOFF_MS
+}
+
 // ---------- 主类 ----------
 export class Updater {
   constructor({ net, filex, appVersion, platform, kv, notify, ipc, onLog, trusted }) {
@@ -103,6 +117,8 @@ export class Updater {
     this.idleSince = null
     this._hubBusy = false
     this._lastSeenVer = null
+    this._ghProbeAt = 0 // 上次 GitHub 清单兜底探测时刻（退避用）
+    this._ghProbing = false
   }
 
   async init() {
@@ -146,6 +162,11 @@ export class Updater {
     if (!pkg || pkg === this.knownPkg) return
     if (!verifyManifest(pkg, this.trustedPubkeys)) { this.onLog(`收到无效更新清单（来自 ${fromName || '对端'}，签名不符已丢弃）`, 'warn'); return }
     if (this.knownPkg && semverCompare(pkg.v, this.knownPkg.v) <= 0) return
+    await this.adoptManifest(pkg, `来自 ${fromName || '房间'} 的签名清单`)
+  }
+
+  // 采纳清单（gossip 与 GitHub 兜底共用；调用方负责验签与版本择优）→ 落 KV → evaluate
+  async adoptManifest(pkg, from) {
     this.knownPkg = pkg
     this.stagedOk = false
     this.phase = 'idle'
@@ -153,8 +174,25 @@ export class Updater {
       lastAutoApplyAt: this.lastAutoApplyAt || 0, autoApplyFails: this.autoApplyFails || 0,
       autoAppliedVer: (await this.readState()).autoAppliedVer || null, knownPkg: pkg,
     }))
-    this.onLog(`发现新版本 ${pkg.v}（来自 ${fromName || '房间'} 的签名清单）`)
+    this.onLog(`发现新版本 ${pkg.v}（${from}）`)
     void this.evaluate('gossip')
+  }
+
+  // GitHub 清单兜底发现（盲种子补救）：清单获取与 gossip 采纳同权同验签
+  async probeGitHubManifest() {
+    if (this._ghProbing) return
+    this._ghProbing = true
+    try {
+      const m = await this.fetchFromGitHub()
+      if (m && semverCompare(m.v, this.appVersion) > 0
+        && (!this.knownPkg || semverCompare(m.v, this.knownPkg.v) > 0)) {
+        await this.adoptManifest(m, 'GitHub 清单兜底发现')
+      }
+    } catch (e) {
+      this.onLog(`GitHub 清单兜底失败：${e?.message || e}（${Math.round(GH_PROBE_BACKOFF_MS / 60000)} 分钟后随下轮 tick 重试）`, 'warn')
+    } finally {
+      this._ghProbing = false
+    }
   }
 
   // GitHub 兜底（M2）：主进程拉最新 Release 的签名清单（验签后与 gossip 清单同权）
@@ -178,6 +216,18 @@ export class Updater {
       // 配置热加载（设置页可能改了策略）
       const saved = JSON.parse((await this.kv.get('oc-updater-cfg')) || '{}')
       this.cfg = { ...this.cfg, ...saved }
+      // 盲种子补救：ready 对端有比本机更高的版本号而本地清单覆盖不了 → 主动去
+      // GitHub 拉签名清单（shouldProbeGitHub 内含 30 分钟退避与 peers-only 排除）
+      const maxPeerVer = [...(this.net.peers?.values() || [])]
+        .filter((p) => p.state === 'ready' && p.ver)
+        .reduce((mx, p) => (semverCompare(p.ver, mx) > 0 ? p.ver : mx), this.appVersion)
+      if (shouldProbeGitHub({
+        maxPeerVer, myVersion: this.appVersion, knownPkgV: this.knownPkg?.v,
+        source: this.cfg.source, lastProbeAt: this._ghProbeAt, now: Date.now(),
+      })) {
+        this._ghProbeAt = Date.now()
+        await this.probeGitHubManifest() // 采纳（若成功）先落盘，本轮 evaluate 随即可见
+      }
       // 主机服务空闲检测（hubStatus 由 app 层注入）
       if (this.hubStatus) {
         const st = await this.hubStatus()

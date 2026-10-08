@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { b64, unb64, utf8 } from '../renderer/src/crypto.mjs'
-import { semverCompare, verifyManifest, manifestBytes, gateDecision, inMaintenanceWindow, Updater } from '../renderer/src/updater.mjs'
+import { semverCompare, verifyManifest, manifestBytes, gateDecision, inMaintenanceWindow, shouldProbeGitHub, GH_PROBE_BACKOFF_MS, Updater } from '../renderer/src/updater.mjs'
 
 const results = []
 const ok = (name, cond, detail = '') => { results.push(cond); console.log(`  ${cond ? '✅' : '❌'} ${name}${detail ? ` — ${detail}` : ''}`) }
@@ -103,6 +103,53 @@ console.log('[4] Updater gossip/崩溃环')
   const d2 = gateDecision({ policy: 'full-auto', knownPkg: u2.knownPkg, myVersion: '1.28.0', now, autoApplyFails: 2, stagedOk: true })
   ok('4.5 失败 1 次仍 apply（允许重试一次）', d1 === 'apply')
   ok('4.6 失败 2 次降级 notify', d2 === 'notify:自动更新连续失败已降级')
+}
+
+// ---------- 5) GitHub 清单兜底发现（盲种子补救）----------
+console.log('[5] shouldProbeGitHub')
+{
+  const base = { maxPeerVer: '1.30.0', myVersion: '1.29.0', knownPkgV: null, source: 'peers-first', lastProbeAt: 0, now }
+  ok('5.1 对端更高且无清单 → 探测', shouldProbeGitHub(base) === true)
+  ok('5.2 无人比我新 → 不探测', shouldProbeGitHub({ ...base, maxPeerVer: '1.29.0' }) === false)
+  ok('5.3 peers-only 源 → 不探测', shouldProbeGitHub({ ...base, source: 'peers-only' }) === false)
+  ok('5.4 本地清单已覆盖该版本 → 不探测', shouldProbeGitHub({ ...base, knownPkgV: '1.30.0' }) === false)
+  ok('5.5 本地清单更低（覆盖不了）→ 探测', shouldProbeGitHub({ ...base, knownPkgV: '1.29.5' }) === true)
+  ok('5.6 退避未到 → 不探测', shouldProbeGitHub({ ...base, lastProbeAt: now - GH_PROBE_BACKOFF_MS + 60000 }) === false)
+  ok('5.7 退避已过 → 再探测', shouldProbeGitHub({ ...base, lastProbeAt: now - GH_PROBE_BACKOFF_MS - 60000 }) === true)
+  ok('5.8 无对端版本信息 → 不探测', shouldProbeGitHub({ ...base, maxPeerVer: null }) === false)
+}
+
+// ---------- 6) 盲种子补救端到端（tick → GitHub 探测 → 采纳）----------
+console.log('[6] tick→GitHub 探测→采纳')
+{
+  const seed = ed25519.keygen().secretKey
+  const pub = b64(ed25519.getPublicKey(seed))
+  const mkPkg = (v) => {
+    const m = { v, ts: Date.now(), assets: { 'mac-zip': { name: 'a.zip', size: 1, sha256: 'cd'.repeat(32), fid: 'cd'.repeat(12) } } }
+    return { ...m, sig: b64(ed25519.sign(manifestBytes(m), seed)) }
+  }
+  const store = new Map()
+  const kv = { get: async (k) => store.get(k), set: async (k, v) => store.set(k, v) }
+  // 盲种子对端：ready 的 1.30.0 只报版本不带清单；connecting 的 9.9.9 不应计入
+  const net = { peers: new Map([['p1', { state: 'ready', ver: '1.30.0' }], ['p2', { state: 'connecting', ver: '9.9.9' }]]) }
+  let calls = 0
+  const u = new Updater({
+    appVersion: '1.29.0', platform: 'darwin', kv, trusted: [pub], onLog: () => {}, net,
+    ipc: { githubManifest: async () => { calls++; return mkPkg('1.30.0') } },
+  })
+  await u.saveCfg({ policy: 'off' }) // 聚焦清单采纳，不进入下载
+  await u.tick()
+  ok('6.1 ready 高版本对端触发 GitHub 清单探测并采纳', u.knownPkg?.v === '1.30.0')
+  ok('6.2 采纳落盘 oc-updater-state', JSON.parse(store.get('oc-updater-state') || '{}')?.knownPkg?.v === '1.30.0')
+  await u.tick()
+  ok('6.3 本地清单已覆盖 → 不重复探测', calls === 1)
+  const u2 = new Updater({
+    appVersion: '1.29.0', platform: 'darwin', kv, trusted: [pub], onLog: () => {}, net,
+    ipc: { githubManifest: async () => { calls++; return mkPkg('1.30.0') } },
+  })
+  await u2.saveCfg({ policy: 'off', source: 'peers-only' })
+  await u2.tick()
+  ok('6.4 peers-only 源不发起 GitHub 探测', calls === 1)
 }
 
 const pass = results.filter(Boolean).length

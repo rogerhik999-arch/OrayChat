@@ -5,10 +5,15 @@
 //   Linux   AppImage → 原子替换 process.execPath + chmod + 重启（最简）
 // 回滚（M2）：换装保留旧版备份（dst.bak）；boot-ok 自检簿记连续缺失 → 恢复备份。
 // 演练沙箱：ORAY_UPDATE_DST / ORAY_UPDATE_NO_LAUNCH。
-const { app } = require('electron')
+const { app, net } = require('electron')
 const { spawn, execFileSync } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
+
+// GitHub 下载走 Chromium 网络栈（net.fetch）：自动使用系统代理。Node 裸 fetch
+// 不认 Windows 系统代理——github.com 直连超时、代理可达的环境（典型国内网络）
+// 会让兜底链路整个卡死。app 未 ready 或无 net.fetch 时退回 Node fetch。
+const xfetch = (url, opts) => (app.isReady() && typeof net?.fetch === 'function' ? net.fetch(url, opts) : fetch(url, opts))
 
 const state = { staged: null } // { version, appPath|installerPath }
 
@@ -127,19 +132,19 @@ async function apply(opts) {
 
 // GitHub 兜底（主进程下载，绕开渲染层 CSP；写进 files/<fid> 供 filex/staging 复用）
 async function githubFetchManifest() {
-  const res = await fetch('https://api.github.com/repos/rogerhik999-arch/OrayChat/releases/latest', { headers: { 'User-Agent': 'oraychat-updater' } })
+  const res = await xfetch('https://api.github.com/repos/rogerhik999-arch/OrayChat/releases/latest', { headers: { 'User-Agent': 'oraychat-updater' } })
   if (!res.ok) throw new Error('releases/latest ' + res.status)
   const rel = await res.json()
   const mAsset = (rel.assets || []).find((a) => a.name === 'manifest.json')
   if (!mAsset) throw new Error('最新 Release 无签名清单（分布式更新未启用或 CI 跳过）')
-  const m = await (await fetch(mAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).json()
+  const m = await (await xfetch(mAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).json()
   const sigAsset = (rel.assets || []).find((a) => a.name === 'manifest.sig')
-  if (sigAsset) m.sig = (await (await fetch(sigAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).text()).trim()
+  if (sigAsset) m.sig = (await (await xfetch(sigAsset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })).text()).trim()
   return m
 }
 
 async function githubDownloadAsset(asset) {
-  const res = await fetch(asset.url || asset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })
+  const res = await xfetch(asset.url || asset.browser_download_url, { headers: { 'User-Agent': 'oraychat-updater' } })
   if (!res.ok) throw new Error('资产下载 ' + res.status)
   const buf = Buffer.from(await res.arrayBuffer())
   const dir = filesDir()
