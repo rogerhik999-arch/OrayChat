@@ -12,8 +12,9 @@ import crypto from 'node:crypto'
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { b64, unb64, utf8 } from '../renderer/src/crypto.mjs'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 
-const ROOT = path.dirname(path.dirname(import.meta.url.replace('file://', '')))
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const ELECTRON = createRequire(path.join(ROOT, 'package.json'))('electron')
 const ROOM = `oc-updlive-${Date.now().toString(36)}`
 const TEST_DIR = path.join(os.tmpdir(), 'oc-updlive')
@@ -35,7 +36,9 @@ const zipPath = path.join(TEST_DIR, 'OrayChat-9.9.9-arm64-mac.zip')
 const { execFileSync } = createRequire(import.meta.url)('node:child_process')
 // Windows 无 zip 命令，用系统自带 bsdtar（Win10 1803+）按后缀出 zip；mac/linux 用 zip
 if (process.platform === 'win32') {
-  execFileSync('tar', ['-a', '-c', '-f', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
+  // Git Bash 环境里 GNU tar 会把 "C:" 当远程主机——显式用 System32 的 bsdtar
+  const bsdtar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+  execFileSync(bsdtar, ['-a', '-c', '-f', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
 } else {
   execFileSync('zip', ['-qr', zipPath, '.'], { cwd: path.join(TEST_DIR, 'pkg') })
 }
