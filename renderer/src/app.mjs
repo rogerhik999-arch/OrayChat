@@ -2169,6 +2169,13 @@ function sampleHealth() {
     const links = relayLinksInfo()
     const rate = relay ? Math.round(((relay.framesIn || 0) - (state._framesInMark || 0)) / 600) : 0 // 帧/秒（10min 窗口均值）
     if (relay) state._framesInMark = relay.framesIn || 0
+    // 空窗检测：上次采样距今超过 1.5 个周期 = 渲染进程曾被冻结/挂起（或机器睡眠）——
+    // 本身就是长跑故障证据（2026-10-09 实机：78 分钟空窗 + 堆骤降 = 渲染进程崩溃重载）
+    const gap = state._lastSampleAt ? Math.round((Date.now() - state._lastSampleAt) / 60000) : 0
+    state._lastSampleAt = Date.now()
+    // 全灭持续时长（分钟）：诊断"链路全灭无人强救"的直接证据
+    const alive = links.filter((l) => l.alive).length
+    state._deadSampleMin = alive === 0 ? (state._deadSampleMin || 0) + 10 : 0
     const sample = {
       t: Date.now(),
       heap: Math.round((performance.memory?.usedJSHeapSize || 0) / 1048576), // MB
@@ -2176,10 +2183,12 @@ function sampleHealth() {
       dom: document.getElementsByTagName('*').length,
       inRate: rate,
       drops: links.reduce((s, l) => s + (l.fails || 0), 0),
-      linksAlive: links.filter((l) => l.alive).length,
+      linksAlive: alive,
       linksAll: links.length,
       ready: [...(state.net?.peers?.values() || [])].filter((p) => p.state === 'ready').length,
       wd: state.net?._wdK || 0,
+      ...(gap >= 15 ? { gap } : {}), // 仅异常时记录（>1.5 周期）
+      ...(state._deadSampleMin ? { dead: state._deadSampleMin } : {}),
     }
     healthSamples.push(sample)
     while (healthSamples.length > 144) healthSamples.shift()

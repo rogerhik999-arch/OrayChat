@@ -29,6 +29,7 @@ const PRESENCE_HEARTBEAT_MS = 15000
 // p2p 会话不走 onRelayGone）会永远挂在在线列表里。回收判据见 reapGhosts。
 const REAP_INTERVAL_MS = 15000
 const WATCHDOG_SILENT_MS = 5 * 60 * 1000 // 看门狗阈值：就绪会话存在时，5 分钟零入站=链路认知已坏（对端 presence 周期 ≤90s TTL，回收器 2min 内会清掉真消失者，不会误触发）
+const WATCHDOG_DEAD_MS = 10 * 60 * 1000 // 全灭阈值：所有中继链路死亡持续此时长 → 强制复位（不看 ready/inRate——全灭期间 P2P 残流会让所有活性判据饱和）
 const GHOST_GRACE_MS = 90000 // 已建立会话：视野里消失后至少再等这么久才回收（复活机会留给 ping/digest）
 const GHOST_FAST_MS = 30000 // 未就绪条目（建联中/握手失败）：无进展 30s 即回收——握手超时才 15s，两倍足矣
 const GHOST_MAX_LIFETIME_MS = 90000 // 未就绪条目总寿命硬上限：无论任何内部续命，bornAt 起 90s 必回收
@@ -1414,10 +1415,42 @@ export class ChatNet {
   watchdogCheck() {
     if (this.destroyed) return
     const relay = this.relay
+    if (this.goOnlineInflight) return // 复位已在途
+    const transferring = this.filex?.hasActiveTransfer?.()
+    if (transferring) return // 传输期挂起
+
+    // ---- 全灭分支（2026-10-10 实机确诊）：所有中继链路死亡持续 ≥10min → 强制复位。
+    // 旧版此处 `if (!relay?.connected) return` 直接回家——全灭时 connected=false，
+    // 看门狗整个失明，唯一自救 scheduleLinkRetry 又全撞死墙（实机 2.5h 零恢复，
+    // 且 P2P 残流一直有入站，静默判据也不成立）。peers.size>0 = 本会话见过成员
+    // （登录过）；空房全灭不触发（无人可聊，onVisible 会兜底）。
+    const aliveCount = relay?.aliveLinks?.().length ?? 0
+    const totalLinks = relay?.links?.size ?? aliveCount
+    if (totalLinks > 0 && aliveCount === 0 && this.peers.size > 0) {
+      this._wdDeadSince ||= Date.now()
+    } else {
+      if (this._wdDeadSince) { this._wdDeadSince = 0; this._wdDeadResets = 0 } // 恢复：全灭计数清零
+    }
+    const deadFor = this._wdDeadSince ? Date.now() - this._wdDeadSince : 0
+    if (totalLinks > 0 && aliveCount === 0 && deadFor >= WATCHDOG_DEAD_MS && Date.now() >= (this._wdCooldownUntil || 0)) {
+      this._wdDeadResets = (this._wdDeadResets || 0) + 1
+      this._wdK = (this._wdK || 0) + 1
+      this._wdCooldownUntil = Date.now() + Math.min(10 * 60000 * 2 ** (this._wdK - 1), 40 * 60000)
+      if (this._wdDeadResets >= 3) {
+        // 复位 3 次仍全灭 = 应用内网络栈卡死（重连与复位都救不回，实测只有渲染进程
+        // 重启能治）。整页重载后需重新登录一次——比永久断联是净收益。
+        this.hooks.onLog?.(`看门狗：全灭复位 ${this._wdDeadResets} 次仍 0 链路（持续 ${Math.round(deadFor / 60000)} 分钟）——判定应用内网络栈卡死，整页重载自愈`, 'warn')
+        this._reloadForNet()
+        return
+      }
+      this.hooks.onLog?.(`看门狗：全部中继链路死亡已 ${Math.round(deadFor / 60000)} 分钟——强制网络复位（全灭第 ${this._wdDeadResets} 次）`, 'warn')
+      try { this.goOnline('看门狗：全链路死亡强制复位') } catch { /* 失败等下轮冷却 */ }
+      return
+    }
+
+    // ---- 静默分支（原有）：链路自称存活但零入站 ----
     if (!relay?.connected) return
     if (![...this.peers.values()].some((p) => p.state === 'ready')) return // 空房静默是正常的
-    if (this.filex?.hasActiveTransfer?.()) return // 传输期挂起
-    if (this.goOnlineInflight) return // 复位已在途
     const silent = Date.now() - (relay.lastInboundAt || 0)
     if (silent < WATCHDOG_SILENT_MS) {
       this._wdK = 0
@@ -1428,6 +1461,13 @@ export class ChatNet {
     this._wdCooldownUntil = Date.now() + Math.min(10 * 60000 * 2 ** (this._wdK - 1), 40 * 60000)
     this.hooks.onLog?.(`看门狗：链路自称存活但 ${Math.round(silent / 60000)} 分钟零入站（就绪会话 ${[...this.peers.values()].filter((p) => p.state === 'ready').length} 个）——强制网络复位（第 ${this._wdK} 次）`, 'warn')
     try { this.goOnline('看门狗：链路静默强制复位') } catch { /* 复位失败等下轮冷却后再试 */ }
+  }
+
+  // 终极自愈：复位救不回 = 应用内网络栈卡死（2026-10-09 实测只有渲染进程重启能治）。
+  // 整页重载后停在登录页需手动再登录——相比永久断联是净收益。node 测试环境无 location。
+  _reloadForNet() {
+    if (typeof location === 'undefined') return
+    try { location.reload() } catch { /* 重载失败等下轮冷却再试 */ }
   }
 
   // 同名 ready 会话（昵称即账号）：接管/防复种共用
