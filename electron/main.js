@@ -566,7 +566,10 @@ function createSettingsWindow() {
 }
 
 function showMainWindow() {
-  const win = BrowserWindow.getAllWindows()[0]
+  // 按 URL 精确找主窗口。⚠️ 不能用 getAllWindows()[0]：主窗被销毁只剩设置窗时，
+  // [0] 就是设置窗自己——show/focus 等于原地踏步，表现为"返回主窗口按钮失灵"
+  // （2026-10-10 用户实测）。仍找不到（主窗确已销毁）→ 重建，兑现按钮承诺。
+  const win = mainWindow() || BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && !w.webContents.getURL().includes('settings.html'))
   if (win) {
     if (win.isMinimized()) win.restore()
     win.show()
