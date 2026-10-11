@@ -15,8 +15,8 @@ android {
         applicationId "app.oraychat.mobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 13005
-        versionName "1.30.5"
+        versionCode 13006
+        versionName "1.30.6"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
