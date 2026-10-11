@@ -1166,6 +1166,8 @@ async function doLogin(name, room) {
   state.logData = await window.oray.kvGet(`oc-log2:${room}`)
   // 登录历史：按昵称记住房间
   await upsertLogin(name, room)
+  // 会话记录（自愈重载后自动回房用；正常启动不自动登录，仅此标记场景生效）
+  try { await window.oray.kvSet('oc-session', JSON.stringify({ name, room })) } catch { /* 记录失败不影响登录 */ }
 
   const cfg = state.cfg
   state.net = new ChatNet(state.ident, state.name, state.room, {
@@ -1852,6 +1854,10 @@ async function main() {
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
     }
+    if (state.args['reload-self-test']) {
+      // 验证钩子（自愈重载链路）：登录 20s 后触发终极自愈路径（写恢复标记+整页重载）
+      setTimeout(() => { try { state.net?._reloadForNet?.() } catch { /* 测试钩子失败忽略 */ } }, 20000)
+    }
     if (state.args['diag-pull']) {
       // 验证钩子（test/diag-live.mjs）：目标 ready 后自动拉取其运行记录
       const want = String(state.args['diag-pull'])
@@ -2095,6 +2101,28 @@ async function main() {
       const info = await (window.oray.appInfo ? window.oray.appInfo() : Promise.resolve({ version: '1.0.0' }))
       $('verLine').textContent = `v${info.version}`
     } catch { $('verLine').textContent = '' }
+  }
+
+  // ---------- 网络自愈重载后的自动恢复（非 bot 场景）----------
+  // 终极自愈（_reloadForNet）整页重载前写 oc-relogin-at（5 分钟一次性标记）——
+  // 启动时发现标记 + 上次会话记录（oc-session）→ 自动重新登录回房。正常手动启动
+  // 无标记不受影响（仍停登录页）；标记一次性消费，失败静默回登录页可手动登录。
+  if (!state.args.bot) {
+    try {
+      const at = Number(await window.oray.kvGet('oc-relogin-at')) || 0
+      const sessRaw = await window.oray.kvGet('oc-session')
+      if (at && sessRaw && Date.now() - at < 5 * 60000) {
+        const { name, room } = JSON.parse(sessRaw)
+        if (name && room) {
+          await window.oray.kvSet('oc-relogin-at', '') // 一次性：先消费再登录（失败不循环）
+          await doLogin(String(name), String(room))
+          appendSys('🔧 检测到网络自愈重载，已自动恢复连接（如非预期请检查网络）')
+          if (window.oray.botLog) window.oray.botLog('[RELOGIN] 自愈重载后自动恢复完成')
+        }
+      } else if (at) {
+        await window.oray.kvSet('oc-relogin-at', '') // 过期标记清掉
+      }
+    } catch { /* 恢复失败停留登录页，可手动登录 */ }
   }
 }
 

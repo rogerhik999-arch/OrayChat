@@ -403,6 +403,8 @@ function registerIpc() {
     if (kind === 'login-history') {
       cleared = Object.keys(s4['oc-login-history'] || {}).length
       delete s4['oc-login-history']
+      delete s4['oc-session'] // 会话记录随登录历史一并清（自愈自动恢复不再可用，符合预期）
+      delete s4['oc-relogin-at']
     } else if (kind === 'room-log' && room) {
       const key = `oc-log2:${room}`
       cleared = 1

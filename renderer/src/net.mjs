@@ -1508,9 +1508,12 @@ export class ChatNet {
   }
 
   // 终极自愈：复位救不回 = 应用内网络栈卡死（2026-10-09 实测只有渲染进程重启能治）。
-  // 整页重载后停在登录页需手动再登录——相比永久断联是净收益。node 测试环境无 location。
+  // 整页重载前留一次性恢复标记（5 分钟内有效）——app 启动时据此自动重新登录回房，
+  // 房间视角本成员不再"重载后永久消失"。node 测试环境无 location。
   _reloadForNet() {
     if (typeof location === 'undefined') return
+    try { sessionStorage.setItem('oc-auto-relogin', '1') } catch { /* 崩溃场景由 KV 兜底 */ }
+    try { window.oray?.kvSet?.('oc-relogin-at', String(Date.now())) } catch { /* KV 失败仍重载 */ }
     try { location.reload() } catch { /* 重载失败等下轮冷却再试 */ }
   }
 
