@@ -218,6 +218,21 @@
     <div class="hint">每 10 分钟采样一次（保留 24 小时）。堆内存持续上涨 / 断线数暴涨 / 看门狗触发 = 长跑隐患信号；链路与就绪会话正常时无需重启。</div>
   </div>
 
+  <div class="set-card" id="diagCard" data-cat="diag">
+    <h2>诊断（远程调试）</h2>
+    <div class="row">
+      <input type="checkbox" id="diagEnabled" style="width:auto" />
+      <label for="diagEnabled" style="margin:0; color:var(--tx); font-size:13px; cursor:pointer">
+        持续记录运行事件（链路/看门狗/握手/更新——不含聊天内容，环形保留最近 300 条）
+      </label>
+    </div>
+    <div class="hint" style="margin-top:6px">
+      调试机在聊天输入框发送 <b>/diag 成员名</b>，即可经加密通道拉取对方运行记录（环境/健康
+      采样/事件日志/中继日志/隧道清单），自动存为 JSON 文件——远程终端离线问题从此无需
+      人工拷日志。中继服务日志另持久化于 hub-log.jsonl。
+    </div>
+  </div>
+
   <div class="set-card" id="aboutCard" data-cat="about">
     <h2>关于</h2>
     <table>

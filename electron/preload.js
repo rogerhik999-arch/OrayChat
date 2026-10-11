@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld('oray', {
   openSettings: () => ipcRenderer.invoke('settings:open'),
   // 中继服务模式（v1.23.0）：主窗口查询状态/监听变化 → 运行中自动并入本地私有链
   hubStatus: () => ipcRenderer.invoke('hub:status'),
+  // 诊断（/diag 远程拉取组装包用）：cloudflared 隧道清单等主进程侧数据
+  diagExtra: () => ipcRenderer.invoke('diag:extra'),
+  diagSave: (fname, json) => ipcRenderer.invoke('diag:save', fname, json),
   // 分布式自动更新（docs/update-plan.md M1）
   updaterStage: (args) => ipcRenderer.invoke('updater:stage', args),
   updaterApply: (args) => ipcRenderer.invoke('updater:apply', args),

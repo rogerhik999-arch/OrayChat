@@ -952,6 +952,20 @@ export class ChatNet {
     else await this.ctlAction?.send(frame, { target: peerId })
   }
 
+  // 诊断协议：调试机 → 成员 diag-req；成员 → 调试机 diag-resp（JSON→b64 分片 6KB/帧）
+  async sendDiagReq(peerId) { await this.sendCtl(peerId, { op: 'diag-req' }) }
+  async sendDiagResp(peerId, obj, err) {
+    if (err) return this.sendCtl(peerId, { op: 'diag-resp', i: 0, n: 1, err: String(err).slice(0, 120) })
+    const txt = JSON.stringify(obj)
+    const b64 = btoa(unescape(encodeURIComponent(txt))) // UTF-8 安全 b64
+    const CHUNK = 6 * 1024
+    const n = Math.max(1, Math.ceil(b64.length / CHUNK))
+    for (let i = 0; i < n; i++) {
+      await this.sendCtl(peerId, { op: 'diag-resp', i, n, d: b64.slice(i * CHUNK, (i + 1) * CHUNK) })
+      if (i < n - 1) await new Promise((r) => setTimeout(r, 60)) // 分片 pacing：与心跳/presence 错峰
+    }
+  }
+
   // wireConv='lobby' → 广播给所有就绪成员；'dm' → 仅发给该对端。
   // del/clear 幂等且必须送达：三重发送（QoS0 丢帧兜底，间隔 400ms）
   async propagateCtl(wireConv, frame, onlyPeer) {
@@ -999,6 +1013,36 @@ export class ChatNet {
     const peer = this.peers.get(peerId)
     if (!peer || !this.acceptsVia(peer, via) || peer.state !== 'ready') return
     if (frame?.op?.startsWith?.('fx-')) { this.filex?.onCtl(peerId, frame); return } // 文件传输控制
+    if (frame?.op === 'diag-req') { // 调试机拉取本终端运行记录（信任域=房间；ready 会话即真实成员）
+      try { this.hooks.onDiagReq?.(peerId, peer) } catch { /* 组装失败不伤主流程 */ }
+      return
+    }
+    if (frame?.op === 'diag-resp') { // 诊断包分片重组（6KB/片 b64；字节级拼接——UTF-8 多字节
+      // 字符跨片时逐片文本解码会产生 U+FFFD，必须先拼字节再整体解码）
+      try {
+        const key = `diag:${peerId}`
+        const buf = this._diagParts?.get(key) || { parts: [], got: 0 }
+        if (!this._diagParts) this._diagParts = new Map()
+        if (frame.d && Number.isInteger(frame.i) && frame.i >= 0 && frame.i < 64 && frame.n > 0 && frame.i < frame.n) {
+          if (!buf.parts[frame.i]) { buf.parts[frame.i] = frame.d; buf.got++ }
+          this._diagParts.set(key, buf)
+          if (buf.got >= frame.n) {
+            this._diagParts.delete(key)
+            try {
+              const bin = buf.parts.map((p) => atob(p)).join('') // latin1 串=逐字节
+              const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+              const obj = JSON.parse(new TextDecoder().decode(bytes))
+              this.hooks.onDiagResp?.(peerId, peer, obj, null)
+            } catch (e) { this.hooks.onDiagResp?.(peerId, peer, null, '重组解码失败: ' + (e?.message || e)) }
+          }
+        }
+        if (frame.i === 0 && frame.n === 1 && !frame.d) { // 空包/拒绝
+          this._diagParts.delete(key)
+          this.hooks.onDiagResp?.(peerId, peer, null, frame.err || '对端返回空')
+        }
+      } catch { /* 重组异常忽略 */ }
+      return
+    }
     if (frame?.op === 'presence') { // 在线报告（含 SWIM 摘要）
       peer.lastSeen = Date.now()
       peer.lastProgress = Date.now()

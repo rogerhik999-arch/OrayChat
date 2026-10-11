@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('settings', {
   get: () => ipcRenderer.invoke('settings:get'),
+  kvGet: (key) => ipcRenderer.invoke('settings:kv-get', key),
+  kvSet: (key, val) => ipcRenderer.invoke('settings:kv-set', key, val),
   setUserConfig: (cfg) => ipcRenderer.invoke('settings:set-user-config', cfg),
   setTrayEnabled: (on) => ipcRenderer.invoke('settings:set-tray-enabled', on),
   clearData: (kind, room) => ipcRenderer.invoke('settings:clear-data', kind, room),

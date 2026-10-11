@@ -15,6 +15,7 @@ const NAV_ITEMS = [
   ['network', '网络'],
   ['hub', '中继服务'],
   ['data', '数据'],
+  ['diag', '诊断'],
   ['update', '更新'],
   ['health', '健康'],
   ['about', '关于'],
@@ -133,6 +134,21 @@ $('clearLogin').onclick = async () => {
   const n = await window.settings.clearData('login-history')
   toast(n ? `已清空 ${n} 条登录历史` : '登录历史已为空')
 }
+
+// 诊断开关（与主窗口 DiagCollector 共用 KV oc-diag-cfg；主窗口 30s 内生效）
+const diagInit = async () => {
+  try {
+    const raw = JSON.parse((await window.settings.kvGet('oc-diag-cfg')) || '{}')
+    $('diagEnabled').checked = raw.enabled !== false
+    $('diagEnabled').onchange = async () => {
+      try {
+        await window.settings.kvSet('oc-diag-cfg', JSON.stringify({ ...raw, enabled: $('diagEnabled').checked }))
+        toast($('diagEnabled').checked ? '将持续记录运行事件' : '已停止记录（已有记录保留）')
+      } catch { toast('保存失败') }
+    }
+  } catch { /* KV 不可用时保持默认开 */ }
+}
+diagInit()
 
 $('clearRoom').onclick = async () => {
   const room = $('roomSelect').value

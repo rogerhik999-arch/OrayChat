@@ -1377,7 +1377,18 @@ function netHooks() {
     },
     onLog: (msg, level) => {
       if (state.args.bot) window.oray.botLog(`[BOT] LOG ${level || 'info'} ${msg}`)
+      diagLog(msg, level)
     },
+    // 调试机拉取本终端运行记录：组装诊断包回发（信任域=房间；ready 会话即真实成员）
+    onDiagReq: async (peerId, peer) => {
+      try {
+        const pkg = await diagCollect()
+        await state.net.sendDiagResp(peerId, pkg)
+        appendSys(`🔧 诊断包已发给 ${peer.name || peerId.slice(0, 8)}（调试拉取）`)
+      } catch (e) { await state.net.sendDiagResp(peerId, null, `组装失败: ${e?.message || e}`) }
+    },
+    // 调试机收到诊断包：落 Downloads + 提示
+    onDiagResp: (peerId, peer, obj, err) => { diagReceived(peer, obj, err) },
     onPeerAdded: () => renderPeers(),
     onPeerRemoved: (peerId, p) => {
       if (state.view.conv === 'dm' && state.view.peerId === peerId) $('input').disabled = true
@@ -1625,6 +1636,12 @@ async function sendCurrent() {
   const text = $('input').value.trim()
   const hasFiles = state.pendingFiles.length > 0
   if ((!text && !hasFiles) || !state.net) return
+  if (text.startsWith('/diag')) { // 调试命令：拉取成员运行记录（不进聊天日志）
+    $('input').value = ''
+    $('input').style.height = 'auto'
+    await diagRequest(text.slice(5).trim())
+    return
+  }
   if (hasFiles) await sendPendingFiles()
   if (!text) return
   $('input').value = ''
@@ -1834,6 +1851,15 @@ async function main() {
     }
     if (state.args['hb-log']) {
       setInterval(() => window.oray.botLog(`[BOT] TICK view=${state.view.conv} peers=${state.net?.peers.size} ready=${state.net?.readyPeerIds().length}`), 5000)
+    }
+    if (state.args['diag-pull']) {
+      // 验证钩子（test/diag-live.mjs）：目标 ready 后自动拉取其运行记录
+      const want = String(state.args['diag-pull'])
+      const t = setInterval(() => {
+        const p = [...(state.net?.peers?.values() || [])].find((x) => x.state === 'ready' && x.name === want)
+        if (p) { clearInterval(t); window.oray.botLog(`[BOT] DIAG-PULL start → ${want}`); diagRequest(want) }
+      }, 3000)
+      setTimeout(() => clearInterval(t), 180000)
     }
     if (state.args['mute-presence']) {
       // 测试注入：停发本端 relay presence 广播（模拟广播丢失/不可达），仅剩心跳摘要通道
@@ -2158,6 +2184,80 @@ setInterval(() => {
 }, 5000)
 
 // ---------- 健康采样（docs/longrun-hardening-plan.md 任务 A）----------
+// ---------- 运行记录（诊断）----------
+// 持续记录关键运行事件（链路断开/看门狗/握手停滞/隧道探测/更新里程碑——不含聊天
+// 内容），环形 300 条落 KV；调试机经 /diag 命令远程拉取组装诊断包。开关：设置页
+// 「诊断」区块（oc-diag-cfg.enabled，默认开——开销一行 JSON/事件）。
+let diagBuf = []
+let diagDirty = false
+let diagEnabled = true
+window.oray.kvGet('oc-diag-cfg').then((v) => { try { diagEnabled = JSON.parse(v)?.enabled !== false } catch {} }).catch(() => {})
+window.oray.kvGet('oc-diag-log').then((v) => { try { diagBuf = JSON.parse(v) || [] } catch {} }).catch(() => {})
+
+function diagLog(msg, level) {
+  if (!diagEnabled) return
+  const line = String(msg).slice(0, 240)
+  diagBuf.push({ t: Date.now(), lvl: level === 'warn' || level === 'error' ? level : 'info', m: line })
+  while (diagBuf.length > 300) diagBuf.shift()
+  diagDirty = true
+}
+setInterval(() => { if (diagDirty && diagEnabled) { diagDirty = false; window.oray.kvSet('oc-diag-log', JSON.stringify(diagBuf)).catch(() => {}) } }, 30000)
+
+// 诊断包组装（本机全量运行状况；不含聊天内容/准入 token）
+async function diagCollect() {
+  const info = await (window.oray.appInfo ? window.oray.appInfo() : Promise.resolve({}))
+  let hubLog = [], tunnelList = ''
+  try { const s = await window.oray.hubStatus(); hubLog = (s.log || []).slice(-100) } catch {}
+  try { const x = await window.oray.diagExtra?.(); tunnelList = x?.tunnelList || '' } catch {}
+  let health = []
+  try { health = (healthSamples || []).slice(-48) } catch {}
+  const relay = state.net?.relay
+  return {
+    takenAt: Date.now(),
+    env: {
+      version: info.version, platform: info.platform || navigator.userAgent.slice(0, 80),
+      profile: info.profile, room: state.room, uptimeMs: Math.round(performance.now()),
+      linksAlive: relay?.aliveLinks?.().length ?? 0, linksAll: relay?.links?.size ?? 0,
+      readyPeers: [...(state.net?.peers?.values() || [])].filter((p) => p.state === 'ready').map((p) => ({ name: p.name, ver: p.ver || '', via: p.via || '' })),
+    },
+    health,
+    diagLog: (diagBuf || []).slice(-150),
+    hubLog,
+    tunnelList: tunnelList.slice(0, 2000),
+  }
+}
+
+// /diag <成员名>：向该成员拉取运行记录（结果落 Downloads/oraychat-diag-*.json）
+const diagPending = new Map() // name → { at }
+async function diagRequest(name) {
+  const target = name.trim()
+  if (!target) { appendSys('用法：/diag <成员名> —— 拉取该成员的运行记录'); return }
+  const peer = [...(state.net?.peers?.values() || [])].find((p) => p.state === 'ready' && p.name === target)
+  if (!peer) { appendSys(`未找到就绪成员「${target}」（需其在线且握手完成）`); return }
+  diagPending.set(target, { at: Date.now() })
+  appendSys(`🔧 正在向 ${target} 拉取运行记录…`)
+  const peerId = [...state.net.peers.entries()].find(([, p]) => p === peer)?.[0]
+  await state.net.sendDiagReq(peerId)
+}
+function diagReceived(peer, obj, err) {
+  const name = peer?.name || 'peer'
+  if (err || !obj) { appendSys(`🔧 ${name} 诊断拉取失败：${err || '空包'}`); return }
+  const fname = `oraychat-diag-${name}-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.json`
+  const json = JSON.stringify(obj, null, 1)
+  const done = (where) => appendSys(`🔧 ${name} 诊断包已保存 ${where}（版本 ${obj.env?.version} · 链路 ${obj.env?.linksAlive}/${obj.env?.linksAll} · 事件 ${obj.diagLog?.length} 条）`)
+  if (window.oray.diagSave) {
+    window.oray.diagSave(fname, json).then((dst) => done(dst)).catch(() => done(`（下载名）${fname}`))
+  } else { // 移动端无主进程通道：浏览器下载
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = fname; a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+    done(`（下载）${fname}`)
+  }
+  if (state.args.bot) window.oray.botLog(`[BOT] DIAG-RECV from=${name} v=${obj.env?.version} events=${obj.diagLog?.length}`)
+}
+
 // 每 10min 采一次长跑健康指标，环形存 local-state 'oc-health'（144 条 = 24h）。
 // 长跑问题（内存增长/链路翻动/看门狗误触发）从此有数字可查，设置页「健康」区块
 // 展示——"感觉变慢了"变成"堆内存从 X 涨到 Y"

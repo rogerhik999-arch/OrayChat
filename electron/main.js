@@ -6,6 +6,7 @@
 // - 应用层配置：<userData>/oraychat-config.json 可覆盖 STUN/TURN/默认房间
 
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell } = require('electron')
+const { execFileSync } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
 const crypto2 = require('node:crypto')
@@ -323,6 +324,14 @@ function registerIpc() {
       })(),
     }
   })
+  ipcMain.handle('settings:kv-get', (_e, key) => loadLocalState()[String(key).slice(0, 64)])
+  // 通用 KV 写（设置页诊断开关等）：直写 local-state 键（主窗口 30s flush 周期内合入）
+  ipcMain.handle('settings:kv-set', (_e, key, val) => {
+    const s = loadLocalState()
+    s[String(key).slice(0, 64)] = val
+    fs.writeFileSync(statePath(), JSON.stringify(s), { mode: 0o600 })
+    return true
+  })
   ipcMain.handle('settings:set-user-config', (_e, userConfig) => {
     const s2 = loadLocalState()
     const prev = s2['oc-config'] || {}
@@ -337,6 +346,24 @@ function registerIpc() {
   ipcMain.handle('hub:start', (_e, opts = {}) => hub.start({ ...opts, userDataDir: app.getPath('userData') }))
   ipcMain.handle('hub:stop', () => hub.stop())
   ipcMain.handle('hub:status', () => hub.snapshot())
+  // 诊断（/diag 远程拉取组装包用）：cloudflared 隧道清单等主进程侧数据
+  ipcMain.handle('diag:extra', () => {
+    const out = { tunnelList: '', at: Date.now() }
+    try {
+      const bin = path.join(app.getPath('userData'), 'cloudflared', process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared')
+      const fsx = fs.existsSync(bin) ? bin : 'cloudflared'
+      out.tunnelList = String(execFileSync(fsx, ['tunnel', 'list'], { timeout: 12000 }) || '').slice(0, 2000)
+    } catch (e) { out.tunnelList = `（不可用：${String(e?.message || e).split('\n')[0].slice(0, 120)}）` }
+    return out
+  })
+  // 诊断包落盘（主进程直写 Downloads——浏览器下载栈在后台窗口不可靠）
+  ipcMain.handle('diag:save', (_e, fname, json) => {
+    // 只剥路径分隔与控制符（保留中文成员名），长度封顶防滥用
+    const safe = String(fname || 'oraychat-diag.json').replace(/[/\\:*?"<>|\x00-\x1f]/g, '').slice(0, 120) || 'oraychat-diag.json'
+    const dst = path.join(app.getPath('downloads'), safe)
+    fs.writeFileSync(dst, String(json), { mode: 0o600 })
+    return dst
+  })
   // 命名隧道三步向导（稳定域名）：授权 → 创建 → 绑域名；run 由 app 全托管
   ipcMain.handle('hub:login', () => hub.loginTunnel(app.getPath('userData')))
   ipcMain.handle('hub:create-tunnel', (_e, name) => hub.createTunnel(name, app.getPath('userData')))
