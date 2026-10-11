@@ -163,6 +163,23 @@ console.log('[6] tick→GitHub 探测→采纳')
   ok('6.4 peers-only 源不发起 GitHub 探测', calls === 1)
 }
 
+// ---------- 7) Windows 换装 cmd helper（buildWinCmd：纯函数锁定关键行为）----------
+console.log('[7] buildWinCmd')
+{
+  const { buildWinCmd, buildApplySteps } = await import('../electron/apply-steps.js')
+  const cmd = buildWinCmd({ pid: 123, installerPath: 'C:\\tmp\\OrayChat Setup 1.30.5.exe', allUsers: false, launchPaths: ['C:\\u\\OrayChat.exe', 'C:\\m\\OrayChat.exe'], logPath: 'C:\\l\\h.log', version: '1.30.5' })
+  ok('7.1 per-user 安装参数', cmd.includes('/currentuser'))
+  const cmdAll = buildWinCmd({ pid: 1, installerPath: 'C:\\i.exe', allUsers: true, launchPaths: ['C:\\x.exe'], logPath: 'C:\\l.log', version: '1.0.0' })
+  ok('7.2 per-machine 安装参数', cmdAll.includes('/allusers'))
+  ok('7.3 每步日志回显', cmd.split('>>').length >= 4)
+  ok('7.4 装完探测启动新版', cmd.includes('if exist') && cmd.includes('start ""'))
+  ok('7.5 纯 ASCII（GBK 代码页安全）', /^[\x00-\x7f]*$/.test(cmd))
+  const sh = buildApplySteps('darwin', { dst: '/tmp/a.app', appPath: '/tmp/b.app', pid: 9, version: '1.2.3', logPath: '/tmp/h.log' })
+  ok('7.6 mac helper 日志回显+备份+启动', sh.some((l) => l.includes('exec >>')) && sh.some((l) => l.includes('.bak')) && sh.some((l) => l.includes('open "')))
+  const ln = buildApplySteps('linux', { dst: '/tmp/OrayChat.AppImage', appPath: '/tmp/n.AppImage', pid: 9, version: '1.2.3', logPath: '/tmp/h.log' })
+  ok('7.7 linux helper 原子替换+拉起', ln.some((l) => l.includes('mv -f')) && ln.some((l) => l.includes('nohup')))
+}
+
 const pass = results.filter(Boolean).length
 console.log(`\n${pass === results.length ? '✅' : '❌'} update.test.mjs：${pass}/${results.length} 通过`)
 process.exit(pass === results.length ? 0 : 1)

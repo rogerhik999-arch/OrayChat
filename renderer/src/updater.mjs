@@ -288,7 +288,7 @@ export class Updater {
       }
       try {
       if (decision === 'notify') { this.notify(`发现新版本 ${this.knownPkg.v}（设置→更新 可选择策略）`); return }
-      if (decision === 'notify-install') { this.notify(`新版本 ${this.knownPkg.v} 已下载就绪，重启即完成更新`); return }
+      if (decision === 'notify-install') { this.notify(`新版本 ${this.knownPkg.v} 已就绪——退出应用时自动换装并重启；也可到 设置→更新 立即安装`); return }
       if (decision === 'download') {
         if (routeSource({ source: this.cfg.source, peerPullFailedAt: this._peerPullFailedAt, now: Date.now() }) === 'github') {
           // GitHub 失败退避 5 分钟：未认证 API 限流 60/h，失败循环会打爆限额（实测 403）

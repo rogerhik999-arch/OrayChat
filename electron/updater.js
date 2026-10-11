@@ -8,6 +8,7 @@
 const { app, net } = require('electron')
 const { spawn, execFileSync } = require('node:child_process')
 const path = require('node:path')
+const { buildApplySteps, buildWinCmd } = require('./apply-steps')
 const fs = require('node:fs')
 
 // GitHub 下载走 Chromium 网络栈（net.fetch）：自动使用系统代理。Node 裸 fetch
@@ -34,37 +35,6 @@ function findPkgFile(fid) {
     const hit = fs.readdirSync(dir).find((f) => f.startsWith(fid))
     return hit ? path.join(dir, hit) : null
   } catch { return null }
-}
-
-// 换装步骤生成（纯函数：单测锁定各平台关键行为）
-function buildApplySteps(platform, opts) {
-  const dst = opts.dst
-  const pid = opts.pid
-  const common = [
-    'for i in $(seq 1 120); do kill -0 ' + pid + ' 2>/dev/null || break; sleep 0.5; done',
-    'sleep 1',
-  ]
-  if (platform === 'darwin') {
-    return common.concat([
-      'rm -rf "' + dst + '.bak"',
-      '[ -d "' + dst + '" ] && ditto "' + dst + '" "' + dst + '.bak"',
-      'rm -rf "' + dst + '"',
-      'ditto "' + opts.appPath + '" "' + dst + '"',
-      'sleep 0.5',
-      'open "' + dst + '"',
-    ])
-  }
-  if (platform === 'win32') {
-    return common.concat(['"' + opts.installerPath + '" /S']) // NSIS 静默安装，安装器接管重启
-  }
-  // linux：AppImage 原子替换自身（mv 同分区原子）
-  return common.concat([
-    '[ -f "' + dst + '" ] && cp "' + dst + '" "' + dst + '.bak"',
-    'cp "' + opts.appPath + '" "' + dst + '.new"',
-    'chmod +x "' + dst + '.new"',
-    'mv -f "' + dst + '.new" "' + dst + '"',
-    '(cd "$(dirname "' + dst + '")" && nohup "$(basename "' + dst + '")" >/dev/null 2>&1 &)',
-  ])
 }
 
 async function stage(opts) {
@@ -109,28 +79,40 @@ async function apply(opts) {
   const st = state.staged && state.staged.version === version ? state.staged : null
   if (!st) return { ok: false, err: '尚未 staging（先 stage）' }
   const pid = process.pid
+  const logPath = path.join(userDataDir(), 'staging', 'update-helper.log')
+  // 换装簿记（崩溃环回滚依据 + 诊断留痕）：ver/at/startsSince
+  try {
+    const lsPath = path.join(userDataDir(), 'local-state.json')
+    const ls = JSON.parse(fs.readFileSync(lsPath, 'utf8'))
+    ls['oc-updater-apply'] = { ver: version, at: Date.now(), startsSince: 0 }
+    fs.writeFileSync(lsPath, JSON.stringify(ls), { mode: 0o600 })
+  } catch { /* 簿记失败不阻断换装 */ }
   let steps
   if (process.platform === 'darwin') {
-    steps = buildApplySteps('darwin', { dst: process.env.ORAY_UPDATE_DST || '/Applications/OrayChat.app', appPath: st.appPath, pid: pid })
+    steps = buildApplySteps('darwin', { dst: process.env.ORAY_UPDATE_DST || '/Applications/OrayChat.app', appPath: st.appPath, pid, version, logPath })
   } else if (process.platform === 'win32') {
-    // Windows 无 /bin/bash：写 cmd 批处理 helper——等待本进程退出（释放 exe 句柄）
-    // 后静默安装，NSIS /S 自带完成重启。未实机验证（首次跨平台测试重点纠错项）。
+    // Windows 无 /bin/bash：cmd helper（buildWinCmd：纯 ASCII + 每步日志 + 按旧安装
+    // 范围装 + 装完拉起新版）。旧版"装完不启动、装错范围导致快捷方式仍指旧版、
+    // 零日志不可归因"三问题一并治（2026-10-11 用户实报 1.30.3 退出后未更新）。
+    const allUsers = /^.:\\Program Files/i.test(process.execPath) // 旧装在 Program Files = per-machine
+    const launchPaths = [
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'OrayChat', 'OrayChat.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'oraychat', 'OrayChat.exe'),
+      'C:\\Program Files\\OrayChat\\OrayChat.exe',
+    ]
+    const cmd = buildWinCmd({ pid, installerPath: st.installerPath, allUsers, launchPaths, logPath, version })
     const helper = path.join(userDataDir(), 'staging', 'update-helper.cmd')
-    fs.writeFileSync(helper, [
-      '@echo off',
-      'rem OrayChat 换装 helper（自动生成 v' + version + '）',
-      'for /l %%i in (1,1,120) do (tasklist /FI "PID eq ' + pid + '" 2>nul | find "' + pid + '" >nul && ping -n 2 127.0.0.1 >nul)',
-      'ping -n 2 127.0.0.1 >nul',
-      '"' + st.installerPath + '" /S',
-    ].join('\r\n'))
+    fs.writeFileSync(helper, cmd, { mode: 0o755 })
     const child = spawn('cmd.exe', ['/c', helper], { detached: true, stdio: 'ignore' })
     child.unref()
     return { ok: true, helper: helper }
   } else {
-    steps = buildApplySteps('linux', { dst: process.env.ORAY_UPDATE_DST || process.execPath, appPath: st.appPath, pid: pid })
+    steps = buildApplySteps('linux', { dst: process.env.ORAY_UPDATE_DST || process.execPath, appPath: st.appPath, pid, version, logPath })
   }
   const helper = path.join(userDataDir(), 'staging', 'update-helper.sh')
-  fs.writeFileSync(helper, ['#!/bin/bash', '# OrayChat 换装 helper（自动生成 v' + version + '）'].concat(steps).join('\n'), { mode: 0o755 })
+  let stepLines = ['#!/bin/bash', '# OrayChat swap helper v' + version].concat(steps)
+  if (process.env.ORAY_UPDATE_NO_LAUNCH) stepLines = stepLines.filter((l) => !/^(open |\(cd )/.test(l)) // 演练：不真启动
+  fs.writeFileSync(helper, stepLines.join('\n'), { mode: 0o755 })
   const child = spawn('/bin/bash', [helper], { detached: true, stdio: 'ignore' })
   child.unref()
   return { ok: true, helper: helper }
@@ -186,9 +168,44 @@ async function rollback() {
 }
 
 let quitCb = null
-function registerIpc(cb) { quitCb = cb }
+function registerIpc(cb) { quitCb = cb; restoreStaged() }
+
+// staged 重启恢复：上次会话已暂存（提示过"退出时换装"）但用户尚未退出/退出失败
+// → 本次启动直接从 staging/<版本>/ 恢复 state.staged——退出换装钩子重新武装，
+// 不再依赖渲染层重新走一遍 download→stage（files 包在时虽会重建，但那要等 tick
+// 且期间用户退出就漏换装）。仅接受比当前版本新的目录。
+function restoreStaged() {
+  try {
+    const base = path.join(userDataDir(), 'staging')
+    if (!fs.existsSync(base)) return
+    const cur = app.getVersion()
+    for (const d of fs.readdirSync(base)) {
+      const ver = String(d)
+      if (!/^\d+\.\d+\.\d+$/.test(ver)) continue
+      if (cmpVer(ver, cur) <= 0) continue
+      const dir = path.join(base, d)
+      if (process.platform === 'darwin' && fs.existsSync(path.join(dir, 'OrayChat.app'))) {
+        state.staged = { version: ver, appPath: path.join(dir, 'OrayChat.app') }
+        return
+      }
+      if (process.platform === 'win32') {
+        const exe = fs.readdirSync(dir).find((f) => /^OrayChat.*\.exe$/i.test(f) && !/uninst/i.test(f))
+        if (exe) { state.staged = { version: ver, installerPath: path.join(dir, exe) }; return }
+      }
+      if (process.platform === 'linux' && fs.existsSync(path.join(dir, 'OrayChat.AppImage'))) {
+        state.staged = { version: ver, appPath: path.join(dir, 'OrayChat.AppImage') }
+        return
+      }
+    }
+  } catch { /* 恢复失败：渲染层 tick 会重建 */ }
+}
+function cmpVer(a, b) {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0) }
+  return 0
+}
 function quitForUpdate() {
   try { quitCb && quitCb() } catch { app.exit(0) }
 }
 
-module.exports = { registerIpc, quitForUpdate, stage, apply, rollback, githubFetchManifest, githubDownloadAsset, buildApplySteps, state }
+module.exports = { registerIpc, quitForUpdate, stage, apply, rollback, githubFetchManifest, githubDownloadAsset, buildApplySteps, buildWinCmd, state }
