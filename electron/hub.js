@@ -30,10 +30,23 @@ const state = {
 }
 
 function log(msg) {
-  const line = `[HUB] ${new Date().toLocaleTimeString('zh-CN', { hour12: false })} ${msg}`
+  const line = `[HUB ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${msg}`
   state.logs.push(line)
   if (state.logs.length > HUB_LOG_MAX) state.logs.shift()
   state.emitter?.emit('event', { type: 'log', line })
+  // 持久化（跨重启取证）：隧道断连/重启的完整历史是诊断"开着却 530"的唯一证据链
+  try {
+    const fs2 = require('fs')
+    const p = path.join(state.logDir || '.', 'hub-log.jsonl')
+    fs2.appendFileSync(p, JSON.stringify({ t: Date.now(), m: String(msg).slice(0, 500) }) + '\n')
+    try {
+      const st2 = fs2.statSync(p)
+      if (st2.size > 512 * 1024) { // 512KB 封顶：保留后半（最近历史）
+        const lines = fs2.readFileSync(p, 'utf8').split('\n').filter(Boolean)
+        fs2.writeFileSync(p, lines.slice(-Math.floor(lines.length / 2)).join('\n') + '\n')
+      }
+    } catch { /* 封顶失败无碍 */ }
+  } catch { /* 持久化失败不阻断 */ }
 }
 
 // cloudflared 二进制：PATH → 缓存（profile 目录与基础目录都查；profile 模式下
@@ -56,6 +69,7 @@ async function start(opts = {}) {
     return applyTunnel(opts)
   }
   state.emitter = opts.emitter || state.emitter
+  state.logDir = opts.userDataDir || state.logDir // hub-log.jsonl 落 userData（跨重启取证）
   const port = Number(opts.port) || 48883
   const bind = String(opts.bind || '127.0.0.1') // 生产仅回环；e2e 用 0.0.0.0 验 token 准入
   // 准入 token：有则沿用（配置持久化），无则生成（8 组 4 字符 base32 风格，可抄写）
@@ -139,6 +153,7 @@ function applyTunnel(opts) {
 }
 
 async function stop() {
+  if (edgeProbeTimer) { clearInterval(edgeProbeTimer); edgeProbeTimer = null }
   if (state.tunnelProc) { try { state.tunnelProc.kill('SIGTERM') } catch { /* 已死 */ } state.tunnelProc = null }
   if (state.namedProc) { try { state.namedProc.kill('SIGTERM') } catch { /* 已死 */ } state.namedProc = null }
   if (state.server) {
@@ -365,6 +380,47 @@ function startNamedRun(userDataDir) {
     log(`命名隧道「${state.name}」${useToken ? '(token 模式)' : ''}启动 → ${state.tunnelUrl}（随客户端后台运行，异常自动重启）`)
   }
   spawnRun()
+  startEdgeProbe()
+}
+
+// ---------- 边缘健康探测（"开着却 530"自愈，2026-10-11）----------
+// 病理：机器睡眠唤醒/网络切换后，cloudflared 进程活着但与边缘的 http2 连接已死
+// （半开，进程无感知）——边缘侧表现 530，成员全部掉线，而旧监督只看进程存活，
+// 永远不会拉起。判据：从公网视角 fetch 自己的隧道域名，明确收到 530（Cloudflare
+// "隧道无活跃连接"错误页）才算边缘失联；网络探测失败（本机断网）不计——只治
+// 确诊的假活，避免误杀。连续 3 次 530 → kill cloudflared 走既有自动重启路径。
+let edgeProbeTimer = null
+function startEdgeProbe() {
+  if (edgeProbeTimer) clearInterval(edgeProbeTimer)
+  const intervalMs = Number(process.env.ORAY_HUB_PROBE_MS) || 60000
+  const failThreshold = Number(process.env.ORAY_HUB_PROBE_FAILS) || 3
+  let consec530 = 0
+  edgeProbeTimer = setInterval(async () => {
+    if (state.mode !== 'named' || !state.server || !state.hostname) return
+    if (!state.namedProc) return // 进程不在=退出处理已在重启循环
+    try {
+      const res = await fetch(`https://${state.hostname}/`, { signal: AbortSignal.timeout(8000), headers: { 'User-Agent': 'oraychat-hub-probe' } })
+      if (res.status === 530 || res.status === 533) {
+        consec530++
+        log(`边缘探测：${state.hostname} → HTTP ${res.status}（边缘认为隧道无活跃连接）${consec530}/${failThreshold}`)
+        if (consec530 >= failThreshold) {
+          consec530 = 0
+          state.registered = false
+          log(`边缘探测连续 ${failThreshold} 次失联——判定 cloudflared 假活（进程在/边缘连接已死），强制重启隧道进程`)
+          try { state.namedProc.kill('SIGKILL') } catch { /* 已死则退出处理器接管 */ }
+          // kill 后 exit handler → 退避重启 → registered 恢复
+        }
+      } else {
+        if (consec530 > 0) log(`边缘探测恢复：HTTP ${res.status}`)
+        consec530 = 0
+        if (!state.registered && state.namedProc) {
+          // 进程活 + 边缘可达但 registered 从未置位（如唤醒后重连成功）——纠正状态供 UI 展示
+          state.registered = true
+          state.emitter?.emit('event', { type: 'tunnel', url: state.tunnelUrl })
+        }
+      }
+    } catch { /* 探测网络失败（本机断网）≠ 边缘失联证据，不计 */ }
+  }, intervalMs)
 }
 
 // 成员视角接入测试：真实连接目标地址并完成发布/订阅往返。
